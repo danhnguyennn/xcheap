@@ -1817,6 +1817,7 @@ app.post('/api/admin/products', requireRole('admin'), async (req, res) => {
     return res.status(400).json({ error: 'Tên sản phẩm và danh mục là bắt buộc' });
   }
 
+  const adminUser = (await getSessionUser(req))!;
   const prodCol = db.collection<Product>('products');
   const newId = 'prod-' + Math.random().toString(36).substring(2, 8);
   const resolvedPrice = Number(price) || 0.5;
@@ -1845,10 +1846,11 @@ app.post('/api/admin/products', requireRole('admin'), async (req, res) => {
     rating: 5,
     reviewCount: 0,
     seller: {
-      name: 'XCHEAP Official',
+      name: `${adminUser.username}`,
       statusText: 'Đang hoạt động',
       isActive: true,
     },
+    createdByUserId: adminUser.id,
     isHot: false,
     isFeatured: true,
     inStock: true,
@@ -2249,6 +2251,34 @@ app.post('/api/admin/withdrawals/:id/reject', requireRole('admin'), async (req, 
   res.json({ success: true, withdrawal: updated });
 });
 
+// The CTV product form only lets a CTV pick a category by its display
+// label (e.g. "Twitter / X") — it never sends categorySlug or image (unlike
+// the admin form, which has its own explicit icon picker). Without this,
+// every CTV-created product fell back to categorySlug/image "other", so its
+// storefront card always showed the generic fallback art regardless of
+// which category was actually selected. Derived here so the fix applies
+// uniformly without needing a new form field.
+const CTV_CATEGORY_LABEL_TO_SLUG: Record<string, string> = {
+  'Twitter / X': 'twitter',
+  'Facebook': 'facebook',
+  'Hotmail / Outlook': 'hotmail',
+  'Gmail': 'gmail',
+  'TikTok': 'tiktok',
+  'Telegram': 'telegram',
+  'Discord': 'discord',
+  'Tool / Proxy': 'other',
+};
+
+function deriveCategorySlug(categoryLabel: string): string {
+  if (CTV_CATEGORY_LABEL_TO_SLUG[categoryLabel]) return CTV_CATEGORY_LABEL_TO_SLUG[categoryLabel];
+  const slugified = String(categoryLabel)
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return slugified || 'other';
+}
+
 // 22. CTV: Upload product to store (MongoDB: insertOne) — CTV and Admin only
 app.post('/api/ctv/products', requireRole('admin', 'ctv'), async (req, res) => {
   const { name, category, categorySlug, price, originalPrice, image, description, accountFormat, variantName, rawAccounts, variants = [] } = req.body;
@@ -2283,15 +2313,16 @@ app.post('/api/ctv/products', requireRole('admin', 'ctv'), async (req, res) => {
     id: newId,
     name,
     category,
-    categorySlug: categorySlug || 'other',
-    image: image || 'other',
+    categorySlug: categorySlug || deriveCategorySlug(category),
+    image: image || deriveCategorySlug(category),
     rating: 5,
     reviewCount: 0,
     seller: {
-      name: `CTV ${ctvUser.username}`,
+      name: `${ctvUser.username}`,
       statusText: 'Đang hoạt động',
       isActive: true,
     },
+    createdByUserId: ctvUser.id,
     isHot: false,
     isFeatured: true,
     inStock: true,
@@ -2366,10 +2397,20 @@ async function translateDescriptionToAllLanguages(text: string): Promise<Partial
 }
 
 function ctvOwnsProduct(user: User, product: Product): boolean {
+  // createdByUserId is the real source of truth (set at creation time for
+  // every product from here on) — an exact id match, not a guess.
+  if (product.createdByUserId) return product.createdByUserId === user.id;
+
+  // Fallback for products created before createdByUserId existed: best-effort
+  // match against the seller display name. This used to also treat ANY
+  // seller name containing the substring "ctv" as a match — since every
+  // CTV-created listing's seller name literally starts with "CTV ", that
+  // meant every CTV owned every other CTV's products. Only an exact
+  // "ctv <username>" match (or the reverse-containment check below) counts.
   const sellerName = product.seller?.name?.toLowerCase() || '';
   const username = user.username.toLowerCase();
   if (!sellerName) return false;
-  if (sellerName.includes('ctv') || sellerName.includes(username)) return true;
+  if (sellerName === `ctv ${username}`) return true;
   // Guard the reverse direction with a minimum length so a short/generic
   // display name (e.g. a 1-2 character seller name) can't spuriously match
   // just because it happens to be a substring of an unrelated username.

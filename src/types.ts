@@ -74,6 +74,13 @@ export interface Product {
     statusText: string;
     isActive: boolean;
   };
+  // The account id of whoever actually created this listing (admin or CTV) —
+  // the real source of truth for ownership checks (see ctvOwnsProduct in
+  // server.ts). seller.name is just a display string and must never be
+  // parsed back into an ownership decision: two different CTVs both get
+  // "CTV" in their seller name, so substring-matching it would let any CTV
+  // manage any other CTV's listings.
+  createdByUserId?: string;
   isHot?: boolean;
   isFeatured?: boolean;
   inStock: boolean;

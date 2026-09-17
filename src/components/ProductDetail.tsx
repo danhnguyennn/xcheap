@@ -14,7 +14,6 @@ import {
   Tag,
   ShieldAlert,
   CheckCircle2,
-  User as UserIcon,
   ExternalLink,
   Copy,
   RefreshCw,
@@ -452,8 +451,6 @@ export const ProductDetail: React.FC<ProductDetailProps> = ({
     (p) => p.variantId === selectedVariant.id && (p.status === 'pending' || p.status === 'insufficient_balance')
   );
 
-  const sellerUsername = product.seller && product.seller.name ? product.seller.name.replace(/^CTV\s+/i, '') : 'admin';
-
   // CTV/admin always write the description in Vietnamese — for any other
   // site language, show the real machine-translated version cached on the
   // product (see server.ts translateDescriptionToAllLanguages). If that
@@ -681,15 +678,6 @@ export const ProductDetail: React.FC<ProductDetailProps> = ({
             <h1 className="text-xl sm:text-2xl font-bold text-slate-900 dark:text-slate-100 mb-2">
               {product.name}
             </h1>
-
-            {/* Chỉ hiển thị Username */}
-            <div className="flex items-center gap-2 text-xs mb-3 pb-3 border-b border-[#e1e4e3] dark:border-[#32363e]">
-              <span className="text-slate-600 dark:text-slate-400">{t.seller}</span>
-              <span className="bg-purple-500/10 text-purple-700 dark:text-purple-300 font-bold px-2.5 py-1 rounded-lg border border-purple-500/30 text-xs font-mono flex items-center gap-1">
-                <UserIcon className="w-3 h-3 text-purple-600 dark:text-purple-400" />
-                <span>@{sellerUsername}</span>
-              </span>
-            </div>
 
             {/* Price display */}
             <div className="mb-4">
