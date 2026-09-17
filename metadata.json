@@ -1,0 +1,6 @@
+{
+  "name": "XCheap.us - Digital Account Store",
+  "description": "XCheap.us - Chợ tài khoản số, dịch vụ mạng xã hội (Twitter/X, Facebook, Gmail, Discord) & công cụ MMO tự động 24/7.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

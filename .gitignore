@@ -1,0 +1,18 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Local Claude Code session/runtime state, not application source.
+.claude/
+
+# One-off verification scripts/screenshots created while testing a change —
+# never meant to be committed, only cleaned up after use.
+/_shot_*
+/_test_*
+/_cleanup_*
+/_check_*
