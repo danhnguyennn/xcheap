@@ -1,7 +1,29 @@
 import React, { useState, useEffect } from 'react';
+import { TOTP, Secret } from 'otpauth';
 import { Language } from '../types';
 import { translations } from '../locales/translations';
 import { Wrench, Key, Mail, Split, Copy, Check, RefreshCw } from 'lucide-react';
+
+// Real RFC 6238 TOTP — the exact same algorithm an authenticator app (Google
+// Authenticator, Authy...) runs over a secret you already hold, not a guess
+// or a lookup against anything live. Returns null for a secret that isn't
+// valid Base32 rather than throwing, so a bad paste shows an error state
+// instead of crashing the modal.
+function computeTotp(secretKeyRaw: string): string | null {
+  const cleaned = secretKeyRaw.replace(/\s+/g, '').toUpperCase();
+  if (!cleaned) return null;
+  try {
+    const totp = new TOTP({
+      secret: Secret.fromBase32(cleaned),
+      digits: 6,
+      period: 30,
+      algorithm: 'SHA1',
+    });
+    return totp.generate();
+  } catch {
+    return null;
+  }
+}
 
 interface ToolsModalProps {
   isOpen: boolean;
@@ -15,7 +37,7 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
 
   // 2FA TOTP Generator state
   const [secretKey, setSecretKey] = useState('JBSWY3DPEHPK3PXP');
-  const [totpCode, setTotpCode] = useState('482910');
+  const [totpCode, setTotpCode] = useState<string | null>(computeTotp('JBSWY3DPEHPK3PXP'));
   const [secondsRemaining, setSecondsRemaining] = useState(30);
   const [copiedTotp, setCopiedTotp] = useState(false);
 
@@ -117,28 +139,28 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
   const [copiedTokenIndex, setCopiedTokenIndex] = useState<number | null>(null);
   const [copiedAllTokens, setCopiedAllTokens] = useState(false);
 
-  // Simple TOTP countdown simulation
+  // Recomputes the real TOTP code every second so it's always correct for
+  // the live 30-second window — not just refreshed at the boundary, so
+  // pasting a new secret (or opening the modal mid-window) shows the right
+  // code immediately instead of a stale one.
   useEffect(() => {
     if (!isOpen) return;
-    const interval = setInterval(() => {
+    const tick = () => {
       const now = new Date();
-      const s = 30 - (now.getSeconds() % 30);
-      setSecondsRemaining(s);
-      if (s === 30) {
-        const rand = Math.floor(100000 + Math.random() * 900000);
-        setTotpCode(String(rand));
-      }
-    }, 1000);
+      setSecondsRemaining(30 - (now.getSeconds() % 30));
+      setTotpCode(computeTotp(secretKey));
+    };
+    tick();
+    const interval = setInterval(tick, 1000);
     return () => clearInterval(interval);
-  }, [isOpen]);
+  }, [isOpen, secretKey]);
 
   const handleGenerateTotp = () => {
-    if (!secretKey.trim()) return;
-    const rand = Math.floor(100000 + Math.random() * 900000);
-    setTotpCode(String(rand));
+    setTotpCode(computeTotp(secretKey));
   };
 
   const handleCopyTotp = () => {
+    if (!totpCode) return;
     navigator.clipboard.writeText(totpCode);
     setCopiedTotp(true);
     setTimeout(() => setCopiedTotp(false), 2000);
@@ -314,9 +336,6 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
         <div className="p-5 overflow-y-auto space-y-4 text-xs flex-1">
           {activeTab === '2fa' && (
             <div className="space-y-3">
-              <div className="p-2.5 bg-amber-50 dark:bg-amber-950/70 border border-amber-500/40 rounded-lg text-[11px] text-amber-800 dark:text-amber-200">
-                {t.demoDataNotice}
-              </div>
               <div>
                 <label className="font-bold text-slate-800 dark:text-slate-200 block mb-1">{t.twoFaTool}</label>
                 <div className="flex gap-2">
@@ -345,8 +364,8 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
                   <span className="text-[11px] text-slate-600 dark:text-slate-400 block mb-1">
                     {t.toolsCurrent2FACode}
                   </span>
-                  <div className="text-3xl font-mono font-black text-emerald-600 dark:text-emerald-400 tracking-wider">
-                    {totpCode.slice(0, 3)} {totpCode.slice(3)}
+                  <div className={`text-3xl font-mono font-black tracking-wider ${totpCode ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-500 dark:text-red-400 text-base'}`}>
+                    {totpCode ? `${totpCode.slice(0, 3)} ${totpCode.slice(3)}` : t.toolsInvalidSecretKey}
                   </div>
                 </div>
 
@@ -358,7 +377,8 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
 
                   <button
                     onClick={handleCopyTotp}
-                    className="bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 px-3.5 py-2 rounded-lg font-bold flex items-center gap-1.5 transition flex-shrink-0"
+                    disabled={!totpCode}
+                    className="bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 px-3.5 py-2 rounded-lg font-bold flex items-center gap-1.5 transition flex-shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     {copiedTotp ? <Check className="w-4 h-4 text-emerald-600 dark:text-emerald-400" /> : <Copy className="w-4 h-4" />}
                     <span>{copiedTotp ? t.pdCopiedLabel : t.toolsCopyShort}</span>
