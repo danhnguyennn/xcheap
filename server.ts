@@ -2,8 +2,6 @@ import 'dotenv/config';
 import crypto from 'crypto';
 import express from 'express';
 import path from 'path';
-import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
 import { cryptoOptions } from './src/data/storeData';
 import { getVipTier } from './src/data/vipTiers';
 import { User, UserRole, Product, Order, PreOrder, AdminNotification, DepositTransaction, CryptoNetwork, WithdrawalRequest, CtvStats, Category, Voucher, Review, ReviewSuggestion } from './src/types';
@@ -12,11 +10,8 @@ import { getOrCreateUserWallet, ensureUserDepositWallets } from './server/wallet
 import { sessionMiddleware, getSessionUser, requireAuth, requireRole, hashPassword, verifyPassword, toPublicUser, generateApiKey } from './server/auth';
 import { ethers } from 'ethers';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3434;
 
 app.use(express.json());
 app.use(sessionMiddleware());
@@ -2266,7 +2261,7 @@ const CTV_CATEGORY_LABEL_TO_SLUG: Record<string, string> = {
   'TikTok': 'tiktok',
   'Telegram': 'telegram',
   'Discord': 'discord',
-  'Tool / Proxy': 'other',
+  'Tool / Proxy': 'tool',
 };
 
 function deriveCategorySlug(categoryLabel: string): string {
@@ -2277,6 +2272,15 @@ function deriveCategorySlug(categoryLabel: string): string {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
   return slugified || 'other';
+}
+
+// Product cards (ProductShopArt.tsx) render from a fixed set of storefront
+// photos that doesn't include a "tool" one — category browsing (Categories.tsx)
+// has its own icon set that does. Same source label, two different target
+// vocabularies, so this can't just reuse deriveCategorySlug's result as-is.
+function deriveProductImageKey(categoryLabel: string): string {
+  const slug = deriveCategorySlug(categoryLabel);
+  return slug === 'tool' ? 'other' : slug;
 }
 
 // 22. CTV: Upload product to store (MongoDB: insertOne) — CTV and Admin only
@@ -2314,7 +2318,7 @@ app.post('/api/ctv/products', requireRole('admin', 'ctv'), async (req, res) => {
     name,
     category,
     categorySlug: categorySlug || deriveCategorySlug(category),
-    image: image || deriveCategorySlug(category),
+    image: image || deriveProductImageKey(category),
     rating: 5,
     reviewCount: 0,
     seller: {
@@ -2624,6 +2628,12 @@ app.post('/api/tools/renew-hotmail-token', requireRole('admin', 'ctv'), (req, re
 // Vite dev middleware or static serving
 async function start() {
   if (process.env.NODE_ENV !== 'production') {
+    // Loaded lazily and only in dev — esbuild bundles a static top-level
+    // import into an unconditional require(), which would otherwise force
+    // every production install (and Docker image) to carry vite's entire
+    // dev-only dependency tree (esbuild, rollup, lightningcss...) just to
+    // satisfy a module load that's never actually used there.
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',

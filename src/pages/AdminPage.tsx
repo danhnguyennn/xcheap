@@ -1298,6 +1298,26 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                       />
                     </div>
 
+                    <div>
+                      <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Logo danh mục:</label>
+                      <select
+                        value={newCatIcon}
+                        onChange={(e) => setNewCatIcon(e.target.value)}
+                        className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-2 py-2 text-slate-800 dark:text-slate-200"
+                      >
+                        <option value="twitter">Twitter / X</option>
+                        <option value="facebook">Facebook</option>
+                        <option value="gmail">Gmail</option>
+                        <option value="hotmail">Hotmail / Outlook</option>
+                        <option value="instagram">Instagram</option>
+                        <option value="discord">Discord</option>
+                        <option value="tiktok">TikTok</option>
+                        <option value="telegram">Telegram</option>
+                        <option value="tool">Tool / Proxy</option>
+                        <option value="other">Khác (mặc định)</option>
+                      </select>
+                    </div>
+
                     <div className="flex justify-end gap-2 pt-2">
                       <button
                         type="button"

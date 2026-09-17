@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3434:3434"
+    env_file:
+      - .env
+    environment:
+      # Overrides whatever MONGODB_URI is in .env (typically 127.0.0.1 for
+      # local dev) — inside the compose network the Mongo container is only
+      # reachable by its service name, "mongo".
+      - MONGODB_URI=mongodb://mongo:27017
+      - NODE_ENV=production
+    depends_on:
+      - mongo
+
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+
+volumes:
+  mongo_data:

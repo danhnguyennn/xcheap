@@ -975,7 +975,7 @@ export const ProductDetail: React.FC<ProductDetailProps> = ({
             )}
 
             <button
-              onClick={() => window.open('https://t.me/Will_XCheap', '_blank')}
+              onClick={() => window.open('https://t.me/XCheap_Support', '_blank')}
               className="w-full sm:w-auto bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e3e7e6] hover:dark:bg-[#2f3239] border border-emerald-500/40 text-emerald-600 dark:text-emerald-400 hover:text-slate-900 hover:dark:text-slate-100 font-semibold text-xs py-3 px-5 rounded-xl flex items-center justify-center gap-1.5 transition"
             >
               <MessageSquare className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />

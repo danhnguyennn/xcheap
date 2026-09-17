@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.env
+.env.*
+!.env.example
+*.log
+.claude
+_shot_*
+_test_*
+_cleanup_*
+_check_*
