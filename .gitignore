@@ -16,3 +16,4 @@ coverage/
 /_test_*
 /_cleanup_*
 /_check_*
+/command.txt

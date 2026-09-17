@@ -37,22 +37,23 @@ export function toPublicUser(user: User): Omit<User, 'passwordHash' | 'apiKey'> 
   return publicUser;
 }
 
-const FALLBACK_SESSION_SECRET = 'xcheap-local-dev-secret-change-me';
-
 export function sessionMiddleware() {
+  // No fallback on purpose: a hardcoded default secret is guessable by
+  // definition (it's sitting in source control), and whoever holds it can
+  // forge a validly-signed session cookie for any userId, including an
+  // admin's. A missing SESSION_SECRET used to silently fall back to one and
+  // just log a warning — easy to miss in a real deployment. Refusing to
+  // start is the only way to guarantee that never happens quietly.
   if (!process.env.SESSION_SECRET) {
-    // This fallback is public (it's sitting in source control) — anyone who
-    // reads it can forge a validly-signed session cookie for any userId,
-    // including an admin's. Loud on purpose: a silent fallback here is how a
-    // real deployment ends up running with a known-to-everyone secret.
-    console.warn(
-      '[auth] WARNING: SESSION_SECRET is not set — falling back to a publicly-known dev secret. ' +
-        'Sessions can be forged. Set SESSION_SECRET in your .env before deploying anywhere real.'
+    throw new Error(
+      '[auth] SESSION_SECRET is not set. Generate one with: ' +
+        `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))" ` +
+        'and put it in your .env file before starting the server.'
     );
   }
 
   return session({
-    secret: process.env.SESSION_SECRET || FALLBACK_SESSION_SECRET,
+    secret: process.env.SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
     cookie: {
