@@ -2,24 +2,41 @@ services:
   app:
     build: .
     restart: unless-stopped
-    ports:
-      - "3434:3434"
+    # No host port published, no public-facing proxy either — cloudflared
+    # reaches this container over the private compose network only
+    # ("app:3434"), and makes an outbound-only connection to Cloudflare's
+    # edge. Nothing on this VPS ever needs to accept an inbound connection.
+    expose:
+      - "3434"
     env_file:
       - .env
     environment:
-      # Overrides whatever MONGODB_URI is in .env (typically 127.0.0.1 for
-      # local dev) — inside the compose network the Mongo container is only
-      # reachable by its service name, "mongo".
-      - MONGODB_URI=mongodb://mongo:27017
+      # MONGODB_URI is NOT set here on purpose — it comes straight from
+      # .env, so it can point at the bundled "mongo" service below
+      # (mongodb://mongo:27017), an external server, or a managed cluster
+      # (e.g. MongoDB Atlas) just by editing .env, no compose file changes.
       - NODE_ENV=production
-    depends_on:
-      - mongo
 
+  # Bundled local MongoDB — only useful if MONGODB_URI in .env actually
+  # points at it (mongodb://mongo:27017). If you're using an external/
+  # managed database instead, just don't start this service:
+  # `docker compose up -d --build app cloudflared`
   mongo:
     image: mongo:7
     restart: unless-stopped
     volumes:
       - mongo_data:/data/db
+
+  # Cloudflare Tunnel — makes an outbound-only connection out to Cloudflare,
+  # which then proxies your domain's traffic through it to "app:3434".
+  # Requires CLOUDFLARE_TUNNEL_TOKEN in .env (from the Cloudflare Zero Trust
+  # dashboard: Networks > Tunnels > Create a tunnel > Docker connector).
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - app
 
 volumes:
   mongo_data:
