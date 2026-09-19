@@ -2,7 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { TOTP, Secret } from 'otpauth';
 import { Language } from '../types';
 import { translations } from '../locales/translations';
-import { Wrench, Key, Mail, Split, Copy, Check, RefreshCw } from 'lucide-react';
+import { Wrench, Key, Mail, Split, Copy, Check, RefreshCw, AlertCircle } from 'lucide-react';
+import { EmailReaderTab } from './tools/EmailReaderTab';
 
 // Real RFC 6238 TOTP — the exact same algorithm an authenticator app (Google
 // Authenticator, Authy...) runs over a secret you already hold, not a guess
@@ -40,24 +41,6 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
   const [totpCode, setTotpCode] = useState<string | null>(computeTotp('JBSWY3DPEHPK3PXP'));
   const [secondsRemaining, setSecondsRemaining] = useState(30);
   const [copiedTotp, setCopiedTotp] = useState(false);
-
-  // Email reader state
-  const [emailInput, setEmailInput] = useState('ronan_user1@hotmail.com|MailPass#2026');
-  const [emails, setEmails] = useState<any[]>([
-    {
-      sender: 'X (Twitter) Support <verify@x.com>',
-      subject: 'Your X confirmation code is 849-210',
-      time: t.toolsMin1Ago,
-      code: '849210',
-    },
-    {
-      sender: 'Microsoft Security <account-security@accountprotection.microsoft.com>',
-      subject: 'Security alert: New sign-in from Android app',
-      time: t.toolsMin10Ago,
-      code: '918402',
-    },
-  ]);
-  const [isReadingMail, setIsReadingMail] = useState(false);
 
   // Splitter state — the two real formats accounts in this store actually
   // come in, plus a custom option for anything else. Field order here is
@@ -131,13 +114,11 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
   };
 
   // Renew Token Hotmail state
-  const [hotmailTokensInput, setHotmailTokensInput] = useState(
-    'ronan_user1@hotmail.com|M.C543_BAY.0.U.-CtwJ!1829481928a9b1c2d3e4f5g\nalex_trade99@outlook.com|M.C543_BAY.0.U.-AzwK!9182391028a1b2c3d4e5f6g'
-  );
+  const [hotmailTokensInput, setHotmailTokensInput] = useState('');
   const [isRenewingToken, setIsRenewingToken] = useState(false);
   const [renewResult, setRenewResult] = useState<any>(null);
-  const [copiedTokenIndex, setCopiedTokenIndex] = useState<number | null>(null);
-  const [copiedAllTokens, setCopiedAllTokens] = useState(false);
+  const [copiedLineIndex, setCopiedLineIndex] = useState<number | null>(null);
+  const [copiedAllLines, setCopiedAllLines] = useState(false);
 
   // Recomputes the real TOTP code every second so it's always correct for
   // the live 30-second window — not just refreshed at the boundary, so
@@ -166,23 +147,6 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
     setTimeout(() => setCopiedTotp(false), 2000);
   };
 
-  const handleReadEmail = () => {
-    setIsReadingMail(true);
-    setTimeout(() => {
-      setIsReadingMail(false);
-      const newCode = Math.floor(100000 + Math.random() * 900000);
-      setEmails([
-        {
-          sender: 'X / Twitter Verification <info@x.com>',
-          subject: `X Verification code: ${newCode}`,
-          time: t.toolsJustNow,
-          code: String(newCode),
-        },
-        ...emails,
-      ]);
-    }, 1200);
-  };
-
   const handleSplit = () => {
     const fields = activeInputFields;
     if (fields.length === 0) return;
@@ -192,9 +156,6 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
       const parts = line.split('|');
       const row: Record<string, string> = {};
       fields.forEach((fieldName, idx) => {
-        // The last declared field absorbs any remaining '|'-joined text —
-        // a Cookies value can itself legitimately contain '|' characters,
-        // so it must not be cut off at the first one.
         row[fieldName] = idx === fields.length - 1 ? parts.slice(idx).join('|').trim() : (parts[idx] || '').trim();
       });
       if (fields.includes('Cookies')) {
@@ -205,47 +166,163 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
 
     setSplitRows(parsed);
     setParsedFields(fields.includes('Cookies') ? [...fields, 'Auth_token'] : fields);
-    // Default the output format to exactly the fields just parsed — user can
-    // then toggle fields off/on (and reorder by re-toggling) to build any
-    // new format from here.
     setOutputFields(fields.includes('Cookies') ? [...fields, 'Auth_token'] : fields);
   };
 
   const handleRenewHotmailTokens = async () => {
     if (!hotmailTokensInput.trim()) return;
     setIsRenewingToken(true);
-    try {
-      const res = await fetch('/api/tools/renew-hotmail-token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tokensInput: hotmailTokensInput }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        setRenewResult(data);
+    const lines = hotmailTokensInput.split('\n').map((l) => l.trim()).filter(Boolean);
+    const results: any[] = [];
+    let liveCount = 0;
+    let dieCount = 0;
+
+    for (let idx = 0; idx < lines.length; idx++) {
+      const line = lines[idx];
+      const parts = line.split('|').map((p) => p.trim());
+      let email = '';
+      let password = '';
+      let refreshToken = '';
+      let clientId = '000000004017045b';
+      let tokenIndex = -1;
+
+      if (parts.length >= 4) {
+        email = parts[0];
+        password = parts[1];
+        refreshToken = parts[2];
+        clientId = parts[3] || '000000004017045b';
+        tokenIndex = 2;
+      } else if (parts.length === 3) {
+        email = parts[0];
+        if (parts[1].length > 30 || parts[1].startsWith('M.') || parts[1].startsWith('0.')) {
+          refreshToken = parts[1];
+          clientId = parts[2] || '000000004017045b';
+          tokenIndex = 1;
+        } else {
+          password = parts[1];
+          refreshToken = parts[2];
+          tokenIndex = 2;
+        }
+      } else if (parts.length === 2) {
+        if (parts[0].includes('@')) {
+          email = parts[0];
+          refreshToken = parts[1];
+          tokenIndex = 1;
+        } else {
+          refreshToken = parts[0];
+          clientId = parts[1] || '000000004017045b';
+          tokenIndex = 0;
+        }
+      } else {
+        if (line.includes('@')) {
+          email = line;
+        } else {
+          refreshToken = line;
+          tokenIndex = 0;
+        }
       }
-    } catch (err) {
-      console.error('Error renewing token', err);
-    } finally {
-      setIsRenewingToken(false);
+
+      // If tokenIndex is not set but parts exist, find the token part
+      if (tokenIndex === -1 && parts.length > 1) {
+        const foundIdx = parts.findIndex(
+          (p) => (p.length > 30 || p.startsWith('M.') || p.startsWith('0.')) && !p.includes('@')
+        );
+        if (foundIdx !== -1) {
+          refreshToken = parts[foundIdx];
+          tokenIndex = foundIdx;
+        }
+      }
+
+      try {
+        const res = await fetch('/api/renew_token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email,
+            password,
+            refresh_token: refreshToken,
+            client_id: clientId || '000000004017045b',
+          }),
+        });
+        const data = await res.json();
+        if (res.ok && data.status) {
+          liveCount++;
+          let outputLine = line;
+          if (data.new_refresh_token) {
+            if (tokenIndex >= 0 && tokenIndex < parts.length) {
+              const newParts = [...parts];
+              newParts[tokenIndex] = data.new_refresh_token;
+              outputLine = newParts.join('|');
+            } else {
+              outputLine = data.new_refresh_token;
+            }
+          }
+
+          results.push({
+            id: idx + 1,
+            input: line,
+            outputLine,
+            email: data.email || email || `user_${idx + 1}@hotmail.com`,
+            newRefreshToken: data.new_refresh_token || null,
+            expiresIn: data.expires_in || 3600,
+            status: 'LIVE',
+            renewedAt: new Date().toLocaleTimeString(),
+          });
+        } else {
+          dieCount++;
+          results.push({
+            id: idx + 1,
+            input: line,
+            outputLine: line,
+            email: email || `user_${idx + 1}@hotmail.com`,
+            newRefreshToken: null,
+            expiresIn: 0,
+            status: 'DIE',
+            errorMessage: data?.error || 'Token không hợp lệ hoặc đã hết hạn',
+            renewedAt: new Date().toLocaleTimeString(),
+          });
+        }
+      } catch (err: any) {
+        dieCount++;
+        results.push({
+          id: idx + 1,
+          input: line,
+          outputLine: line,
+          email: email || `user_${idx + 1}@hotmail.com`,
+          newRefreshToken: null,
+          expiresIn: 0,
+          status: 'DIE',
+          errorMessage: err.message || 'Lỗi kết nối',
+          renewedAt: new Date().toLocaleTimeString(),
+        });
+      }
     }
+
+    setRenewResult({
+      total: results.length,
+      liveCount,
+      dieCount,
+      results,
+    });
+    setIsRenewingToken(false);
   };
 
-  const handleCopySingleToken = (token: string, idx: number) => {
-    navigator.clipboard.writeText(token);
-    setCopiedTokenIndex(idx);
-    setTimeout(() => setCopiedTokenIndex(null), 2000);
+  const handleCopyLine = (line: string, idx: number) => {
+    navigator.clipboard.writeText(line);
+    setCopiedLineIndex(idx);
+    setTimeout(() => setCopiedLineIndex(null), 2000);
   };
 
-  const handleCopyAllAccessTokens = () => {
+  const handleCopyAllRenewedLines = () => {
     if (!renewResult || !renewResult.results) return;
-    const allTokens = renewResult.results
-      .filter((r: any) => r.accessToken)
-      .map((r: any) => `${r.email}|${r.accessToken}`)
-      .join('\n');
-    navigator.clipboard.writeText(allTokens);
-    setCopiedAllTokens(true);
-    setTimeout(() => setCopiedAllTokens(false), 2000);
+    const liveResults = renewResult.results.filter(
+      (r: any) => r.status === 'LIVE' || r.status === 'HOẠT ĐỘNG'
+    );
+    const targetResults = liveResults.length > 0 ? liveResults : renewResult.results;
+    const allLines = targetResults.map((r: any) => r.outputLine).join('\n');
+    navigator.clipboard.writeText(allLines);
+    setCopiedAllLines(true);
+    setTimeout(() => setCopiedAllLines(false), 2000);
   };
 
   if (!isOpen) return null;
@@ -264,7 +341,7 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
               {/* Redundant with the tab bar's icons/labels right below it, and
                   on a phone-width header it just forces an ugly two-line wrap
                   that crowds the close button — so it's desktop-only. */}
-              <p className="hidden sm:block text-[11px] text-slate-600 dark:text-slate-400">2FA TOTP • Email Inbox Reader • Data Splitter • Renew Token Hotmail</p>
+              <p className="hidden sm:block text-[11px] text-slate-600 dark:text-slate-400">2FA (TOTP) • {t.toolsSplitterTabLabel} • {t.toolsEmailReader || 'Email Reader'} • {t.renewHotmail}</p>
             </div>
           </div>
           <button onClick={onClose} className="text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100 text-sm">
@@ -293,19 +370,6 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
           </button>
 
           <button
-            onClick={() => setActiveTab('email')}
-            title="Email Reader"
-            className={`py-2.5 sm:py-3 px-1 sm:px-4 flex items-center justify-center gap-1.5 sm:gap-2 border-b-2 whitespace-nowrap transition ${
-              activeTab === 'email'
-                ? 'border-emerald-400 text-emerald-600 dark:text-emerald-400 bg-[#eef0ef] dark:bg-[#202227]'
-                : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200'
-            }`}
-          >
-            <Mail className="w-4 h-4 sm:w-3.5 sm:h-3.5 flex-shrink-0" />
-            <span className="hidden sm:inline">Email Reader</span>
-          </button>
-
-          <button
             onClick={() => setActiveTab('splitter')}
             title={t.toolsSplitterTabLabel}
             className={`py-2.5 sm:py-3 px-1 sm:px-4 flex items-center justify-center gap-1.5 sm:gap-2 border-b-2 whitespace-nowrap transition ${
@@ -316,6 +380,19 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
           >
             <Split className="w-4 h-4 sm:w-3.5 sm:h-3.5 flex-shrink-0" />
             <span className="hidden sm:inline">{t.toolsSplitterTabLabel}</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('email')}
+            title={t.toolsEmailReader || 'Email Reader'}
+            className={`py-2.5 sm:py-3 px-1 sm:px-4 flex items-center justify-center gap-1.5 sm:gap-2 border-b-2 whitespace-nowrap transition ${
+              activeTab === 'email'
+                ? 'border-emerald-400 text-emerald-600 dark:text-emerald-400 bg-[#eef0ef] dark:bg-[#202227]'
+                : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200'
+            }`}
+          >
+            <Mail className="w-4 h-4 sm:w-3.5 sm:h-3.5 flex-shrink-0" />
+            <span className="hidden sm:inline">{t.toolsEmailReader || 'Email Reader'}</span>
           </button>
 
           <button
@@ -389,48 +466,7 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
           )}
 
           {activeTab === 'email' && (
-            <div className="space-y-3">
-              <div className="p-2.5 bg-amber-50 dark:bg-amber-950/70 border border-amber-500/40 rounded-lg text-[11px] text-amber-800 dark:text-amber-200">
-                {t.demoDataNotice}
-              </div>
-              <div>
-                <label className="font-bold text-slate-800 dark:text-slate-200 block mb-1">{t.emailReaderTool}</label>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={emailInput}
-                    onChange={(e) => setEmailInput(e.target.value)}
-                    placeholder="email@hotmail.com|password"
-                    className="flex-1 bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] rounded-lg px-3 py-2 text-xs font-mono text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-500"
-                  />
-                  <button
-                    onClick={handleReadEmail}
-                    disabled={isReadingMail}
-                    className="bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 font-bold px-4 py-2 rounded-lg transition flex items-center gap-1"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${isReadingMail ? 'animate-spin' : ''}`} />
-                    <span>{isReadingMail ? t.toolsReadingInbox : t.toolsReadInbox}</span>
-                  </button>
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                {emails.map((m, idx) => (
-                  <div key={idx} className="p-3 bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl space-y-1">
-                    <div className="flex items-center justify-between text-slate-600 dark:text-slate-400 text-[11px]">
-                      <span className="text-slate-800 dark:text-slate-200 font-medium">{m.sender}</span>
-                      <span>{m.time}</span>
-                    </div>
-                    <div className="text-slate-700 dark:text-slate-300 font-medium">{m.subject}</div>
-                    {m.code && (
-                      <div className="inline-block bg-[#eceeed] dark:bg-[#23252a] border border-emerald-500/30 px-2 py-0.5 rounded text-emerald-700 dark:text-emerald-300 font-mono font-bold text-xs">
-                        OTP: {m.code}
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
+            <EmailReaderTab language={language} />
           )}
 
           {activeTab === 'splitter' && (
@@ -591,7 +627,7 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
           {/* TAB 4: RENEW TOKEN HOTMAIL */}
           {activeTab === 'renew-hotmail' && (
             <div className="space-y-4">
-              <div className="bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl p-3.5 space-y-1.5">
+              <div className="bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl p-3.5 space-y-1">
                 <div className="flex items-center gap-2 text-slate-900 dark:text-slate-100 font-bold text-xs">
                   <RefreshCw className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
                   <span>{t.renewHotmail}</span>
@@ -599,20 +635,17 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
                 <p className="text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed">
                   {t.renewHotmailDesc}
                 </p>
-                <div className="text-[10px] text-slate-600 dark:text-slate-400 font-mono pt-1">
-                  {t.toolsFormatLabel} <code className="text-emerald-700 dark:text-emerald-300">refresh_token</code> {t.toolsOrWord} <code className="text-emerald-700 dark:text-emerald-300">email|refresh_token</code> {t.toolsOrWord} <code className="text-emerald-700 dark:text-emerald-300">email|refresh_token|client_id</code>
-                </div>
               </div>
 
               <div>
-                <label className="font-bold text-slate-800 dark:text-slate-200 block mb-1">
+                <label className="font-bold text-slate-800 dark:text-slate-200 text-xs block mb-1">
                   {t.toolsHotmailTokensLabel}
                 </label>
                 <textarea
                   rows={4}
                   value={hotmailTokensInput}
                   onChange={(e) => setHotmailTokensInput(e.target.value)}
-                  placeholder="ronan_user1@hotmail.com|M.C543_BAY.0.U.-CtwJ!1829481928a9b1c2d3e4f5g"
+                  placeholder={`email|pass|refresh_token|client_id\nemail|refresh_token\nemail|pass|refresh_token\nrefresh_token`}
                   className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl p-3 font-mono text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-500"
                 />
 
@@ -624,7 +657,7 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
                   <button
                     onClick={handleRenewHotmailTokens}
                     disabled={isRenewingToken || !hotmailTokensInput.trim()}
-                    className="bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-slate-950 font-bold px-5 py-2 rounded-xl transition flex items-center gap-1.5 disabled:opacity-40 shadow-md shadow-emerald-500/20"
+                    className="bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-slate-950 font-bold px-5 py-2 rounded-xl transition flex items-center gap-1.5 disabled:opacity-40 shadow-md shadow-emerald-500/20 cursor-pointer text-xs"
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${isRenewingToken ? 'animate-spin' : ''}`} />
                     <span>{isRenewingToken ? t.toolsSendingMsApi : t.toolsRenewTokenBtn}</span>
@@ -634,85 +667,82 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
 
               {/* Results */}
               {renewResult && (
-                <div className="space-y-3 pt-2 border-t border-[#e2e6e5] dark:border-[#30333b]">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-3">
+                <div className="space-y-2.5 pt-2 border-t border-[#e2e6e5] dark:border-[#30333b]">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
                       <span className="text-xs font-bold text-slate-900 dark:text-slate-100">{t.toolsResultsLabel}</span>
-                      <span className="text-[11px] bg-emerald-50 dark:bg-emerald-950/70 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 px-2 py-0.5 rounded font-bold">
+                      <span className="text-[11px] bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30 px-2 py-0.5 rounded font-bold">
                         ✓ LIVE: {renewResult.liveCount}
                       </span>
                       {renewResult.dieCount > 0 && (
-                        <span className="text-[11px] bg-red-50 dark:bg-red-950/70 text-red-700 dark:text-red-300 border border-red-500/30 px-2 py-0.5 rounded font-bold">
+                        <span className="text-[11px] bg-rose-500/15 text-rose-700 dark:text-rose-400 border border-rose-500/30 px-2 py-0.5 rounded font-bold">
                           ✕ DIE: {renewResult.dieCount}
                         </span>
                       )}
                     </div>
 
                     <button
-                      onClick={handleCopyAllAccessTokens}
-                      className="text-emerald-700 dark:text-emerald-300 hover:text-slate-900 hover:dark:text-slate-100 text-xs font-semibold flex items-center gap-1 bg-[#f2f4f3] dark:bg-[#1a1b1f] px-2.5 py-1 rounded-lg border border-[#e2e6e5] dark:border-[#30333b]"
+                      onClick={handleCopyAllRenewedLines}
+                      className="text-emerald-700 dark:text-emerald-300 hover:text-slate-900 hover:dark:text-slate-100 text-xs font-semibold flex items-center gap-1.5 bg-[#f2f4f3] dark:bg-[#1a1b1f] px-2.5 py-1.5 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] cursor-pointer"
+                      title={t.toolsCopyAllBtn || 'Copy Tất Cả'}
                     >
-                      {copiedAllTokens ? <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                      <span>{copiedAllTokens ? t.toolsCopiedAll : t.toolsCopyAllBtn}</span>
+                      {copiedAllLines ? (
+                        <>
+                          <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                          <span>{t.toolsCopiedAll || 'Đã chép tất cả'}</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          <span>{t.toolsCopyAllBtn || 'Copy Tất Cả'}</span>
+                        </>
+                      )}
                     </button>
                   </div>
 
-                  <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
-                    {renewResult.results.map((item: any, idx: number) => (
-                      <div
-                        key={idx}
-                        className="p-3 rounded-xl border border-[#e2e6e5] dark:border-[#30333b] bg-[#f2f4f3] dark:bg-[#1a1b1f] flex flex-col sm:flex-row sm:items-center justify-between gap-2.5"
-                      >
-                        <div className="space-y-1 flex-1 min-w-0">
-                          <div className="flex items-center gap-2">
-                            <span className="font-bold text-slate-800 dark:text-slate-200 text-xs truncate">{item.email}</span>
-                            <span
-                              className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
-                                item.status === 'LIVE'
-                                  ? 'bg-emerald-50 dark:bg-emerald-950/70 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30'
-                                  : 'bg-red-50 dark:bg-red-950/70 text-red-700 dark:text-red-300 border border-red-500/30'
-                              }`}
-                            >
-                              {item.status}
-                            </span>
-                            {item.expiresIn > 0 && (
-                              <span className="text-[10px] text-slate-600 dark:text-slate-400">
-                                {t.toolsExpiresInTemplate.replace('{s}', String(item.expiresIn))}
-                              </span>
-                            )}
-                          </div>
+                  <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                    {renewResult.results.map((item: any, idx: number) => {
+                      const isLive = item.status === 'LIVE' || item.status === 'HOẠT ĐỘNG';
+                      return (
+                        <div
+                          key={idx}
+                          className="flex items-center gap-2 px-2.5 py-2 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] bg-[#fafcfb] dark:bg-[#181a1e] hover:border-emerald-500/30 transition text-xs group"
+                        >
+                          <span className="font-mono text-[10px] text-slate-500 dark:text-slate-400 bg-[#e7ebe9] dark:bg-[#282a30] px-1.5 py-0.5 rounded font-bold flex-shrink-0">
+                            #{idx + 1}
+                          </span>
 
-                          {item.accessToken ? (
-                            <div className="font-mono text-[11px] text-emerald-700 dark:text-emerald-300 truncate bg-[#f5f6f6] dark:bg-[#16181b] px-2 py-1 rounded border border-[#e2e6e5] dark:border-[#30333b]">
-                              {item.accessToken}
-                            </div>
-                          ) : (
-                            <div className="text-[11px] text-slate-600 dark:text-slate-400">
-                              {t.toolsTokenExpiredMsg}
-                            </div>
-                          )}
-                        </div>
-
-                        {item.accessToken && (
-                          <button
-                            onClick={() => handleCopySingleToken(item.accessToken, idx)}
-                            className="flex-shrink-0 bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 font-semibold px-3 py-1.5 rounded-lg text-xs flex items-center gap-1 transition"
+                          <span
+                            className={`text-[10px] font-bold px-1.5 py-0.5 rounded flex-shrink-0 ${
+                              isLive
+                                ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30'
+                                : 'bg-rose-500/15 text-rose-700 dark:text-rose-400 border border-rose-500/30'
+                            }`}
                           >
-                            {copiedTokenIndex === idx ? (
-                              <>
-                                <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
-                                <span className="text-emerald-600 dark:text-emerald-400 font-bold">{t.pdCopiedLabel}</span>
-                              </>
+                            {isLive ? 'LIVE' : 'DIE'}
+                          </span>
+
+                          <span
+                            className="font-mono text-xs text-slate-800 dark:text-slate-200 truncate flex-1 min-w-0 select-all cursor-text"
+                            title={item.outputLine}
+                          >
+                            {item.outputLine}
+                          </span>
+
+                          <button
+                            onClick={() => handleCopyLine(item.outputLine, idx)}
+                            className="text-slate-500 dark:text-slate-400 hover:text-emerald-600 dark:hover:text-emerald-400 hover:bg-[#e7ebe9] dark:hover:bg-[#282a30] p-1.5 rounded transition flex-shrink-0 cursor-pointer"
+                            title={t.toolsCopyShort || 'Copy'}
+                          >
+                            {copiedLineIndex === idx ? (
+                              <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
                             ) : (
-                              <>
-                                <Copy className="w-3.5 h-3.5" />
-                                <span>Copy Token</span>
-                              </>
+                              <Copy className="w-3.5 h-3.5" />
                             )}
                           </button>
-                        )}
-                      </div>
-                    ))}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               )}
