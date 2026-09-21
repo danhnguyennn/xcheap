@@ -262,6 +262,33 @@ export default function App() {
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
 
+  // Presence heartbeat for the admin "online now" stat — every tab (guest or
+  // logged in) pings every 20s with a per-browser id kept in localStorage,
+  // so several tabs from the same visitor still only count as one person.
+  useEffect(() => {
+    let visitorId: string;
+    try {
+      visitorId = localStorage.getItem('xcheap_visitor_id') || '';
+      if (!visitorId) {
+        visitorId = crypto.randomUUID();
+        localStorage.setItem('xcheap_visitor_id', visitorId);
+      }
+    } catch {
+      visitorId = crypto.randomUUID(); // private-window localStorage may throw — still ping, just not persisted
+    }
+
+    const ping = () => {
+      fetch('/api/presence/ping', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ visitorId }),
+      }).catch(() => {});
+    };
+    ping();
+    const interval = setInterval(ping, 20000);
+    return () => clearInterval(interval);
+  }, []);
+
   // Already logged in but sitting on /login or /register — send home instead.
   useEffect(() => {
     if (authChecked && user && (currentPage === 'login' || currentPage === 'register')) {

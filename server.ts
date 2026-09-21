@@ -25,6 +25,27 @@ app.use(sessionMiddleware() as any);
 // requests, not across restarts (a restart has no in-flight requests to race).
 const depositCheckInProgress = new Set<string>();
 
+// "Online now" count for the admin dashboard — every open tab (logged in or
+// guest) pings this every ~20s with a random id it generated once and kept
+// in localStorage, so the same visitor across multiple tabs still counts as
+// one person. In-memory by design: this is a live "right now" figure, not
+// historical data worth persisting across a restart.
+const ONLINE_WINDOW_MS = 60 * 1000;
+const lastSeenByVisitor = new Map<string, number>();
+
+function countOnlineVisitors(): number {
+  const cutoff = Date.now() - ONLINE_WINDOW_MS;
+  let count = 0;
+  for (const [visitorId, lastSeen] of lastSeenByVisitor) {
+    if (lastSeen < cutoff) {
+      lastSeenByVisitor.delete(visitorId);
+    } else {
+      count++;
+    }
+  }
+  return count;
+}
+
 // Caps how many random inventory samples a visitor can pull for a single
 // product before cooling down — without this, the "xem mẫu ngẫu nhiên"
 // button could be used to enumerate real usernames out of the warehouse in
@@ -1002,13 +1023,12 @@ app.get('/api/products/:id/sample', async (req, res) => {
 // fulfillment (which prices an order at delivery time, not at the moment the
 // pre-order was placed) can price it identically instead of duplicating the
 // logic and risking the two ever drifting apart.
+// CTV/admin no longer get an automatic role-based discount when buying —
+// they pay the exact listed price, same as a regular user with no VIP tier
+// yet. Only the VIP-by-deposit system below still applies (role === 'user').
 async function computeUnitPriceForUser(user: User, listedPrice: number): Promise<number> {
   let unitPrice = listedPrice;
-  if (user.role === 'ctv') {
-    unitPrice = Number((unitPrice * (1 - (user.discountPercent || 12) / 100)).toFixed(3));
-  } else if (user.role === 'admin') {
-    unitPrice = Number((unitPrice * (1 - (user.discountPercent || 20) / 100)).toFixed(3));
-  } else if (user.role === 'user') {
+  if (user.role === 'user') {
     const totalDeposited = await computeTotalDeposited(user.id);
     const vipDiscountPercent = getVipTier(totalDeposited).discountPercent;
     if (vipDiscountPercent > 0) {
@@ -1794,7 +1814,7 @@ app.post('/api/admin/users/create', requireRole('admin'), async (req, res) => {
     email: cleanEmail,
     role: role as UserRole,
     balance: Number(initialBalance) || 0,
-    discountPercent: role === 'admin' ? 20 : role === 'ctv' ? 12 : 0,
+    discountPercent: 0,
     depositWallets: await getOrCreateUserWallet(newId),
     passwordHash: await hashPassword(tempPassword),
     apiKey: generateApiKey(),
@@ -2127,7 +2147,10 @@ app.get('/api/admin/inventory', requireRole('admin'), async (req, res) => {
   const available = await invCol.countDocuments({ ...baseQuery, isSold: false });
   const sold = await invCol.countDocuments({ ...baseQuery, isSold: true });
 
-  const preview = items.slice(0, 100).map((item) => ({
+  // The Admin Inventory tab now paginates through every product client-side
+  // (see AdminPage.tsx), so this needs to cover the store's real inventory,
+  // not just a 100-item preview sample.
+  const preview = items.slice(0, 5000).map((item) => ({
     id: item.id,
     productId: item.productId,
     variantId: item.variantId,
@@ -2177,6 +2200,22 @@ app.get('/api/admin/stats', requireRole('admin'), async (req, res) => {
     platformFeePercent: feePercent,
     databaseEngine: 'MongoDB Document Storage Engine',
   });
+});
+
+// Presence ping — called every ~20s by every open tab (see App.tsx), guest
+// or logged in, with a random id that tab generated once and stashed in
+// localStorage. No auth required: guests count toward "online now" too.
+app.post('/api/presence/ping', (req, res) => {
+  const { visitorId } = req.body;
+  if (typeof visitorId === 'string' && visitorId.length > 0 && visitorId.length <= 100) {
+    lastSeenByVisitor.set(visitorId, Date.now());
+  }
+  res.json({ ok: true });
+});
+
+// Admin-only — polled every ~20s by the admin dashboard (see AdminPage.tsx).
+app.get('/api/admin/online-count', requireRole('admin'), (req, res) => {
+  res.json({ count: countOnlineVisitors() });
 });
 
 // 17b. Admin Chart Stats — revenue/orders bucketed by the requested period

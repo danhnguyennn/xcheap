@@ -34,7 +34,8 @@ import {
   Upload,
   Star,
   Eye,
-  EyeOff
+  EyeOff,
+  Flame
 } from 'lucide-react';
 
 interface AdminPageProps {
@@ -157,6 +158,37 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   // Search queries
   const [userSearch, setUserSearch] = useState('');
   const [productSearch, setProductSearch] = useState('');
+
+  // Pagination — Users and Inventory tabs used to just dump everything into
+  // a tall scroll box, which got unwieldy once there were more than a
+  // screenful of rows. Paginated instead, page resets to 1 whenever the
+  // underlying filtered list changes shape (new search term, new data).
+  const USERS_PER_PAGE = 15;
+  const [usersPage, setUsersPage] = useState(1);
+  const INVENTORY_PRODUCTS_PER_PAGE = 8;
+  const [inventoryPage, setInventoryPage] = useState(1);
+
+  // "Đang online" stat — polled independently of fetchAdminData (which only
+  // runs on mount/after an action) so the number actually stays live while
+  // the admin has the dashboard open.
+  const [onlineCount, setOnlineCount] = useState<number | null>(null);
+  useEffect(() => {
+    const fetchOnlineCount = () => {
+      fetch('/api/admin/online-count')
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (data) setOnlineCount(data.count);
+        })
+        .catch(() => {});
+    };
+    fetchOnlineCount();
+    const interval = setInterval(fetchOnlineCount, 20000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    setUsersPage(1);
+  }, [userSearch]);
 
   const showNotification = (successMsg: string | null, errorMsg: string | null = null) => {
     setActionSuccess(successMsg);
@@ -820,6 +852,28 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     }
   };
 
+  // Hot Deals shows at most the first 2 products with isHot === true (see
+  // HotDeals.tsx) — this is the only place that flag can be set, since the
+  // product create/edit form never exposed it.
+  const handleToggleProductHot = async (prod: Product) => {
+    const nextHot = !prod.isHot;
+    try {
+      const res = await fetch(`/api/admin/products/${prod.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isHot: nextHot }),
+      });
+      if (res.ok) {
+        showNotification(nextHot ? `✅ Đã thêm "${prod.name}" vào Hot Deals` : `✅ Đã bỏ "${prod.name}" khỏi Hot Deals`);
+        onRefreshProducts();
+      } else {
+        showNotification(null, 'Lỗi cập nhật Hot Deal');
+      }
+    } catch (e) {
+      showNotification(null, 'Lỗi cập nhật Hot Deal');
+    }
+  };
+
   // Toggle a single variant on/off the storefront (same idea, scoped to one
   // variant of the product rather than the whole listing). Calls
   // refreshAfterVariantChange (defined further down) — safe to reference
@@ -1136,7 +1190,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         {activeTab === 'overview' && (
           <div className="space-y-6">
             {/* Stat Cards Grid */}
-            <div className="grid grid-cols-2 md:grid-cols-5 gap-3 sm:gap-4">
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 sm:gap-4">
               <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl p-4 shadow-sm">
                 <div className="flex items-center justify-between text-xs text-slate-600 dark:text-slate-400 mb-1">
                   <span>Tổng Doanh Thu</span>
@@ -1194,6 +1248,21 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 <div className="text-[11px] text-slate-600 dark:text-slate-400 mt-1">
                   {allUsers.filter((u) => u.role === 'ctv').length} CTV | {allUsers.filter((u) => u.role === 'admin').length} Admin
                 </div>
+              </div>
+
+              <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl p-4 shadow-sm">
+                <div className="flex items-center justify-between text-xs text-slate-600 dark:text-slate-400 mb-1">
+                  <span>Đang Online</span>
+                  <Activity className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                </div>
+                <div className="text-xl sm:text-2xl font-black text-emerald-600 dark:text-emerald-400 font-mono flex items-center gap-2">
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
+                  </span>
+                  {onlineCount ?? '—'}
+                </div>
+                <div className="text-[11px] text-slate-600 dark:text-slate-400 mt-1">Trong 60 giây gần nhất</div>
               </div>
             </div>
 
@@ -1598,6 +1667,17 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                                 {prod.isHidden ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                               </button>
                               <button
+                                onClick={() => handleToggleProductHot(prod)}
+                                className={`p-1 rounded transition ${
+                                  prod.isHot
+                                    ? 'text-orange-600 dark:text-orange-400 bg-orange-50 dark:bg-orange-950/70'
+                                    : 'text-slate-600 dark:text-slate-400 hover:text-orange-600 hover:dark:text-orange-400 hover:bg-orange-50 hover:dark:bg-orange-950/70'
+                                }`}
+                                title={prod.isHot ? 'Bỏ khỏi Hot Deals' : 'Thêm vào Hot Deals (tối đa 2 sản phẩm hiện cùng lúc)'}
+                              >
+                                <Flame className="w-4 h-4" fill={prod.isHot ? 'currentColor' : 'none'} />
+                              </button>
+                              <button
                                 onClick={() => handleOpenVariants(prod)}
                                 className="p-1 text-slate-600 dark:text-slate-400 hover:text-amber-600 hover:dark:text-amber-400 hover:bg-amber-50 hover:dark:bg-amber-950/70 rounded transition"
                                 title="Quản lý biến thể"
@@ -1938,13 +2018,17 @@ export const AdminPage: React.FC<AdminPageProps> = ({
               </div>
             </div>
 
-            {/* Users Table — capped height with its own scrollbar so a large
-                user base doesn't stretch the whole admin page out; header
-                stays pinned while scrolling. */}
+            {(() => {
+              const filteredUsers = allUsers.filter(
+                (u) => !userSearch || u.username.toLowerCase().includes(userSearch.toLowerCase()) || u.email.toLowerCase().includes(userSearch.toLowerCase())
+              );
+              const usersTotalPages = Math.max(1, Math.ceil(filteredUsers.length / USERS_PER_PAGE));
+              const pagedUsers = filteredUsers.slice((usersPage - 1) * USERS_PER_PAGE, usersPage * USERS_PER_PAGE);
+              return (
+                <>
             <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
-              <div className="max-h-[560px] overflow-y-auto">
               <table className="w-full text-left text-xs">
-                <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43] sticky top-0 z-10">
+                <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
                   <tr>
                     <th className="p-3">Tài khoản</th>
                     <th className="p-3">Email</th>
@@ -1956,9 +2040,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#e4e8e7]">
-                  {allUsers
-                    .filter((u) => !userSearch || u.username.toLowerCase().includes(userSearch.toLowerCase()) || u.email.toLowerCase().includes(userSearch.toLowerCase()))
-                    .map((usr) => (
+                  {pagedUsers.map((usr) => (
                       <tr key={usr.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34] transition">
                         <td className="p-3">
                           <div className="font-bold text-slate-900 dark:text-slate-100">{usr.username}</div>
@@ -1990,10 +2072,10 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                             ) : (
                               '0%'
                             )
-                          ) : usr.discountPercent > 0 ? (
-                            <span className="text-emerald-600 dark:text-emerald-400 font-semibold">-{usr.discountPercent}%</span>
                           ) : (
-                            '0%'
+                            // CTV/admin no longer get an automatic purchase
+                            // discount — they always pay the listed price.
+                            <span className="text-slate-500 dark:text-slate-500">—</span>
                           )}
                         </td>
                         <td className="p-3 font-mono text-[10px] text-slate-600 dark:text-slate-400 max-w-[140px] truncate" title={usr.depositWallets?.bsc}>
@@ -2006,9 +2088,9 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                             onChange={(e) => handleUpdateUser(usr.id, e.target.value as UserRole)}
                             className="bg-[#eef0ef] dark:bg-[#202227] border border-[#dee1e0] dark:border-[#373b43] rounded px-1.5 py-1 text-[11px] text-slate-800 dark:text-slate-200"
                           >
-                            <option value="user">USER (0%)</option>
-                            <option value="ctv">CTV (12%)</option>
-                            <option value="admin">ADMIN (20%)</option>
+                            <option value="user">USER</option>
+                            <option value="ctv">CTV</option>
+                            <option value="admin">ADMIN</option>
                           </select>
 
                           {/* Custom balance top-up/deduct amount */}
@@ -2054,8 +2136,35 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                     ))}
                 </tbody>
               </table>
-              </div>
             </div>
+
+            {/* Pagination */}
+            {usersTotalPages > 1 && (
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-slate-600 dark:text-slate-400">
+                  Trang {usersPage}/{usersTotalPages} ({filteredUsers.length} người dùng)
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setUsersPage((p) => Math.max(1, p - 1))}
+                    disabled={usersPage === 1}
+                    className="px-3 py-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e0e4e2] hover:dark:bg-[#2a2d34] border border-[#dde2e0] dark:border-[#373b43] rounded-lg font-semibold text-slate-700 dark:text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                  >
+                    ← Trước
+                  </button>
+                  <button
+                    onClick={() => setUsersPage((p) => Math.min(usersTotalPages, p + 1))}
+                    disabled={usersPage === usersTotalPages}
+                    className="px-3 py-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e0e4e2] hover:dark:bg-[#2a2d34] border border-[#dde2e0] dark:border-[#373b43] rounded-lg font-semibold text-slate-700 dark:text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                  >
+                    Sau →
+                  </button>
+                </div>
+              </div>
+            )}
+                </>
+              );
+            })()}
 
             {/* Modal Add User */}
             {showAddUserModal && (
@@ -2103,8 +2212,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                           className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-2 py-2 text-slate-800 dark:text-slate-200"
                         >
                           <option value="user">Thành viên (User)</option>
-                          <option value="ctv">Cộng tác viên (CTV -12%)</option>
-                          <option value="admin">Quản trị viên (Admin -20%)</option>
+                          <option value="ctv">Cộng tác viên (CTV)</option>
+                          <option value="admin">Quản trị viên (Admin)</option>
                         </select>
                       </div>
 
@@ -2235,7 +2344,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   <Database className="w-4 h-4 text-purple-600 dark:text-purple-400" />
                   <span>Danh Sách Tài Khoản Trong Kho (Xem Mẫu Bảo Mật)</span>
                 </h3>
-                <span className="text-xs text-slate-600 dark:text-slate-400">Hiển thị mẫu 100 tài khoản • Bấm vào tên sản phẩm để mở/đóng</span>
+                <span className="text-xs text-slate-600 dark:text-slate-400">Bấm vào tên sản phẩm để mở/đóng</span>
               </div>
 
               {inventoryItems.length === 0 ? (
@@ -2243,7 +2352,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   Kho hàng đang trống. Nhập tài khoản ở form phía trên.
                 </div>
               ) : (
-                <div className="max-h-[520px] overflow-y-auto space-y-3 pr-1">
+                <>
+                <div className="space-y-3">
                 {(() => {
                   const byProduct = new Map<string, typeof inventoryItems>();
                   inventoryItems.forEach((item) => {
@@ -2251,8 +2361,21 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                     list.push(item);
                     byProduct.set(item.productId, list);
                   });
+                  const productEntries = Array.from(byProduct.entries());
+                  const inventoryTotalPages = Math.max(1, Math.ceil(productEntries.length / INVENTORY_PRODUCTS_PER_PAGE));
+                  // Clamped rather than reset via effect — if a bulk import
+                  // or filter change shrinks the product count while the
+                  // admin is sitting on a now out-of-range page, this just
+                  // quietly shows the last valid page instead of a blank one.
+                  const safeInventoryPage = Math.min(inventoryPage, inventoryTotalPages);
+                  const pagedEntries = productEntries.slice(
+                    (safeInventoryPage - 1) * INVENTORY_PRODUCTS_PER_PAGE,
+                    safeInventoryPage * INVENTORY_PRODUCTS_PER_PAGE
+                  );
 
-                  return Array.from(byProduct.entries()).map(([productId, items]) => {
+                  return (
+                    <>
+                    {pagedEntries.map(([productId, items]) => {
                     const product = products.find((p) => p.id === productId);
                     const isExpanded = expandedInventoryProducts.has(productId);
                     const byVariant = new Map<string, typeof items>();
@@ -2320,9 +2443,35 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                         })}
                       </div>
                     );
-                  });
+                  })}
+                    {inventoryTotalPages > 1 && (
+                      <div className="flex items-center justify-between text-xs pt-1">
+                        <span className="text-slate-600 dark:text-slate-400">
+                          Trang {safeInventoryPage}/{inventoryTotalPages} ({productEntries.length} sản phẩm)
+                        </span>
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => setInventoryPage((p) => Math.max(1, p - 1))}
+                            disabled={safeInventoryPage === 1}
+                            className="px-3 py-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e0e4e2] hover:dark:bg-[#2a2d34] border border-[#dde2e0] dark:border-[#373b43] rounded-lg font-semibold text-slate-700 dark:text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                          >
+                            ← Trước
+                          </button>
+                          <button
+                            onClick={() => setInventoryPage((p) => Math.min(inventoryTotalPages, p + 1))}
+                            disabled={safeInventoryPage === inventoryTotalPages}
+                            className="px-3 py-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e0e4e2] hover:dark:bg-[#2a2d34] border border-[#dde2e0] dark:border-[#373b43] rounded-lg font-semibold text-slate-700 dark:text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                          >
+                            Sau →
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                    </>
+                  );
                 })()}
                 </div>
+                </>
               )}
             </div>
           </div>
