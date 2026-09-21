@@ -13,7 +13,10 @@ import { ethers } from 'ethers';
 const app = express();
 const PORT = 3434;
 
-app.use(express.json());
+// Default 100kb is too small for CTV/admin bulk stock imports (pasting a
+// few thousand account lines easily exceeds it) — 10mb gives generous
+// headroom while still bounding request size sanely.
+app.use(express.json({ limit: '50mb' }));
 app.use(sessionMiddleware() as any);
 
 // Serializes concurrent /api/deposit/check-rpc calls per user+network so two
