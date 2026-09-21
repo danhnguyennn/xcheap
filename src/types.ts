@@ -16,6 +16,10 @@ export interface CryptoOption {
   icon: string;
   minDeposit: number;
   chainId?: number; // EVM chain id, used to skip ethers' network auto-detection
+  // Admin can pull a deposit network off the deposit page without deleting
+  // its config (and without breaking any already-generated user wallet
+  // addresses for it) — same on/off pattern as Product.isHidden.
+  isHidden?: boolean;
 }
 
 export interface User {
@@ -58,6 +62,11 @@ export interface ProductVariant {
   // of view. Any variant object that actually reached the frontend has them.
   stockCount?: number;
   inStock?: boolean;
+  // Set by the owning CTV/Admin to pull a variant off the storefront without
+  // deleting it (and its inventory) outright — e.g. to pause selling one
+  // package while restocking. Missing/false means visible, same as before
+  // this field existed, so no backfill is needed for existing variants.
+  isHidden?: boolean;
 }
 
 export interface Product {
@@ -83,6 +92,12 @@ export interface Product {
   createdByUserId?: string;
   isHot?: boolean;
   isFeatured?: boolean;
+  // Set by the owning CTV/Admin to pull the whole product off the
+  // storefront without deleting it — hidden products are skipped by every
+  // customer-facing listing/detail/category-count endpoint, but still show
+  // up (clearly marked) in the owner's own admin/CTV product table so they
+  // can be unhidden later. Missing/false means visible.
+  isHidden?: boolean;
   inStock: boolean;
   price: number;
   originalPrice?: number;

@@ -334,7 +334,7 @@ export class MongoDBEngine {
         {
           id: 'user_admin',
           username: 'admin',
-          email: 'admin@xcheap.us',
+          email: 'admin@xcheap.top',
           role: 'admin',
           balance: 1000,
           discountPercent: 0,
@@ -351,7 +351,7 @@ export class MongoDBEngine {
         {
           id: 'user_demo',
           username: 'demo',
-          email: 'demo@xcheap.us',
+          email: 'demo@xcheap.top',
           role: 'user',
           balance: 85.5,
           discountPercent: 0,
@@ -368,7 +368,7 @@ export class MongoDBEngine {
         {
           id: 'user_ctv',
           username: 'ctv_seller',
-          email: 'ctv@xcheap.us',
+          email: 'ctv@xcheap.top',
           role: 'ctv',
           balance: 240,
           discountPercent: 10,

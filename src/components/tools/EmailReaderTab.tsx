@@ -117,7 +117,7 @@ interface EmailReaderTabProps {
 
 export const EmailReaderTab: React.FC<EmailReaderTabProps> = ({ language }) => {
   const t = translations[language] || translations.vn;
-  const [inputText, setInputText] = useState(SAMPLE_INPUT);
+  const [inputText, setInputText] = useState('');
   const [listMailType, setListMailType] = useState<'all' | 'inbox' | 'junk'>('all');
   const [accounts, setAccounts] = useState<AccountGroup[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);

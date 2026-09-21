@@ -4,14 +4,14 @@ import express from 'express';
 import path from 'path';
 import { cryptoOptions } from './src/data/storeData';
 import { getVipTier } from './src/data/vipTiers';
-import { User, UserRole, Product, Order, PreOrder, AdminNotification, DepositTransaction, CryptoNetwork, WithdrawalRequest, CtvStats, Category, Voucher, Review, ReviewSuggestion } from './src/types';
+import { User, UserRole, Product, Order, PreOrder, AdminNotification, DepositTransaction, CryptoNetwork, CryptoOption, WithdrawalRequest, CtvStats, Category, Voucher, Review, ReviewSuggestion } from './src/types';
 import { db, generateObjectId, MongoCollection } from './server/mongodb';
 import { getOrCreateUserWallet, ensureUserDepositWallets } from './server/walletVault';
 import { sessionMiddleware, getSessionUser, requireAuth, requireRole, hashPassword, verifyPassword, toPublicUser, generateApiKey } from './server/auth';
 import { ethers } from 'ethers';
 
 const app = express();
-const PORT = 3000;
+const PORT = 3434;
 
 app.use(express.json());
 app.use(sessionMiddleware() as any);
@@ -110,6 +110,21 @@ async function initializeDatabase() {
     ];
     for (const text of defaultSuggestions) {
       await suggestionCol.insertOne({ id: 'sug_' + generateObjectId(), text, createdAt: new Date().toISOString() });
+    }
+  }
+
+  // Seed the deposit network list from the original hardcoded config once —
+  // after this, the DB is the source of truth and admin can edit/hide/
+  // delete/re-add entries (see /api/admin/crypto-options) without touching
+  // code. Wallet address generation itself (server/walletVault.ts) is
+  // unaffected — it's keyed to the fixed CryptoNetwork ids regardless of
+  // what's configured here.
+  const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
+  const existingCryptoOpts = await cryptoOptCol.find();
+  if (existingCryptoOpts.length === 0) {
+    console.log('[MongoDB] Seeding default crypto deposit options...');
+    for (const opt of cryptoOptions) {
+      await cryptoOptCol.insertOne({ ...opt, id: opt.id as any });
     }
   }
 
@@ -584,13 +599,22 @@ app.get('/api/products', async (req, res) => {
   const invCol = db.collection<any>('inventory');
   const reviewCol = db.collection<Review>('reviews');
 
-  const products = await prodCol.find();
+  // Hidden products/variants (isHidden) are a CTV/Admin's own "pull off the
+  // storefront without deleting" control — everyone else must never see
+  // them, but an admin or CTV needs the full list (including their own
+  // hidden ones) to manage them from the admin/CTV panel, which reuses this
+  // same endpoint for its product table.
+  const requester = await getSessionUser(req);
+  const canSeeHidden = !!requester && (requester.role === 'admin' || requester.role === 'ctv');
+
+  const products = await prodCol.find(canSeeHidden ? {} : { isHidden: { $ne: true } });
   const unsoldInventory = await invCol.find({ isSold: false });
   const allReviews = await reviewCol.find();
 
   // Enrich products with real-time live MongoDB inventory counts
   const enriched = products.map((p) => {
-    const updatedVariants = (p.variants || []).map((v) => {
+    const rawVariants = canSeeHidden ? (p.variants || []) : (p.variants || []).filter((v) => !v.isHidden);
+    const updatedVariants = rawVariants.map((v) => {
       // Stock shown to buyers always reflects real inventory records — never
       // falls back to a static declared number, so a variant with no
       // imported accounts correctly shows as out of stock instead of a
@@ -624,6 +648,17 @@ app.get('/api/products/:id', async (req, res) => {
   const reviewCol = db.collection<Review>('reviews');
   const product = await prodCol.findOne({ id: req.params.id });
   if (!product) return res.status(404).json({ error: 'Product not found' });
+
+  const requester = await getSessionUser(req);
+  const canSeeHidden = !!requester && (requester.role === 'admin' || requester.role === 'ctv');
+  // A hidden product is 404 for anyone but its own CTV/Admin — behaves as if
+  // it doesn't exist at all, including for someone with an old direct link.
+  if (product.isHidden && !canSeeHidden) {
+    return res.status(404).json({ error: 'Product not found' });
+  }
+  if (!canSeeHidden && product.variants) {
+    product.variants = product.variants.filter((v) => !v.isHidden);
+  }
 
   if (product.variants) {
     const unsoldInventory = await invCol.find({ productId: product.id, isSold: false });
@@ -1424,11 +1459,15 @@ app.get('/api/orders/:orderCode', async (req, res) => {
 // 8. Deposit Wallets for current user
 app.get('/api/deposit/wallets', async (req, res) => {
   const depCol = db.collection<DepositTransaction>('deposits');
+  const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
   const user = await getSessionUser(req);
   if (!user) return res.status(401).json({ error: 'Vui lòng đăng nhập' });
 
   const userWallets = await ensureUserDepositWallets(user);
-  const optionsWithUserAddress = cryptoOptions.map((opt) => ({
+  // A network an admin has hidden from the deposit page must not appear
+  // here either — this response is exactly what the deposit modal renders.
+  const activeCryptoOptions = (await cryptoOptCol.find()).filter((o) => !o.isHidden);
+  const optionsWithUserAddress = activeCryptoOptions.map((opt) => ({
     ...opt,
     userDepositAddress: userWallets[opt.id],
   }));
@@ -1447,10 +1486,11 @@ app.post('/api/deposit/check-rpc', async (req, res) => {
   const { network = 'bsc' } = req.body as { network: CryptoNetwork };
   const userCol = db.collection<User>('users');
   const depCol = db.collection<DepositTransaction>('deposits');
+  const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
   const user = await getSessionUser(req);
   if (!user) return res.status(401).json({ error: 'Vui lòng đăng nhập' });
 
-  const cryptoConfig = cryptoOptions.find((c) => c.id === network);
+  const cryptoConfig = await cryptoOptCol.findOne({ id: network });
   if (!cryptoConfig) return res.status(400).json({ error: 'Invalid network' });
 
   const userAddress = (await ensureUserDepositWallets(user))[network];
@@ -1556,9 +1596,10 @@ app.post('/api/deposit/simulate-test', requireRole('admin'), async (req, res) =>
   const { network = 'bsc', amount = 10 } = req.body as { network: CryptoNetwork; amount: number };
   const userCol = db.collection<User>('users');
   const depCol = db.collection<DepositTransaction>('deposits');
+  const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
   const user = (await getSessionUser(req))!;
 
-  const cryptoConfig = cryptoOptions.find((c) => c.id === network);
+  const cryptoConfig = await cryptoOptCol.findOne({ id: network });
   if (!cryptoConfig) return res.status(400).json({ error: 'Invalid network' });
 
   const depositAmt = Math.max(1, Number(amount) || 10);
@@ -1594,6 +1635,81 @@ app.post('/api/deposit/simulate-test', requireRole('admin'), async (req, res) =>
     newBalance,
     tx: newTx,
   });
+});
+
+// 10b. Deposit networks (crypto_options) CRUD — lets admin edit display
+// fields (name/icon/min deposit/RPC endpoint/contract address...) and
+// show/hide/delete/restore a network on the deposit page, without touching
+// code. Scoped deliberately to the CryptoNetwork ids the wallet-generation
+// system (server/walletVault.ts) already knows how to derive an address
+// for ('bsc' | 'polygon' | 'trc' | 'base') — adding real support for a new
+// blockchain needs actual wallet/RPC integration code, not just a new row
+// here, so create is restricted to that fixed set.
+const KNOWN_CRYPTO_NETWORK_IDS: CryptoNetwork[] = ['bsc', 'polygon', 'trc', 'base'];
+
+app.get('/api/crypto-options', async (req, res) => {
+  const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
+  const options = (await cryptoOptCol.find()).filter((o) => !o.isHidden);
+  res.json({ options });
+});
+
+app.get('/api/admin/crypto-options', requireRole('admin'), async (req, res) => {
+  const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
+  const options = await cryptoOptCol.find();
+  res.json({ options });
+});
+
+app.post('/api/admin/crypto-options', requireRole('admin'), async (req, res) => {
+  const { id, name, token, networkLabel, decimals, contractAddress, rpcUrl, explorerTxUrl, icon, minDeposit, chainId } = req.body;
+
+  if (!KNOWN_CRYPTO_NETWORK_IDS.includes(id)) {
+    return res.status(400).json({
+      error: `Chỉ hỗ trợ khôi phục/thêm lại 1 trong các mạng đã có sẵn logic ví: ${KNOWN_CRYPTO_NETWORK_IDS.join(', ')}. Thêm blockchain hoàn toàn mới cần code sinh ví riêng.`,
+    });
+  }
+  if (!name || !token || !networkLabel || !contractAddress || !rpcUrl) {
+    return res.status(400).json({ error: 'Thiếu thông tin bắt buộc' });
+  }
+
+  const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
+  if (await cryptoOptCol.findOne({ id })) {
+    return res.status(400).json({ error: `Mạng "${id}" đã tồn tại — dùng sửa hoặc hiện lại thay vì thêm mới` });
+  }
+
+  const newOption: CryptoOption = {
+    id,
+    name: String(name).trim(),
+    token: String(token).trim(),
+    networkLabel: String(networkLabel).trim(),
+    decimals: Number(decimals) || 18,
+    contractAddress: String(contractAddress).trim(),
+    rpcUrl: String(rpcUrl).trim(),
+    explorerTxUrl: String(explorerTxUrl || '').trim(),
+    icon: String(icon || '💰').trim(),
+    minDeposit: Number(minDeposit) || 1.0,
+    chainId: chainId ? Number(chainId) : undefined,
+  };
+  await cryptoOptCol.insertOne(newOption);
+  res.json({ success: true, option: newOption });
+});
+
+app.put('/api/admin/crypto-options/:id', requireRole('admin'), async (req, res) => {
+  const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
+  const existing = await cryptoOptCol.findOne({ id: req.params.id });
+  if (!existing) return res.status(404).json({ error: 'Không tìm thấy mạng nạp tiền này' });
+
+  // id itself is never editable — it's the join key to CryptoNetwork
+  // everywhere else (user.depositWallets, DepositTransaction.network...).
+  const { id: _ignoredId, ...updateFields } = req.body;
+  await cryptoOptCol.updateOne({ id: req.params.id }, { $set: updateFields });
+  const updated = await cryptoOptCol.findOne({ id: req.params.id });
+  res.json({ success: true, option: updated });
+});
+
+app.delete('/api/admin/crypto-options/:id', requireRole('admin'), async (req, res) => {
+  const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
+  await cryptoOptCol.deleteOne({ id: req.params.id });
+  res.json({ success: true });
 });
 
 // 11. Admin & CTV: Manage Inventory / Bulk Import (MongoDB: insertMany)
@@ -1941,7 +2057,7 @@ app.post('/api/admin/products/:id/variants', requireRole('admin'), async (req, r
 });
 
 app.put('/api/admin/products/:id/variants/:variantId', requireRole('admin'), async (req, res) => {
-  const { name, price, originalPrice } = req.body;
+  const { name, price, originalPrice, isHidden } = req.body;
   const prodCol = db.collection<Product>('products');
   const product = await prodCol.findOne({ id: req.params.id });
   if (!product) return res.status(404).json({ error: 'Không tìm thấy sản phẩm' });
@@ -1956,6 +2072,7 @@ app.put('/api/admin/products/:id/variants/:variantId', requireRole('admin'), asy
   variants[idx] = {
     ...variants[idx],
     ...(name !== undefined ? { name: String(name).trim() } : {}),
+    ...(typeof isHidden === 'boolean' ? { isHidden } : {}),
     price: nextPrice,
     originalPrice: nextOriginalPrice,
     discountBadge: computeDiscountBadge(nextPrice, nextOriginalPrice),
@@ -2187,9 +2304,12 @@ app.get('/api/ctv/stats/charts', requireRole('admin', 'ctv'), async (req, res) =
   });
 });
 
-// 20. CTV Withdrawal Request (MongoDB: insertOne) — CTV and Admin only
+// 20. CTV Withdrawal Request (MongoDB: insertOne) — CTV and Admin only.
+// Crypto-only: bank/e-wallet methods are no longer accepted, even if a
+// client sends them directly, so `method`/`network` are never taken from
+// the request body.
 app.post('/api/ctv/withdraw', requireRole('admin', 'ctv'), async (req, res) => {
-  const { amount, network = 'bsc', walletAddress, method = 'crypto', bankName, accountNumber, accountName } = req.body;
+  const { amount, network = 'bsc', accountNumber, accountName } = req.body;
   const wdrCol = db.collection<WithdrawalRequest>('withdrawals');
 
   const ctvUser = (await getSessionUser(req))!;
@@ -2199,17 +2319,20 @@ app.post('/api/ctv/withdraw', requireRole('admin', 'ctv'), async (req, res) => {
     return res.status(400).json({ error: 'Số tiền rút tối thiểu là $5.00' });
   }
 
+  if (!String(accountNumber || '').trim()) {
+    return res.status(400).json({ error: 'Vui lòng nhập địa chỉ ví crypto nhận tiền' });
+  }
+
   const newWithdrawal: WithdrawalRequest = {
     id: 'wdr_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
     userId: ctvUser.id,
     username: ctvUser.username,
     amount: parsedAmount,
-    method,
-    bankName,
+    method: 'crypto',
     accountNumber,
     accountName,
     network,
-    walletAddress: walletAddress || accountNumber,
+    walletAddress: accountNumber,
     status: 'pending',
     createdAt: new Date().toISOString(),
   };
@@ -2461,6 +2584,57 @@ app.put('/api/ctv/products/:id/description', requireRole('admin', 'ctv'), async 
   );
   const updated = await prodCol.findOne({ id: req.params.id });
   res.json({ success: true, product: updated });
+});
+
+// Lets a CTV pull their own product off the storefront (or bring it back)
+// without deleting it and its inventory — same ownership rule as the
+// description endpoint above. Admin can already do this through the
+// generic PUT /api/admin/products/:id merge endpoint, so this is CTV-only.
+app.put('/api/ctv/products/:id/visibility', requireRole('admin', 'ctv'), async (req, res) => {
+  const user = (await getSessionUser(req))!;
+  const prodCol = db.collection<Product>('products');
+  const product = await prodCol.findOne({ id: req.params.id });
+  if (!product) return res.status(404).json({ error: 'Không tìm thấy sản phẩm' });
+
+  if (user.role === 'ctv' && !ctvOwnsProduct(user, product)) {
+    return res.status(403).json({ error: 'Bạn không có quyền chỉnh sửa sản phẩm này' });
+  }
+
+  const { isHidden } = req.body;
+  if (typeof isHidden !== 'boolean') {
+    return res.status(400).json({ error: 'Thiếu trường isHidden (boolean)' });
+  }
+
+  await prodCol.updateOne({ id: req.params.id }, { $set: { isHidden } });
+  const updated = await prodCol.findOne({ id: req.params.id });
+  res.json({ success: true, product: updated });
+});
+
+// Same as above, but for a single variant rather than the whole product —
+// e.g. pausing one out-of-stock package while keeping the rest of the
+// listing live.
+app.put('/api/ctv/products/:id/variants/:variantId/visibility', requireRole('admin', 'ctv'), async (req, res) => {
+  const user = (await getSessionUser(req))!;
+  const prodCol = db.collection<Product>('products');
+  const product = await prodCol.findOne({ id: req.params.id });
+  if (!product) return res.status(404).json({ error: 'Không tìm thấy sản phẩm' });
+
+  if (user.role === 'ctv' && !ctvOwnsProduct(user, product)) {
+    return res.status(403).json({ error: 'Bạn không có quyền chỉnh sửa sản phẩm này' });
+  }
+
+  const { isHidden } = req.body;
+  if (typeof isHidden !== 'boolean') {
+    return res.status(400).json({ error: 'Thiếu trường isHidden (boolean)' });
+  }
+
+  const variants = product.variants || [];
+  const idx = variants.findIndex((v) => v.id === req.params.variantId);
+  if (idx === -1) return res.status(404).json({ error: 'Không tìm thấy biến thể' });
+
+  variants[idx] = { ...variants[idx], isHidden };
+  await prodCol.updateOne({ id: req.params.id }, { $set: { variants } });
+  res.json({ success: true, variant: variants[idx] });
 });
 
 // 22b. Vouchers CRUD — CTV and Admin can create discount codes and track

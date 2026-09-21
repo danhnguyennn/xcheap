@@ -4,8 +4,7 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { User, Product, Language, Category } from './types';
-import { cryptoOptions } from './data/storeData';
+import { User, Product, Language, Category, CryptoOption } from './types';
 import { Header } from './components/Header';
 import { Banner } from './components/Banner';
 import { Categories } from './components/Categories';
@@ -13,7 +12,6 @@ import { HotDeals } from './components/HotDeals';
 import { FeaturedProducts } from './components/FeaturedProducts';
 import { ProductDetail } from './components/ProductDetail';
 import { DepositModal } from './components/DepositModal';
-import { ToolsModal } from './components/ToolsModal';
 import { Footer } from './components/Footer';
 import { ToastContainer } from './components/Toast';
 import { AdminPage } from './pages/AdminPage';
@@ -25,10 +23,11 @@ import { ApiDocsPage } from './pages/ApiDocsPage';
 import { OrdersPage } from './pages/OrdersPage';
 import { TermsPage } from './pages/TermsPage';
 import { PrivacyPage } from './pages/PrivacyPage';
+import { ToolsPage } from './pages/ToolsPage';
 import { ShieldAlert } from 'lucide-react';
 import { translations } from './locales/translations';
 
-type Page = 'home' | 'product-detail' | 'admin' | 'ctv' | 'login' | 'register' | 'account' | 'api-docs' | 'orders' | 'terms' | 'privacy';
+type Page = 'home' | 'product-detail' | 'admin' | 'ctv' | 'login' | 'register' | 'account' | 'api-docs' | 'orders' | 'terms' | 'privacy' | 'tools';
 
 // Builds the URL for a given page so the browser's address bar (and reload)
 // always reflects what's on screen.
@@ -42,6 +41,7 @@ function buildUrl(page: Page, opts?: { productId?: string; category?: string }):
   if (page === 'orders') return '/orders';
   if (page === 'terms') return '/terms';
   if (page === 'privacy') return '/privacy';
+  if (page === 'tools') return '/tools';
   if (page === 'product-detail' && opts?.productId) return `/product/${encodeURIComponent(opts.productId)}`;
   if (opts?.category && opts.category !== 'all') return `/category/${encodeURIComponent(opts.category)}`;
   return '/';
@@ -77,6 +77,7 @@ export default function App() {
   const [authChecked, setAuthChecked] = useState(false);
   const [products, setProducts] = useState<Product[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
+  const [cryptoOptions, setCryptoOptions] = useState<CryptoOption[]>([]);
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -104,7 +105,6 @@ export default function App() {
 
   // Modals state
   const [isDepositOpen, setIsDepositOpen] = useState(false);
-  const [isToolsOpen, setIsToolsOpen] = useState(false);
 
   // Sync user and products with backend
   const fetchUser = async () => {
@@ -141,6 +141,18 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setCategories(data.categories || []);
+      }
+    } catch (err) {
+      // keep whatever was last fetched rather than erroring out
+    }
+  };
+
+  const fetchCryptoOptions = async () => {
+    try {
+      const res = await fetch('/api/crypto-options');
+      if (res.ok) {
+        const data = await res.json();
+        setCryptoOptions(data.options || []);
       }
     } catch (err) {
       // keep whatever was last fetched rather than erroring out
@@ -210,6 +222,10 @@ export default function App() {
       setCurrentPage('privacy');
       return;
     }
+    if (path === '/tools') {
+      setCurrentPage('tools');
+      return;
+    }
     const productMatch = path.match(/^\/product\/([^/]+)$/);
     if (productMatch) {
       const productId = decodeURIComponent(productMatch[1]);
@@ -238,6 +254,7 @@ export default function App() {
     fetchUser();
     fetchProducts();
     fetchCategories();
+    fetchCryptoOptions();
     applyLocationFromUrl();
 
     const onPopState = () => applyLocationFromUrl();
@@ -253,14 +270,20 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authChecked, user, currentPage]);
 
+  // The raw `products` state is also handed to AdminPage/CtvPage so they can
+  // manage hidden listings — the storefront itself (counts, grids, hot
+  // deals) must never include a hidden product, even when the viewer is the
+  // CTV/Admin who hid it and so still receives it from the API.
+  const storefrontProducts = products.filter((p) => !p.isHidden);
+
   // Category counts
   const categoryCounts: Record<string, number> = {};
-  products.forEach((p) => {
+  storefrontProducts.forEach((p) => {
     categoryCounts[p.categorySlug] = (categoryCounts[p.categorySlug] || 0) + 1;
   });
 
   // Filter products by category and search
-  const filteredProducts = products.filter((p) => {
+  const filteredProducts = storefrontProducts.filter((p) => {
     const matchCategory = selectedCategory === 'all' || p.categorySlug === selectedCategory;
     const matchSearch =
       !searchQuery.trim() ||
@@ -280,7 +303,7 @@ export default function App() {
         onToggleTheme={toggleTheme}
         onOpenDeposit={() => setIsDepositOpen(true)}
         onOpenOrders={() => navigate('orders')}
-        onOpenTools={() => setIsToolsOpen(true)}
+        onOpenTools={() => navigate('tools')}
         onOpenAdmin={() => navigate('admin')}
         onOpenCtv={() => navigate('ctv')}
         onOpenAccount={() => navigate('account')}
@@ -370,6 +393,8 @@ export default function App() {
           <TermsPage language={language} onBackToStore={() => navigate('home')} />
         ) : currentPage === 'privacy' ? (
           <PrivacyPage language={language} onBackToStore={() => navigate('home')} />
+        ) : currentPage === 'tools' ? (
+          <ToolsPage language={language} onBackToStore={() => navigate('home')} />
         ) : currentPage === 'orders' ? (
           !authChecked ? null : !user ? (
             <LoginPage language={language} onLoginSuccess={fetchUser} onGoToRegister={() => navigate('register')} onBackToStore={() => navigate('home')} />
@@ -391,7 +416,7 @@ export default function App() {
               navigate('home');
             }}
             onOpenDeposit={() => setIsDepositOpen(true)}
-            onOpenTools={() => setIsToolsOpen(true)}
+            onOpenTools={() => navigate('tools')}
             onPurchaseSuccess={(orderData) => {
               fetchUser();
               fetchProducts();
@@ -419,7 +444,7 @@ export default function App() {
             {/* Hot Deals section matching Image 1 & 2 */}
             {selectedCategory === 'all' && !searchQuery && (
               <HotDeals
-                products={products}
+                products={storefrontProducts}
                 language={language}
                 onSelectProduct={(p) => navigate('product-detail', { product: p })}
               />
@@ -457,13 +482,6 @@ export default function App() {
           }}
         />
       )}
-
-      {/* Digital Accounts Utility Tools Modal */}
-      <ToolsModal
-        isOpen={isToolsOpen}
-        onClose={() => setIsToolsOpen(false)}
-        language={language}
-      />
 
       <ToastContainer />
     </div>

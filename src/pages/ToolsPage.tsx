@@ -1,15 +1,15 @@
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useState } from 'react';
 import { TOTP, Secret } from 'otpauth';
 import { Language } from '../types';
 import { translations } from '../locales/translations';
-import { Wrench, Key, Mail, Split, Copy, Check, RefreshCw, AlertCircle } from 'lucide-react';
-import { EmailReaderTab } from './tools/EmailReaderTab';
+import { ArrowLeft, Wrench, Key, Mail, Split, Copy, Check, RefreshCw } from 'lucide-react';
+import { EmailReaderTab } from '../components/tools/EmailReaderTab';
 
 // Real RFC 6238 TOTP — the exact same algorithm an authenticator app (Google
 // Authenticator, Authy...) runs over a secret you already hold, not a guess
 // or a lookup against anything live. Returns null for a secret that isn't
 // valid Base32 rather than throwing, so a bad paste shows an error state
-// instead of crashing the modal.
+// instead of crashing the page.
 function computeTotp(secretKeyRaw: string): string | null {
   const cleaned = secretKeyRaw.replace(/\s+/g, '').toUpperCase();
   if (!cleaned) return null;
@@ -26,19 +26,30 @@ function computeTotp(secretKeyRaw: string): string | null {
   }
 }
 
-interface ToolsModalProps {
-  isOpen: boolean;
-  onClose: () => void;
+type ToolKey = '2fa' | 'splitter' | 'email' | 'renew-hotmail';
+
+interface ToolsPageProps {
   language: Language;
+  onBackToStore: () => void;
 }
 
-export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, language }) => {
+export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore }) => {
   const t = translations[language];
-  const [activeTab, setActiveTab] = useState<'2fa' | 'email' | 'splitter' | 'renew-hotmail'>('2fa');
+  const [activeTab, setActiveTab] = useState<ToolKey>('2fa');
+
+  // The tool list itself — adding a future tool only means one more entry
+  // here plus a matching content block below, instead of touching a fixed
+  // 4-column tab grid like the old modal had.
+  const TOOLS: { key: ToolKey; icon: React.ReactNode; label: string }[] = [
+    { key: '2fa', icon: <Key className="w-3.5 h-3.5" />, label: '2FA (TOTP)' },
+    { key: 'splitter', icon: <Split className="w-3.5 h-3.5" />, label: t.toolsSplitterTabLabel },
+    { key: 'email', icon: <Mail className="w-3.5 h-3.5" />, label: t.toolsEmailReader || 'Email Reader' },
+    { key: 'renew-hotmail', icon: <RefreshCw className="w-3.5 h-3.5" />, label: t.renewHotmail },
+  ];
 
   // 2FA TOTP Generator state
-  const [secretKey, setSecretKey] = useState('JBSWY3DPEHPK3PXP');
-  const [totpCode, setTotpCode] = useState<string | null>(computeTotp('JBSWY3DPEHPK3PXP'));
+  const [secretKey, setSecretKey] = useState('');
+  const [totpCode, setTotpCode] = useState<string | null>(null);
   const [secondsRemaining, setSecondsRemaining] = useState(30);
   const [copiedTotp, setCopiedTotp] = useState(false);
 
@@ -57,7 +68,7 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
   ];
   const [inputPresetIdx, setInputPresetIdx] = useState<number | 'custom'>(0);
   const [customInputFormat, setCustomInputFormat] = useState('Username | Password | 2FA | Email | Password_email | Cookies');
-  const [rawText, setRawText] = useState('1829471928491|P@sswordX2026!|JBSWY3DPEHPK3PXP|ronan_user1@hotmail.com|MailPass#2026|ct0=f819a1c...; auth_token=9f8e7d6c5b4a3210...');
+  const [rawText, setRawText] = useState('');
   const [splitRows, setSplitRows] = useState<Record<string, string>[] | null>(null);
   const [parsedFields, setParsedFields] = useState<string[]>([]);
   const [outputFields, setOutputFields] = useState<string[]>([]);
@@ -122,10 +133,9 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
 
   // Recomputes the real TOTP code every second so it's always correct for
   // the live 30-second window — not just refreshed at the boundary, so
-  // pasting a new secret (or opening the modal mid-window) shows the right
-  // code immediately instead of a stale one.
+  // pasting a new secret shows the right code immediately instead of a
+  // stale one.
   useEffect(() => {
-    if (!isOpen) return;
     const tick = () => {
       const now = new Date();
       setSecondsRemaining(30 - (now.getSeconds() % 30));
@@ -134,7 +144,7 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
     tick();
     const interval = setInterval(tick, 1000);
     return () => clearInterval(interval);
-  }, [isOpen, secretKey]);
+  }, [secretKey]);
 
   const handleGenerateTotp = () => {
     setTotpCode(computeTotp(secretKey));
@@ -325,92 +335,52 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
     setTimeout(() => setCopiedAllLines(false), 2000);
   };
 
-  if (!isOpen) return null;
-
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
-      <div className="bg-[#eef0ef] dark:bg-[#202227] border border-[#e1e4e3] dark:border-[#32363e] rounded-2xl max-w-3xl w-full my-auto shadow-2xl overflow-hidden flex flex-col max-h-[92vh]">
-        {/* Header */}
-        <div className="px-5 py-4 border-b border-[#e2e6e5] dark:border-[#30333b] flex items-center justify-between bg-[#f2f4f3] dark:bg-[#1a1b1f]">
-          <div className="flex items-center gap-2.5">
-            <div className="w-8 h-8 rounded-lg bg-[#eceeed] dark:bg-[#23252a] border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 flex items-center justify-center shadow-sm">
-              <Wrench className="w-4 h-4" />
-            </div>
-            <div>
-              <h2 className="text-sm sm:text-base font-bold text-slate-900 dark:text-slate-100">{t.toolsTitle}</h2>
-              {/* Redundant with the tab bar's icons/labels right below it, and
-                  on a phone-width header it just forces an ugly two-line wrap
-                  that crowds the close button — so it's desktop-only. */}
-              <p className="hidden sm:block text-[11px] text-slate-600 dark:text-slate-400">2FA (TOTP) • {t.toolsSplitterTabLabel} • {t.toolsEmailReader || 'Email Reader'} • {t.renewHotmail}</p>
-            </div>
-          </div>
-          <button onClick={onClose} className="text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100 text-sm">
-            ✕
-          </button>
+    <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6">
+      <button onClick={onBackToStore} className="flex items-center gap-1.5 text-xs text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100 mb-4 transition">
+        <ArrowLeft className="w-3.5 h-3.5" />
+        <span>{t.authBackToStore}</span>
+      </button>
+
+      <div className="flex items-center gap-2.5 mb-5">
+        <div className="w-9 h-9 rounded-lg bg-[#eceeed] dark:bg-[#23252a] border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 flex items-center justify-center shadow-sm flex-shrink-0">
+          <Wrench className="w-4.5 h-4.5" />
         </div>
+        <h1 className="text-xl sm:text-2xl font-bold text-slate-900 dark:text-slate-100">{t.toolsTitle}</h1>
+      </div>
 
-        {/* Tab Navigation — a 4-column grid on mobile so every tab stays
-            reachable with a single tap and no hidden horizontal scroll (the
-            old overflow-x-auto row cut the 3rd/4th tabs off-screen with no
-            scroll affordance, so they were effectively undiscoverable on a
-            phone). Labels only show at sm+; icons alone identify the tab on
-            mobile, with the full name still available via title tooltip. */}
-        <div className="grid grid-cols-4 sm:flex border-b border-[#e2e6e5] dark:border-[#30333b] bg-[#f2f4f3] dark:bg-[#1a1b1f] text-xs font-semibold">
-          <button
-            onClick={() => setActiveTab('2fa')}
-            title="2FA (TOTP)"
-            className={`py-2.5 sm:py-3 px-1 sm:px-4 flex items-center justify-center gap-1.5 sm:gap-2 border-b-2 whitespace-nowrap transition ${
-              activeTab === '2fa'
-                ? 'border-emerald-400 text-emerald-600 dark:text-emerald-400 bg-[#eef0ef] dark:bg-[#202227]'
-                : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200'
-            }`}
-          >
-            <Key className="w-4 h-4 sm:w-3.5 sm:h-3.5 flex-shrink-0" />
-            <span className="hidden sm:inline">2FA (TOTP)</span>
-          </button>
-
-          <button
-            onClick={() => setActiveTab('splitter')}
-            title={t.toolsSplitterTabLabel}
-            className={`py-2.5 sm:py-3 px-1 sm:px-4 flex items-center justify-center gap-1.5 sm:gap-2 border-b-2 whitespace-nowrap transition ${
-              activeTab === 'splitter'
-                ? 'border-emerald-400 text-emerald-600 dark:text-emerald-400 bg-[#eef0ef] dark:bg-[#202227]'
-                : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200'
-            }`}
-          >
-            <Split className="w-4 h-4 sm:w-3.5 sm:h-3.5 flex-shrink-0" />
-            <span className="hidden sm:inline">{t.toolsSplitterTabLabel}</span>
-          </button>
-
-          <button
-            onClick={() => setActiveTab('email')}
-            title={t.toolsEmailReader || 'Email Reader'}
-            className={`py-2.5 sm:py-3 px-1 sm:px-4 flex items-center justify-center gap-1.5 sm:gap-2 border-b-2 whitespace-nowrap transition ${
-              activeTab === 'email'
-                ? 'border-emerald-400 text-emerald-600 dark:text-emerald-400 bg-[#eef0ef] dark:bg-[#202227]'
-                : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200'
-            }`}
-          >
-            <Mail className="w-4 h-4 sm:w-3.5 sm:h-3.5 flex-shrink-0" />
-            <span className="hidden sm:inline">{t.toolsEmailReader || 'Email Reader'}</span>
-          </button>
-
-          <button
-            onClick={() => setActiveTab('renew-hotmail')}
-            title={t.renewHotmail}
-            className={`py-2.5 sm:py-3 px-1 sm:px-4 flex items-center justify-center gap-1.5 sm:gap-2 border-b-2 whitespace-nowrap transition ${
-              activeTab === 'renew-hotmail'
-                ? 'border-emerald-400 text-emerald-600 dark:text-emerald-400 bg-[#eef0ef] dark:bg-[#202227]'
-                : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200'
-            }`}
-          >
-            <RefreshCw className="w-4 h-4 sm:w-3.5 sm:h-3.5 flex-shrink-0" />
-            <span className="hidden sm:inline">{t.renewHotmail}</span>
-          </button>
-        </div>
+      <div className="flex flex-col md:flex-row gap-4 md:gap-6">
+        {/* Tool list — a vertical sidebar from md up, a horizontally
+            scrollable pill row below that. Adding a future tool is just one
+            more entry in TOOLS plus a matching content block, no layout
+            rework needed either way. The wrapper is `relative` purely to
+            host the mobile fade hint below — it has no layout effect of
+            its own, so it doesn't change how `nav` sizes inside the outer
+            flex row. */}
+        {/* flex-wrap instead of a horizontal scroll: a scrollable row can
+            hide a tool below the fold with nothing but a thin scrollbar as
+            a clue it's there. Wrapping to a second row instead means every
+            tool is always on screen without any scrolling — and it keeps
+            scaling the same way as more tools get added later. */}
+        <nav className="grid grid-cols-2 md:flex md:flex-col gap-1.5 md:w-56 flex-shrink-0">
+          {TOOLS.map((tool) => (
+            <button
+              key={tool.key}
+              onClick={() => setActiveTab(tool.key)}
+              className={`flex items-center gap-2 text-left text-[11px] md:text-xs font-semibold px-2.5 py-2 md:px-3 md:py-2.5 rounded-lg md:rounded-xl border transition ${
+                activeTab === tool.key
+                  ? 'bg-[#eef0ef] dark:bg-[#202227] border-emerald-400 text-emerald-700 dark:text-emerald-300'
+                  : 'bg-[#eceeed] dark:bg-[#23252a] border-[#dfe3e1] dark:border-[#353840] text-slate-700 dark:text-slate-300 hover:border-emerald-500/40'
+              }`}
+            >
+              <span className="flex-shrink-0">{tool.icon}</span>
+              <span className="leading-tight">{tool.label}</span>
+            </button>
+          ))}
+        </nav>
 
         {/* Content */}
-        <div className="p-5 overflow-y-auto space-y-4 text-xs flex-1">
+        <div className="flex-1 min-w-0 bg-[#eef0ef] dark:bg-[#202227] border border-[#e1e4e3] dark:border-[#32363e] rounded-2xl p-5 text-xs">
           {activeTab === '2fa' && (
             <div className="space-y-3">
               <div>
@@ -432,17 +402,21 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
                 </div>
               </div>
 
-              {/* Code Display — stacked on mobile instead of cramming the
-                  big code, countdown, and copy button onto one row, which
-                  used to force the code itself to wrap across two lines on
-                  a phone-width screen. */}
               <div className="p-4 bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
                   <span className="text-[11px] text-slate-600 dark:text-slate-400 block mb-1">
                     {t.toolsCurrent2FACode}
                   </span>
-                  <div className={`text-3xl font-mono font-black tracking-wider ${totpCode ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-500 dark:text-red-400 text-base'}`}>
-                    {totpCode ? `${totpCode.slice(0, 3)} ${totpCode.slice(3)}` : t.toolsInvalidSecretKey}
+                  <div
+                    className={`text-3xl font-mono font-black tracking-wider ${
+                      totpCode
+                        ? 'text-emerald-600 dark:text-emerald-400'
+                        : secretKey.trim()
+                        ? 'text-red-500 dark:text-red-400 text-base'
+                        : 'text-slate-400 dark:text-slate-600'
+                    }`}
+                  >
+                    {totpCode ? `${totpCode.slice(0, 3)} ${totpCode.slice(3)}` : secretKey.trim() ? t.toolsInvalidSecretKey : '••• •••'}
                   </div>
                 </div>
 
@@ -465,14 +439,10 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
             </div>
           )}
 
-          {activeTab === 'email' && (
-            <EmailReaderTab language={language} />
-          )}
+          {activeTab === 'email' && <EmailReaderTab language={language} />}
 
           {activeTab === 'splitter' && (
             <div className="space-y-3">
-              {/* Input format — pick one of the two real formats accounts
-                  come in, or type any custom pipe-separated field list. */}
               <div>
                 <label className="font-bold text-slate-800 dark:text-slate-200 block mb-1">
                   {t.toolsInputFormatLabel}
@@ -523,6 +493,7 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
                   rows={4}
                   value={rawText}
                   onChange={(e) => setRawText(e.target.value)}
+                  placeholder={activeInputFields.join(' | ')}
                   className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] rounded-lg p-3 font-mono text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-500"
                 />
                 <button
@@ -535,8 +506,16 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
 
               {splitRows && (
                 <div className="space-y-3">
-                  {/* Parsed result, dynamic columns matching the chosen input format */}
-                  <div className="overflow-x-auto">
+                  {/* Wide, many-column table — on a phone it always needs to
+                      scroll sideways, so a fade + hint make that obvious
+                      instead of the table just looking cut off */}
+                  <p className="sm:hidden text-[10px] text-slate-500 dark:text-slate-500 flex items-center gap-1">
+                    <span>←</span>
+                    <span>Vuốt ngang để xem đủ các cột</span>
+                    <span>→</span>
+                  </p>
+                  <div className="relative">
+                    <div className="overflow-x-auto">
                     <table className="w-full text-left font-mono text-[11px] border border-[#e2e6e5] dark:border-[#30333b] rounded-lg overflow-hidden">
                       <thead className="bg-[#f2f4f3] dark:bg-[#1a1b1f] text-slate-600 dark:text-slate-400 border-b border-[#e2e6e5] dark:border-[#30333b]">
                         <tr>
@@ -557,10 +536,13 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
                         ))}
                       </tbody>
                     </table>
+                    </div>
+                    {/* Right-edge fade — purely decorative, pointer-events
+                        disabled so it never blocks the horizontal scroll it's
+                        hinting at */}
+                    <div className="sm:hidden pointer-events-none absolute top-0 right-0 bottom-0 w-8 bg-gradient-to-l from-[#f5f6f6] dark:from-[#16181b] to-transparent rounded-r-lg" />
                   </div>
 
-                  {/* Build a new output format by toggling which parsed
-                      fields to include — order clicked = order in output. */}
                   <div>
                     <label className="font-bold text-slate-800 dark:text-slate-200 block mb-1.5">
                       {t.toolsOutputFormatLabel}
@@ -591,7 +573,6 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
                     )}
                   </div>
 
-                  {/* Reassembled result in the new format */}
                   <div>
                     <div className="flex items-center justify-between mb-1">
                       <label className="font-bold text-slate-800 dark:text-slate-200">
@@ -624,19 +605,8 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
             </div>
           )}
 
-          {/* TAB 4: RENEW TOKEN HOTMAIL */}
           {activeTab === 'renew-hotmail' && (
             <div className="space-y-4">
-              <div className="bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl p-3.5 space-y-1">
-                <div className="flex items-center gap-2 text-slate-900 dark:text-slate-100 font-bold text-xs">
-                  <RefreshCw className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                  <span>{t.renewHotmail}</span>
-                </div>
-                <p className="text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed">
-                  {t.renewHotmailDesc}
-                </p>
-              </div>
-
               <div>
                 <label className="font-bold text-slate-800 dark:text-slate-200 text-xs block mb-1">
                   {t.toolsHotmailTokensLabel}
@@ -665,7 +635,6 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
                 </div>
               </div>
 
-              {/* Results */}
               {renewResult && (
                 <div className="space-y-2.5 pt-2 border-t border-[#e2e6e5] dark:border-[#30333b]">
                   <div className="flex flex-wrap items-center justify-between gap-2">
@@ -700,7 +669,7 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
                     </button>
                   </div>
 
-                  <div className="space-y-1.5 max-h-72 overflow-y-auto pr-1">
+                  <div className="space-y-1.5 max-h-96 overflow-y-auto pr-1">
                     {renewResult.results.map((item: any, idx: number) => {
                       const isLive = item.status === 'LIVE' || item.status === 'HOẠT ĐỘNG';
                       return (
@@ -748,16 +717,6 @@ export const ToolsModal: React.FC<ToolsModalProps> = ({ isOpen, onClose, languag
               )}
             </div>
           )}
-        </div>
-
-        {/* Footer */}
-        <div className="px-5 py-3 border-t border-[#e2e6e5] dark:border-[#30333b] bg-[#f2f4f3] dark:bg-[#1a1b1f] flex justify-end">
-          <button
-            onClick={onClose}
-            className="bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-emerald-500/30 text-slate-800 dark:text-slate-200 text-xs font-semibold px-5 py-2 rounded-lg transition"
-          >
-            {t.closeBtn}
-          </button>
         </div>
       </div>
     </div>

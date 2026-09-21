@@ -18,7 +18,6 @@ import {
   Percent,
   PlusCircle,
   Database,
-  Building2,
   Wallet,
   AlertCircle,
   FileText,
@@ -29,6 +28,9 @@ import {
   Ticket,
   Trash2,
   Star,
+  Eye,
+  EyeOff,
+  Boxes,
 } from 'lucide-react';
 
 // Must match the server's minimum withdrawal amount (server.ts /api/ctv/withdraw)
@@ -80,6 +82,9 @@ export const CtvPage: React.FC<CtvPageProps> = ({
   const [editDescText, setEditDescText] = useState('');
   const [editAccountFormatText, setEditAccountFormatText] = useState('');
   const [isSavingDescription, setIsSavingDescription] = useState(false);
+  // Read-only variant list + per-variant visibility toggle — CTV has no
+  // add/edit/delete for variants (only Admin does), just show/hide.
+  const [variantsModalProduct, setVariantsModalProduct] = useState<Product | null>(null);
   const [newVoucherCode, setNewVoucherCode] = useState('');
   const [newVoucherDiscount, setNewVoucherDiscount] = useState<number>(10);
   const [newVoucherMaxUses, setNewVoucherMaxUses] = useState<number>(50);
@@ -104,10 +109,8 @@ export const CtvPage: React.FC<CtvPageProps> = ({
   const [rawRefillAccounts, setRawRefillAccounts] = useState('');
   const [isSubmittingRefill, setIsSubmittingRefill] = useState(false);
 
-  // Withdrawal form state
+  // Withdrawal form state — crypto (USDT) only, bank/e-wallet options removed
   const [withdrawAmount, setWithdrawAmount] = useState<number>(MIN_WITHDRAW_AMOUNT);
-  const [withdrawMethod, setWithdrawMethod] = useState<'bank' | 'crypto' | 'momo'>('bank');
-  const [bankName, setBankName] = useState('Vietcombank');
   const [accountNumber, setAccountNumber] = useState('');
   const [accountName, setAccountName] = useState('');
   const [withdrawNote, setWithdrawNote] = useState('');
@@ -210,10 +213,18 @@ export const CtvPage: React.FC<CtvPageProps> = ({
   // checking sellerName.includes(username) would miss it (same fix as the
   // server's ctvOwnsProduct helper).
   const ownsProduct = (p: Product): boolean => {
+    // createdByUserId is the real source of truth (see ctvOwnsProduct in
+    // server.ts) — an exact id match, not a guess from the display name.
+    if (p.createdByUserId) return p.createdByUserId === user.id;
+    // Legacy fallback for products created before createdByUserId existed.
+    // Must stay narrow: matching on any seller name that merely *contains*
+    // "ctv" used to make every CTV's dashboard show every other CTV's
+    // products as "mine" too, since every CTV listing's seller name starts
+    // with "CTV ".
     const sellerName = p.seller?.name?.toLowerCase() || '';
     const username = user.username.toLowerCase();
     if (!sellerName) return false;
-    if (sellerName.includes('ctv') || sellerName.includes(username)) return true;
+    if (sellerName === `ctv ${username}`) return true;
     return sellerName.length >= 3 && username.includes(sellerName);
   };
   const myProducts = user.role === 'admin' ? products : products.filter(ownsProduct);
@@ -245,6 +256,56 @@ export const CtvPage: React.FC<CtvPageProps> = ({
       showToast('error', 'Lỗi kết nối máy chủ');
     } finally {
       setIsSavingDescription(false);
+    }
+  };
+
+  // Pull a product off the storefront (or bring it back) without deleting
+  // it and its inventory.
+  const handleToggleProductVisibility = async (p: Product) => {
+    const nextHidden = !p.isHidden;
+    try {
+      const res = await fetch(`/api/ctv/products/${p.id}/visibility`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isHidden: nextHidden }),
+      });
+      if (res.ok) {
+        showToast('success', nextHidden ? `Đã ẩn sản phẩm "${p.name}"` : `Đã hiện lại sản phẩm "${p.name}"`);
+        onRefreshProducts();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        showToast('error', data.error || 'Lỗi cập nhật trạng thái hiển thị');
+      }
+    } catch (err) {
+      showToast('error', 'Lỗi kết nối máy chủ');
+    }
+  };
+
+  // Same idea for a single variant — e.g. pausing one out-of-stock package
+  // while keeping the rest of the listing live. variantsModalProduct is
+  // refreshed from the server response so the open modal reflects the new
+  // state immediately rather than waiting for the next full product refresh.
+  const handleToggleVariantVisibility = async (productId: string, variantId: string, currentlyHidden: boolean | undefined) => {
+    const nextHidden = !currentlyHidden;
+    try {
+      const res = await fetch(`/api/ctv/products/${productId}/variants/${variantId}/visibility`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isHidden: nextHidden }),
+      });
+      if (res.ok) {
+        onRefreshProducts();
+        setVariantsModalProduct((prev) =>
+          prev && prev.id === productId
+            ? { ...prev, variants: prev.variants.map((v) => (v.id === variantId ? { ...v, isHidden: nextHidden } : v)) }
+            : prev
+        );
+      } else {
+        const data = await res.json().catch(() => ({}));
+        showToast('error', data.error || 'Lỗi cập nhật trạng thái hiển thị biến thể');
+      }
+    } catch (err) {
+      showToast('error', 'Lỗi kết nối máy chủ');
     }
   };
 
@@ -425,8 +486,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           amount: withdrawAmount,
-          method: withdrawMethod,
-          bankName: withdrawMethod === 'bank' ? bankName : undefined,
+          method: 'crypto',
           accountNumber: accountNumber.trim(),
           accountName: accountName.trim(),
           note: withdrawNote.trim(),
@@ -1098,82 +1158,20 @@ export const CtvPage: React.FC<CtvPageProps> = ({
                   <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">
                     Phương thức nhận tiền:
                   </label>
-                  <div className="grid grid-cols-3 gap-2">
-                    <button
-                      type="button"
-                      onClick={() => setWithdrawMethod('bank')}
-                      className={`p-2.5 rounded-xl border flex flex-col items-center gap-1 transition ${
-                        withdrawMethod === 'bank'
-                          ? 'bg-[#e4e8e7] dark:bg-[#2d3037] border-emerald-400 text-emerald-700 dark:text-emerald-300 font-bold'
-                          : 'bg-[#eff2f1] dark:bg-[#1d1f24] border-[#dee2e0] dark:border-[#363a43] text-slate-600 dark:text-slate-400 hover:border-slate-500 hover:dark:border-slate-500'
-                      }`}
-                    >
-                      <Building2 className="w-4 h-4" />
-                      <span className="text-[11px]">Ngân hàng VN</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => setWithdrawMethod('momo')}
-                      className={`p-2.5 rounded-xl border flex flex-col items-center gap-1 transition ${
-                        withdrawMethod === 'momo'
-                          ? 'bg-[#e4e8e7] dark:bg-[#2d3037] border-emerald-400 text-emerald-700 dark:text-emerald-300 font-bold'
-                          : 'bg-[#eff2f1] dark:bg-[#1d1f24] border-[#dee2e0] dark:border-[#363a43] text-slate-600 dark:text-slate-400 hover:border-slate-500 hover:dark:border-slate-500'
-                      }`}
-                    >
-                      <Wallet className="w-4 h-4" />
-                      <span className="text-[11px]">Ví Momo</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => setWithdrawMethod('crypto')}
-                      className={`p-2.5 rounded-xl border flex flex-col items-center gap-1 transition ${
-                        withdrawMethod === 'crypto'
-                          ? 'bg-[#e4e8e7] dark:bg-[#2d3037] border-emerald-400 text-emerald-700 dark:text-emerald-300 font-bold'
-                          : 'bg-[#eff2f1] dark:bg-[#1d1f24] border-[#dee2e0] dark:border-[#363a43] text-slate-600 dark:text-slate-400 hover:border-slate-500 hover:dark:border-slate-500'
-                      }`}
-                    >
-                      <Coins className="w-4 h-4" />
-                      <span className="text-[11px]">Crypto USDT</span>
-                    </button>
+                  <div className="p-2.5 rounded-xl border bg-[#e4e8e7] dark:bg-[#2d3037] border-emerald-400 text-emerald-700 dark:text-emerald-300 font-bold flex items-center justify-center gap-1.5">
+                    <Coins className="w-4 h-4" />
+                    <span className="text-[11px]">Crypto USDT (TRC20 / BEP20)</span>
                   </div>
                 </div>
 
-                {withdrawMethod === 'bank' && (
-                  <div>
-                    <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">
-                      Chọn ngân hàng thụ hưởng:
-                    </label>
-                    <select
-                      value={bankName}
-                      onChange={(e) => setBankName(e.target.value)}
-                      className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-400"
-                    >
-                      <option value="Vietcombank">Vietcombank (VCB)</option>
-                      <option value="MB Bank">MB Bank (Quân Đội)</option>
-                      <option value="Techcombank">Techcombank (TCB)</option>
-                      <option value="ACB">ACB (Á Châu)</option>
-                      <option value="VPBank">VPBank</option>
-                      <option value="TPBank">TPBank</option>
-                      <option value="BIDV">BIDV</option>
-                      <option value="Vietinbank">Vietinbank</option>
-                    </select>
-                  </div>
-                )}
-
                 <div>
                   <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">
-                    {withdrawMethod === 'bank'
-                      ? 'Số tài khoản ngân hàng:'
-                      : withdrawMethod === 'momo'
-                      ? 'Số điện thoại Momo:'
-                      : 'Địa chỉ ví USDT (TRC20 / BEP20):'}
+                    Địa chỉ ví USDT (TRC20 / BEP20):
                   </label>
                   <input
                     type="text"
                     required
-                    placeholder={withdrawMethod === 'bank' ? 'Ví dụ: 1018293819' : withdrawMethod === 'momo' ? 'Ví dụ: 0987654321' : 'T...' }
+                    placeholder="T..."
                     value={accountNumber}
                     onChange={(e) => setAccountNumber(e.target.value)}
                     className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:outline-none focus:border-emerald-400"
@@ -1182,7 +1180,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
 
                 <div>
                   <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">
-                    Tên chủ tài khoản (Viết hoa không dấu):
+                    Tên/Ghi chú định danh (Viết hoa không dấu):
                   </label>
                   <input
                     type="text"
@@ -1359,7 +1357,14 @@ export const CtvPage: React.FC<CtvPageProps> = ({
                     return (
                       <tr key={p.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34] transition">
                         <td className="p-3">
-                          <div className="font-bold text-slate-800 dark:text-slate-200">{p.name}</div>
+                          <div className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                            {p.name}
+                            {p.isHidden && (
+                              <span className="text-[10px] bg-slate-500/20 text-slate-600 dark:text-slate-400 border border-slate-500/30 px-1.5 py-0.5 rounded font-normal">
+                                Đã ẩn
+                              </span>
+                            )}
+                          </div>
                           <div className="text-[10px] text-slate-600 dark:text-slate-400">{p.variants.length} biến thể</div>
                         </td>
                         <td className="p-3">
@@ -1380,6 +1385,24 @@ export const CtvPage: React.FC<CtvPageProps> = ({
                           {totalStock.toLocaleString()}
                         </td>
                         <td className="p-3 text-right space-x-1.5 whitespace-nowrap">
+                          <button
+                            onClick={() => handleToggleProductVisibility(p)}
+                            title={p.isHidden ? 'Hiện lại sản phẩm' : 'Ẩn sản phẩm khỏi cửa hàng'}
+                            className={`p-1.5 rounded-lg transition inline-flex ${
+                              p.isHidden
+                                ? 'bg-[#e5e8e7] dark:bg-[#2d3036] text-slate-500 dark:text-slate-500 hover:bg-emerald-500 hover:text-slate-950'
+                                : 'bg-[#e5e8e7] dark:bg-[#2d3036] text-slate-600 dark:text-slate-400 hover:bg-slate-500 hover:text-slate-950'
+                            }`}
+                          >
+                            {p.isHidden ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                          </button>
+                          <button
+                            onClick={() => setVariantsModalProduct(p)}
+                            title="Ẩn/hiện biến thể"
+                            className="bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-amber-500 hover:text-slate-950 text-slate-600 dark:text-slate-400 font-bold p-1.5 rounded-lg text-xs transition inline-flex"
+                          >
+                            <Boxes className="w-3.5 h-3.5" />
+                          </button>
                           <button
                             onClick={() => openEditDescription(p)}
                             title="Sửa mô tả & định dạng tài khoản"
@@ -1693,6 +1716,59 @@ export const CtvPage: React.FC<CtvPageProps> = ({
               >
                 {isSavingDescription ? 'Đang lưu...' : 'Lưu Thay Đổi'}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal: show/hide each variant of a product — CTV can't add, edit,
+          or delete a variant's price/name (Admin-only), just pull one off
+          the storefront without touching its inventory. */}
+      {variantsModalProduct && (
+        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-[#eceeed] dark:bg-[#23252a] border border-amber-500/50 rounded-2xl max-w-lg w-full p-5 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-[#e0e4e2] dark:border-[#33363e]">
+              <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                Biến Thể Của "{variantsModalProduct.name}"
+              </h3>
+              <button
+                onClick={() => setVariantsModalProduct(null)}
+                className="text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-2 text-xs">
+              {variantsModalProduct.variants.map((v) => (
+                <div
+                  key={v.id}
+                  className="flex items-center justify-between gap-3 p-3 bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-xl"
+                >
+                  <div className="min-w-0">
+                    <div className="font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-1.5 truncate">
+                      {v.name}
+                      {v.isHidden && (
+                        <span className="text-[10px] bg-slate-500/20 text-slate-600 dark:text-slate-400 border border-slate-500/30 px-1.5 py-0.5 rounded font-normal flex-shrink-0">
+                          Đã ẩn
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-[11px] font-mono text-amber-600 dark:text-amber-400">${formatMoney(v.price)}</div>
+                  </div>
+                  <button
+                    onClick={() => handleToggleVariantVisibility(variantsModalProduct.id, v.id, v.isHidden)}
+                    title={v.isHidden ? 'Hiện lại biến thể' : 'Ẩn biến thể khỏi cửa hàng'}
+                    className={`flex-shrink-0 p-1.5 rounded-lg transition ${
+                      v.isHidden
+                        ? 'bg-[#e5e8e7] dark:bg-[#2d3036] text-slate-500 dark:text-slate-500 hover:bg-emerald-500 hover:text-slate-950'
+                        : 'bg-[#e5e8e7] dark:bg-[#2d3036] text-slate-600 dark:text-slate-400 hover:bg-slate-500 hover:text-slate-950'
+                    }`}
+                  >
+                    {v.isHidden ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              ))}
             </div>
           </div>
         </div>

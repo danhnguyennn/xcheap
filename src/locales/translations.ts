@@ -137,7 +137,7 @@ export const translations: Record<Language, Record<string, string>> = {
     emailReaderDesc: 'Đọc mã xác nhận nhanh trực tiếp từ hòm thư Hotmail/Outlook/Gmail thông qua kết nối tự động.',
     openEmailReader: 'Mở hòm thư',
     formatTool: 'Bộ lọc tách định dạng UID|Mật khẩu',
-    renewHotmail: 'Làm mới Token Hotmail / Outlook',
+    renewHotmail: 'Renew Hotmail',
     renewHotmailDesc: 'Tự động làm mới Refresh Token sang Access Token còn hạn sử dụng.',
 
     // Chân trang Footer
@@ -145,7 +145,7 @@ export const translations: Record<Language, Record<string, string>> = {
     footerDisclaimer2: '- Chúng tôi không chịu trách nhiệm cho bất kỳ hành vi nào sử dụng tài nguyên sai mục đích.',
     termsOfService: 'Điều khoản dịch vụ',
     privacyPolicy: 'Chính sách bảo mật',
-    copyright: '© 2026 XCheap.us - Cửa Hàng Tài Khoản Số. Bảo lưu mọi quyền.',
+    copyright: '© 2026 XCheap.top - Cửa Hàng Tài Khoản Số. Bảo lưu mọi quyền.',
 
     // Đăng nhập / Đăng ký
     authBackToStore: 'Về trang chủ',
@@ -194,7 +194,7 @@ export const translations: Record<Language, Record<string, string>> = {
     notifAutoDepositDesc: 'Hệ thống tự động xử lý và xác nhận giao dịch nạp tiền theo thời gian thực.',
     notifEmpty: 'Chưa có thông báo nào.',
     discountLabel: 'Chiết khấu',
-    siteTagline: 'XCheap.us - Nền tảng dịch vụ số',
+    siteTagline: 'XCheap.top - Nền tảng dịch vụ số',
     clickToDeposit: 'Nhấn để nạp tiền',
 
     // Trang chi tiết sản phẩm
@@ -595,7 +595,7 @@ export const translations: Record<Language, Record<string, string>> = {
     emailReaderDesc: 'Read verification codes quickly from Hotmail/Outlook/Gmail via automated connection.',
     openEmailReader: 'Open Inbox Reader',
     formatTool: 'UID|Password Format Splitter',
-    renewHotmail: 'Renew Hotmail / Outlook Token',
+    renewHotmail: 'Renew Hotmail',
     renewHotmailDesc: 'Automatically renew refresh tokens into active access tokens.',
 
     // Footer
@@ -603,7 +603,7 @@ export const translations: Record<Language, Record<string, string>> = {
     footerDisclaimer2: '- We are not liable for any unauthorized or illegal usage of purchased resources.',
     termsOfService: 'Terms of Service',
     privacyPolicy: 'Privacy Policy',
-    copyright: '© 2026 XCheap.us - Digital Store. All rights reserved.',
+    copyright: '© 2026 XCheap.top - Digital Store. All rights reserved.',
 
     // Login / Register
     authBackToStore: 'Back to store',
@@ -652,7 +652,7 @@ export const translations: Record<Language, Record<string, string>> = {
     notifAutoDepositDesc: 'The system automatically processes and confirms deposit transactions in real time.',
     notifEmpty: 'No notifications yet.',
     discountLabel: 'Discount',
-    siteTagline: 'XCheap.us - Digital Services Platform',
+    siteTagline: 'XCheap.top - Digital Services Platform',
     clickToDeposit: 'Click to deposit',
 
     // Product Detail page
@@ -1043,14 +1043,14 @@ export const translations: Record<Language, Record<string, string>> = {
     emailReaderDesc: '通过自动连接直接在线解析读取 Hotmail/Outlook 邮件验证码。',
     openEmailReader: '打开邮箱阅读器',
     formatTool: 'UID|密码 格式分割器',
-    renewHotmail: 'Hotmail / Outlook Token 自动续期',
+    renewHotmail: 'Hotmail 自动续期',
     renewHotmailDesc: '将 Refresh Token 自动续期为可用 Access Token。',
 
     footerDisclaimer1: '- 严禁将所售账号及邮箱用于任何违法犯罪活动。',
     footerDisclaimer2: '- 本平台对一切不当使用行为概不负责。',
     termsOfService: '服务条款',
     privacyPolicy: '隐私政策',
-    copyright: '© 2026 XCheap.us - 数字账号商城. 版权所有.',
+    copyright: '© 2026 XCheap.top - 数字账号商城. 版权所有.',
 
     // 登录 / 注册
     authBackToStore: '返回首页',
@@ -1099,7 +1099,7 @@ export const translations: Record<Language, Record<string, string>> = {
     notifAutoDepositDesc: '系统自动实时处理并确认充值交易。',
     notifEmpty: '暂无通知。',
     discountLabel: '折扣',
-    siteTagline: 'XCheap.us - 数字服务平台',
+    siteTagline: 'XCheap.top - 数字服务平台',
     clickToDeposit: '点击充值',
 
     // 商品详情页
@@ -1490,14 +1490,14 @@ export const translations: Record<Language, Record<string, string>> = {
     emailReaderDesc: 'อ่านรหัส OTP จากกล่องจดหมาย Hotmail/Outlook/Gmail โดยตรงผ่านการเชื่อมต่ออัตโนมัติ',
     openEmailReader: 'เปิดตัวอ่านอีเมล',
     formatTool: 'เครื่องมือแยกรูปแบบ UID|Pass',
-    renewHotmail: 'ต่ออายุโทเค็น Hotmail / Outlook',
+    renewHotmail: 'ต่ออายุโทเค็น Hotmail',
     renewHotmailDesc: 'ต่ออายุ Refresh Token เป็น Access Token ที่ใช้งานได้โดยอัตโนมัติ',
 
     footerDisclaimer1: '- ห้ามนำบัญชีและอีเมลไปใช้ในวัตถุประสงค์ที่ผิดกฎหมายโดยเด็ดขาด',
     footerDisclaimer2: '- เราไม่รับผิดชอบต่อการกระทำหรือการนำทรัพยากรไปใช้ผิดวัตถุประสงค์',
     termsOfService: 'ข้อกำหนดการให้บริการ',
     privacyPolicy: 'นโยบายความเป็นส่วนตัว',
-    copyright: '© 2026 XCheap.us - Digital Store. All rights reserved.',
+    copyright: '© 2026 XCheap.top - Digital Store. All rights reserved.',
 
     // เข้าสู่ระบบ / สมัครสมาชิก
     authBackToStore: 'กลับหน้าแรก',
@@ -1546,7 +1546,7 @@ export const translations: Record<Language, Record<string, string>> = {
     notifAutoDepositDesc: 'ระบบประมวลผลและยืนยันธุรกรรมเติมเงินโดยอัตโนมัติแบบเรียลไทม์',
     notifEmpty: 'ยังไม่มีการแจ้งเตือน',
     discountLabel: 'ส่วนลด',
-    siteTagline: 'XCheap.us - แพลตฟอร์มบริการดิจิทัล',
+    siteTagline: 'XCheap.top - แพลตฟอร์มบริการดิจิทัล',
     clickToDeposit: 'คลิกเพื่อเติมเงิน',
 
     // หน้ารายละเอียดสินค้า

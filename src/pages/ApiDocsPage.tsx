@@ -233,7 +233,7 @@ function buildCurl(origin: string, ep: ApiEndpoint, apiKey: string | null): stri
 }
 
 export const ApiDocsPage: React.FC<ApiDocsPageProps> = ({ user, onBackToStore }) => {
-  const origin = typeof window !== 'undefined' ? window.location.origin : 'https://xcheap.us';
+  const origin = typeof window !== 'undefined' ? window.location.origin : 'https://xcheap.top';
   const isPowerUser = user.role === 'ctv' || user.role === 'admin';
 
   const [apiKey, setApiKey] = useState<string | null>(null);

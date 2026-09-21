@@ -100,16 +100,33 @@ export const Header: React.FC<HeaderProps> = ({
   };
 
   return (
-    <header className="sticky top-0 z-40 bg-[#f1f3f2]/95 dark:bg-[#1b1d22]/95 backdrop-blur border-b border-[#e4e8e7] dark:border-[#2d3037] px-3 sm:px-6 py-2.5">
-      <div className="max-w-7xl mx-auto flex items-center justify-between gap-2 sm:gap-3 flex-wrap">
-        {/* Left: Brand Logo & Search Bar */}
-        <div className="flex items-center gap-3 md:gap-5 flex-1 min-w-0 max-w-2xl">
-          {/* Brand Logo with Custom XCheap.us Identity */}
-          <button
-            onClick={onLogoClick}
-            className="flex items-center gap-2.5 focus:outline-none group flex-shrink-0"
-            title={t.siteTagline}
-          >
+    <header className="sticky top-0 z-40 bg-[#f1f3f2]/95 dark:bg-[#1b1d22]/95 backdrop-blur border-b border-[#e4e8e7] dark:border-[#2d3037] px-2 min-[380px]:px-3 xl:px-6 py-2.5">
+      {/* One single flat flex row — logo, search bar and every action icon
+          are direct children (no nested sub-groups). That matters: a
+          fixed-size item (the logo, flex-shrink-0) and a shrinkable one
+          (the search bar, min-w-0) used to share a wrapper div with its
+          own flex-1 — that wrapper's own box shrinks toward 0 whenever
+          free space runs low (flex-basis:0% + min-w-0), even though the
+          logo inside it can't shrink, so the logo overflowed its box and
+          visually overlapped whatever came next (seen on iPhone Pro Max
+          and iPad mini widths). With everything flat, "gap" + "justify-
+          between" apply directly to every item: the search bar's flex-1
+          still eats free space and pushes icons to the right edge on
+          xl+ (1280px — the labeled desktop layout only turns on there;
+          iPad mini/iPad landscape (~768-1024px) don't have room for the
+          full search bar + every button's text label, so they keep the
+          compact icon-only row below that — confirmed by testing real
+          iPad mini/iPad landscape/iPhone Pro Max widths), and below xl
+          (no flex-grow item) any leftover width is spread evenly across
+          every gap — logo, icons and avatar stay anchored to their
+          edges and evenly spaced instead of bunching to the left. */}
+      <div className="max-w-7xl mx-auto flex items-center justify-between gap-0.5 min-[380px]:gap-1 min-[900px]:gap-2 xl:gap-3 flex-wrap">
+        {/* Brand Logo with Custom XCheap.top Identity */}
+        <button
+          onClick={onLogoClick}
+          className="flex items-center gap-2.5 focus:outline-none group flex-shrink-0"
+          title={t.siteTagline}
+        >
             <div className="relative w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-[#ecefee] dark:bg-[#222429] border border-emerald-500/40 flex items-center justify-center shadow-lg shadow-black/40 group-hover:border-emerald-500/60 transition-all duration-200">
               {/* Dynamic Cybernetic 'X' with deal-arrow geometry */}
               <svg className="w-5 h-5 sm:w-5.5 sm:h-5.5" viewBox="0 0 28 28" fill="none">
@@ -125,7 +142,7 @@ export const Header: React.FC<HeaderProps> = ({
             <div className="hidden sm:flex flex-col text-left">
               <div className="flex items-baseline tracking-tight font-black font-sans text-lg sm:text-xl leading-none">
                 <span className="text-slate-900 dark:text-slate-100 group-hover:text-emerald-900 group-hover:dark:text-emerald-100 transition-colors">XCheap</span>
-                <span className="text-emerald-600 dark:text-emerald-400 text-sm ml-0.5 font-black">.us</span>
+                <span className="text-emerald-600 dark:text-emerald-400 text-sm ml-0.5 font-black">.top</span>
               </div>
               <span className="text-[9px] font-mono text-slate-600 dark:text-slate-400 tracking-wider uppercase leading-tight mt-0.5 flex items-center gap-1">
                 <span className="text-emerald-600 dark:text-emerald-400 font-semibold">DIGITAL</span>
@@ -135,34 +152,39 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
           </button>
 
-          {/* Search bar */}
-          <div className="relative flex-1 hidden sm:block">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-600 dark:text-slate-400" />
-            <input
-              type="text"
-              value={searchQuery}
-              onChange={(e) => onSearchChange(e.target.value)}
-              placeholder={t.searchPlaceholder}
-              className="w-full bg-[#f4f6f5] dark:bg-[#17181c] border border-[#e1e5e4] dark:border-[#32353d] focus:border-emerald-500 rounded-lg pl-9 pr-4 py-1.5 text-xs text-slate-800 dark:text-slate-200 placeholder-slate-600 dark:placeholder-slate-400 focus:outline-none transition"
-            />
-            {searchQuery && (
-              <button
-                onClick={() => onSearchChange('')}
-                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-xs text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100"
-              >
-                ✕
-              </button>
-            )}
-          </div>
+        {/* Search bar — shown from sm (640px) up, well before the text
+            labels start appearing (those stay gated at md/900/lg/xl since
+            they're the truly width-hungry items). flex-1 + min-w-0 means
+            it's the one item that absorbs free space AND is allowed to
+            shrink below its content size (the input can compress), so on
+            tablet widths — where the icon-only right cluster alone
+            wouldn't fill the row — it eats the leftover space that would
+            otherwise become one big gap next to the logo or icons, and
+            caps how far apart the icons can spread as the window grows */}
+        <div className="relative flex-1 min-w-0 max-w-2xl hidden sm:block">
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-600 dark:text-slate-400" />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => onSearchChange(e.target.value)}
+            placeholder={t.searchPlaceholder}
+            className="w-full bg-[#f4f6f5] dark:bg-[#17181c] border border-[#e1e5e4] dark:border-[#32353d] focus:border-emerald-500 rounded-lg pl-9 pr-4 py-1.5 text-xs text-slate-800 dark:text-slate-200 placeholder-slate-600 dark:placeholder-slate-400 focus:outline-none transition"
+          />
+          {searchQuery && (
+            <button
+              onClick={() => onSearchChange('')}
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-xs text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100"
+            >
+              ✕
+            </button>
+          )}
         </div>
 
-        {/* Right Action Controls */}
-        <div className="flex items-center gap-1.5 sm:gap-2.5">
-          {/* Mobile search toggle — the inline search bar is hidden below sm,
-              this is the only way to search on a phone-width screen */}
+        {/* Mobile search toggle — the inline search bar is hidden below
+            sm, so below that this is the only way to search */}
           <button
             onClick={() => setShowMobileSearch((s) => !s)}
-            className="sm:hidden p-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036] border border-[#dfe3e1] dark:border-[#353840] text-slate-800 dark:text-slate-200 rounded-lg transition"
+            className="sm:hidden p-1 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036] border border-[#dfe3e1] dark:border-[#353840] text-slate-800 dark:text-slate-200 rounded-lg transition"
             title={t.searchPlaceholder}
           >
             <Search className="w-4 h-4" />
@@ -171,7 +193,7 @@ export const Header: React.FC<HeaderProps> = ({
           {/* Dark mode toggle */}
           <button
             onClick={onToggleTheme}
-            className="p-1.5 sm:p-2 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036] border border-[#dfe3e1] dark:border-[#353840] text-slate-800 dark:text-slate-200 rounded-lg transition"
+            className="p-1 xl:p-2 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036] border border-[#dfe3e1] dark:border-[#353840] text-slate-800 dark:text-slate-200 rounded-lg transition"
             title={theme === 'dark' ? t.themeToLight : t.themeToDark}
           >
             {theme === 'dark' ? (
@@ -185,10 +207,10 @@ export const Header: React.FC<HeaderProps> = ({
           <div className="relative">
             <button
               onClick={() => setShowLangMenu(!showLangMenu)}
-              className="flex items-center gap-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036] border border-[#dfe3e1] dark:border-[#353840] text-slate-800 dark:text-slate-200 text-xs font-medium px-2.5 py-1.5 rounded-lg transition"
+              className="flex items-center gap-1 min-[900px]:gap-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036] border border-[#dfe3e1] dark:border-[#353840] text-slate-800 dark:text-slate-200 text-xs font-medium px-2 min-[900px]:px-2.5 py-1.5 rounded-lg transition"
             >
               <span>{langLabels[language].flag}</span>
-              <span className="hidden sm:inline">{langLabels[language].label}</span>
+              <span className="hidden min-[900px]:inline">{langLabels[language].label}</span>
               <ChevronDown className="w-3.5 h-3.5 text-slate-600 dark:text-slate-400" />
             </button>
 
@@ -222,7 +244,7 @@ export const Header: React.FC<HeaderProps> = ({
               with no way at all to reach it on a phone. */}
           <button
             onClick={onOpenTools}
-            className="flex items-center gap-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036] border border-[#dfe3e1] dark:border-[#353840] text-slate-800 dark:text-slate-200 text-xs font-medium px-2.5 sm:px-3 py-1.5 rounded-lg transition"
+            className="flex items-center gap-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036] border border-[#dfe3e1] dark:border-[#353840] text-slate-800 dark:text-slate-200 text-xs font-medium px-2 md:px-3 py-1.5 rounded-lg transition"
             title={t.toolsTitle}
           >
             <Wrench className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
@@ -235,18 +257,18 @@ export const Header: React.FC<HeaderProps> = ({
               {/* Also reachable from the user dropdown menu on mobile */}
               <button
                 onClick={onOpenOrders}
-                className="hidden sm:flex items-center gap-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036] border border-[#dfe3e1] dark:border-[#353840] text-slate-800 dark:text-slate-200 text-xs font-medium px-2.5 sm:px-3 py-1.5 rounded-lg transition"
+                className="hidden min-[900px]:flex items-center gap-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036] border border-[#dfe3e1] dark:border-[#353840] text-slate-800 dark:text-slate-200 text-xs font-medium px-2.5 xl:px-3 py-1.5 rounded-lg transition"
                 title={t.ordersTitle}
               >
                 <ShoppingBag className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
-                <span className="hidden md:inline">{t.orders}</span>
+                <span className="hidden min-[900px]:inline">{t.orders}</span>
               </button>
 
               {/* Same action as the balance pill below — redundant on a
                   cramped mobile row, so only shown once there's room */}
               <button
                 onClick={onOpenDeposit}
-                className="hidden sm:flex items-center gap-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold px-2.5 sm:px-3 py-1.5 rounded-lg transition shadow-md shadow-emerald-500/20"
+                className="hidden min-[1152px]:flex items-center gap-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold px-2.5 xl:px-3 py-1.5 rounded-lg transition shadow-md shadow-emerald-500/20"
               >
                 <Plus className="w-3.5 h-3.5 stroke-[3]" />
                 <span>{t.deposit}</span>
@@ -254,7 +276,7 @@ export const Header: React.FC<HeaderProps> = ({
 
               <button
                 onClick={onOpenDeposit}
-                className="flex items-center gap-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e3e7e6] hover:dark:bg-[#2f3239] border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 text-xs font-mono font-bold px-2 sm:px-2.5 py-1.5 rounded-lg transition"
+                className="flex items-center gap-0.5 min-[380px]:gap-1 xl:gap-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e3e7e6] hover:dark:bg-[#2f3239] border border-emerald-500/30 text-emerald-600 dark:text-emerald-400 text-xs font-mono font-bold px-1 min-[380px]:px-1.5 xl:px-2.5 py-1.5 rounded-lg transition"
                 title={t.clickToDeposit}
               >
                 <Wallet className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
@@ -265,10 +287,10 @@ export const Header: React.FC<HeaderProps> = ({
 
           {/* Notifications button — not very meaningful without an account,
               so it's dropped on mobile for guests to make room */}
-          <div className={`relative ${!user ? 'hidden sm:block' : ''}`}>
+          <div className={`relative ${!user ? 'hidden xl:block' : ''}`}>
             <button
               onClick={handleToggleNotifications}
-              className="relative p-1.5 text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100 transition rounded-lg hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036]"
+              className="relative p-1 xl:p-1.5 text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100 transition rounded-lg hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036]"
             >
               <Bell className="w-4 h-4" />
               {user?.role === 'admin' ? (
@@ -318,17 +340,17 @@ export const Header: React.FC<HeaderProps> = ({
 
           {/* Logged out: login/register. Logged in: avatar + dropdown. */}
           {!user ? (
-            <div className="flex items-center gap-1.5 sm:gap-2">
+            <div className="flex items-center gap-1.5 xl:gap-2">
               <button
                 onClick={onLogin}
-                className="flex items-center gap-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036] border border-[#dfe3e1] dark:border-[#353840] text-slate-800 dark:text-slate-200 text-xs font-semibold px-2.5 sm:px-3 py-1.5 rounded-lg transition"
+                className="flex items-center gap-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036] border border-[#dfe3e1] dark:border-[#353840] text-slate-800 dark:text-slate-200 text-xs font-semibold px-2.5 xl:px-3 py-1.5 rounded-lg transition"
               >
-                <LogIn className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 hidden sm:block" />
+                <LogIn className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400 hidden xl:block" />
                 <span>{t.authLoginTitle}</span>
               </button>
               <button
                 onClick={onRegister}
-                className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold px-2.5 sm:px-3 py-1.5 rounded-lg transition shadow-md shadow-emerald-500/20"
+                className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold px-2.5 xl:px-3 py-1.5 rounded-lg transition shadow-md shadow-emerald-500/20"
               >
                 {t.headerRegister}
               </button>
@@ -337,7 +359,7 @@ export const Header: React.FC<HeaderProps> = ({
           <div className="relative">
             <button
               onClick={() => setShowUserMenu(!showUserMenu)}
-              className="flex items-center gap-2 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036] border border-[#dfe3e1] dark:border-[#353840] px-2 py-1 rounded-lg transition"
+              className="flex items-center gap-2 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e5e8e7] hover:dark:bg-[#2d3036] border border-[#dfe3e1] dark:border-[#353840] px-1.5 xl:px-2 py-1 rounded-lg transition"
             >
               <div className="w-6 h-6 rounded-md bg-emerald-600 text-slate-900 dark:text-slate-100 flex items-center justify-center text-xs font-bold shadow-sm">
                 {user.username.charAt(0).toUpperCase()}
@@ -350,7 +372,7 @@ export const Header: React.FC<HeaderProps> = ({
                   </span>
                 )}
               </div>
-              <ChevronDown className="w-3 h-3 text-slate-600 dark:text-slate-400 hidden sm:block" />
+              <ChevronDown className="w-3 h-3 text-slate-600 dark:text-slate-400 hidden xl:block" />
             </button>
 
             {showUserMenu && (
@@ -522,11 +544,10 @@ export const Header: React.FC<HeaderProps> = ({
             )}
           </div>
           )}
-        </div>
       </div>
 
-      {/* Mobile search row — the inline search bar only shows at sm+, so this
-          is the only way to search on a phone-width screen */}
+      {/* Mobile search row — the inline search bar only shows at sm+, so
+          this is the only way to search on a phone-width screen */}
       {showMobileSearch && (
         <div className="max-w-7xl mx-auto sm:hidden pt-2.5">
           <div className="relative">

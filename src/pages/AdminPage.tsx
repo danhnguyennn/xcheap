@@ -1,7 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Product, ProductVariant, User, Language, UserRole, CryptoNetwork, Voucher, Review, ReviewSuggestion } from '../types';
+import { Product, ProductVariant, User, Language, UserRole, CryptoNetwork, CryptoOption, Voucher, Review, ReviewSuggestion } from '../types';
 import { translations } from '../locales/translations';
-import { cryptoOptions } from '../data/storeData';
 import { formatMoney } from '../utils/pricing';
 import { SimpleBarChart, BarChartDatum } from '../components/charts/SimpleBarChart';
 import {
@@ -33,7 +32,9 @@ import {
   Boxes,
   BarChart3,
   Upload,
-  Star
+  Star,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 
 interface AdminPageProps {
@@ -62,7 +63,20 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [stats, setStats] = useState<any>(null);
   const [allUsers, setAllUsers] = useState<User[]>([]);
   const [categories, setCategories] = useState<any[]>([]);
+  // Deposit networks (crypto_options) — full list including hidden ones, for
+  // the "Cổng RPC" management tab. The public storefront/deposit modal uses
+  // a separately-filtered fetch (App.tsx's fetchCryptoOptions) that already
+  // excludes hidden entries.
+  const [cryptoDepositOptions, setCryptoDepositOptions] = useState<CryptoOption[]>([]);
+  const [editingCryptoOptId, setEditingCryptoOptId] = useState<string | null>(null);
+  const [cryptoOptForm, setCryptoOptForm] = useState<Partial<CryptoOption>>({});
+  const [showAddCryptoOptModal, setShowAddCryptoOptModal] = useState(false);
   const [inventoryItems, setInventoryItems] = useState<any[]>([]);
+  // Which product groups in the inventory list are expanded — starts empty
+  // (everything collapsed) so the tab doesn't render dozens of full account
+  // tables at once; admin clicks a product's header bar to open just that
+  // one.
+  const [expandedInventoryProducts, setExpandedInventoryProducts] = useState<Set<string>>(new Set());
   const [vouchers, setVouchers] = useState<Voucher[]>([]);
   const [productReviews, setProductReviews] = useState<(Review & { productName: string })[]>([]);
   const [reviewEditableMaxRating, setReviewEditableMaxRating] = useState(3);
@@ -176,7 +190,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const fetchAdminData = async () => {
     setLoading(true);
     try {
-      const [statsRes, usersRes, catsRes, invRes, feeRes, withRes, voucherRes, reviewsRes, suggestionsRes] = await Promise.all([
+      const [statsRes, usersRes, catsRes, invRes, feeRes, withRes, voucherRes, reviewsRes, suggestionsRes, cryptoOptsRes] = await Promise.all([
         fetch('/api/admin/stats'),
         fetch('/api/admin/users'),
         fetch('/api/categories'),
@@ -186,6 +200,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         fetch('/api/vouchers'),
         fetch('/api/admin/reviews'),
         fetch('/api/review-comment-suggestions'),
+        fetch('/api/admin/crypto-options'),
       ]);
       fetchChartData(chartPeriod);
 
@@ -233,10 +248,110 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         const suggestionsData = await suggestionsRes.json();
         setReviewSuggestions(suggestionsData.suggestions || []);
       }
+      if (cryptoOptsRes.ok) {
+        const cryptoOptsData = await cryptoOptsRes.json();
+        setCryptoDepositOptions(cryptoOptsData.options || []);
+      }
     } catch (err) {
       console.error('Failed to load admin data', err);
     } finally {
       setLoading(false);
+    }
+  };
+
+  // Deposit network (crypto_options) management — show/hide, edit its
+  // display/RPC config, delete, or restore one of the 4 supported networks.
+  const handleToggleCryptoOptVisibility = async (opt: CryptoOption) => {
+    const nextHidden = !opt.isHidden;
+    try {
+      const res = await fetch(`/api/admin/crypto-options/${opt.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isHidden: nextHidden }),
+      });
+      if (res.ok) {
+        showNotification(nextHidden ? `✅ Đã ẩn cổng nạp "${opt.networkLabel}"` : `✅ Đã hiện lại cổng nạp "${opt.networkLabel}"`);
+        fetchAdminData();
+      } else {
+        showNotification(null, 'Lỗi cập nhật trạng thái hiển thị');
+      }
+    } catch (e) {
+      showNotification(null, 'Lỗi cập nhật trạng thái hiển thị');
+    }
+  };
+
+  const handleDeleteCryptoOpt = async (opt: CryptoOption) => {
+    if (!confirm(`Xóa hẳn cổng nạp "${opt.networkLabel}"? Ví đã tạo cho người dùng trên mạng này sẽ không còn hiển thị/kiểm tra được nữa cho tới khi thêm lại.`)) return;
+    try {
+      const res = await fetch(`/api/admin/crypto-options/${opt.id}`, { method: 'DELETE' });
+      if (res.ok) {
+        showNotification(`✅ Đã xóa cổng nạp "${opt.networkLabel}"`);
+        fetchAdminData();
+      } else {
+        showNotification(null, 'Lỗi xóa cổng nạp');
+      }
+    } catch (e) {
+      showNotification(null, 'Lỗi xóa cổng nạp');
+    }
+  };
+
+  const openEditCryptoOpt = (opt: CryptoOption) => {
+    setEditingCryptoOptId(opt.id);
+    setCryptoOptForm(opt);
+  };
+
+  const handleSaveCryptoOpt = async () => {
+    if (!editingCryptoOptId) return;
+    try {
+      const res = await fetch(`/api/admin/crypto-options/${editingCryptoOptId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cryptoOptForm),
+      });
+      if (res.ok) {
+        showNotification('✅ Đã lưu cấu hình cổng nạp');
+        setEditingCryptoOptId(null);
+        fetchAdminData();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        showNotification(null, data.error || 'Lỗi lưu cấu hình');
+      }
+    } catch (e) {
+      showNotification(null, 'Lỗi kết nối máy chủ');
+    }
+  };
+
+  // Networks the wallet system already knows how to generate an address
+  // for, that currently have no row in cryptoDepositOptions — offered as
+  // "add back" options rather than a free-form id field, since a genuinely
+  // new blockchain id would need real wallet/RPC code, not just a DB row.
+  const KNOWN_CRYPTO_NETWORK_IDS: CryptoNetwork[] = ['bsc', 'polygon', 'trc', 'base'];
+  const missingCryptoNetworkIds = KNOWN_CRYPTO_NETWORK_IDS.filter(
+    (id) => !cryptoDepositOptions.some((o) => o.id === id)
+  );
+
+  const openAddCryptoOpt = (id: CryptoNetwork) => {
+    setCryptoOptForm({ id, name: '', token: '', networkLabel: '', decimals: 18, contractAddress: '', rpcUrl: '', explorerTxUrl: '', icon: '💰', minDeposit: 1.0 });
+    setShowAddCryptoOptModal(true);
+  };
+
+  const handleCreateCryptoOpt = async () => {
+    try {
+      const res = await fetch('/api/admin/crypto-options', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(cryptoOptForm),
+      });
+      if (res.ok) {
+        showNotification('✅ Đã thêm lại cổng nạp');
+        setShowAddCryptoOptModal(false);
+        fetchAdminData();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        showNotification(null, data.error || 'Lỗi thêm cổng nạp');
+      }
+    } catch (e) {
+      showNotification(null, 'Lỗi kết nối máy chủ');
     }
   };
 
@@ -684,6 +799,51 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     }
   };
 
+  // Toggle a product on/off the storefront without deleting it — reuses the
+  // generic field-merge PUT endpoint, same as any other admin product edit.
+  const handleToggleProductVisibility = async (prod: Product) => {
+    const nextHidden = !prod.isHidden;
+    try {
+      const res = await fetch(`/api/admin/products/${prod.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isHidden: nextHidden }),
+      });
+      if (res.ok) {
+        showNotification(nextHidden ? `✅ Đã ẩn sản phẩm "${prod.name}"` : `✅ Đã hiện lại sản phẩm "${prod.name}"`);
+        onRefreshProducts();
+      } else {
+        showNotification(null, 'Lỗi cập nhật trạng thái hiển thị');
+      }
+    } catch (e) {
+      showNotification(null, 'Lỗi cập nhật trạng thái hiển thị');
+    }
+  };
+
+  // Toggle a single variant on/off the storefront (same idea, scoped to one
+  // variant of the product rather than the whole listing). Calls
+  // refreshAfterVariantChange (defined further down) — safe to reference
+  // here since this closure only actually runs on a later click, by which
+  // point the whole component body (including that const) has executed.
+  const handleToggleVariantVisibility = async (productId: string, variant: ProductVariant) => {
+    const nextHidden = !variant.isHidden;
+    try {
+      const res = await fetch(`/api/admin/products/${productId}/variants/${variant.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ isHidden: nextHidden }),
+      });
+      if (res.ok) {
+        showNotification(nextHidden ? `✅ Đã ẩn biến thể "${variant.name}"` : `✅ Đã hiện lại biến thể "${variant.name}"`);
+        refreshAfterVariantChange(productId);
+      } else {
+        showNotification(null, 'Lỗi cập nhật trạng thái hiển thị biến thể');
+      }
+    } catch (e) {
+      showNotification(null, 'Lỗi cập nhật trạng thái hiển thị biến thể');
+    }
+  };
+
   const resetVariantForm = () => {
     setEditingVariantId(null);
     setVariantName('');
@@ -1107,7 +1267,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-                {cryptoOptions.map((opt) => (
+                {cryptoDepositOptions.filter((o) => !o.isHidden).map((opt) => (
                   <div key={opt.id} className="bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#e1e5e4] dark:border-[#32353d] p-3 rounded-lg text-xs space-y-1">
                     <div className="flex items-center justify-between font-bold">
                       <span className="text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
@@ -1392,7 +1552,14 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                       return (
                         <tr key={prod.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34] transition">
                           <td className="p-3">
-                            <div className="font-bold text-slate-800 dark:text-slate-200">{prod.name}</div>
+                            <div className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
+                              {prod.name}
+                              {prod.isHidden && (
+                                <span className="text-[10px] bg-slate-500/20 text-slate-600 dark:text-slate-400 border border-slate-500/30 px-1.5 py-0.5 rounded font-normal">
+                                  Đã ẩn
+                                </span>
+                              )}
+                            </div>
                             {/* badge is computed and saved server-side on every price edit — read it as-is */}
                             {prod.badge && (
                               <span className="text-[10px] bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/30 px-1 rounded">
@@ -1419,6 +1586,17 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                           </td>
                           <td className="p-3 text-right">
                             <div className="flex items-center justify-end gap-1">
+                              <button
+                                onClick={() => handleToggleProductVisibility(prod)}
+                                className={`p-1 rounded transition ${
+                                  prod.isHidden
+                                    ? 'text-slate-500 dark:text-slate-500 hover:text-emerald-600 hover:dark:text-emerald-400 hover:bg-emerald-50 hover:dark:bg-emerald-950/70'
+                                    : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200 hover:bg-slate-100 hover:dark:bg-slate-800/70'
+                                }`}
+                                title={prod.isHidden ? 'Hiện lại sản phẩm' : 'Ẩn sản phẩm khỏi cửa hàng'}
+                              >
+                                {prod.isHidden ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                              </button>
                               <button
                                 onClick={() => handleOpenVariants(prod)}
                                 className="p-1 text-slate-600 dark:text-slate-400 hover:text-amber-600 hover:dark:text-amber-400 hover:bg-amber-50 hover:dark:bg-amber-950/70 rounded transition"
@@ -1598,7 +1776,16 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                         {variantsProduct.variants.map((v) => {
                           return (
                           <tr key={v.id} className={`hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34] transition ${editingVariantId === v.id ? 'bg-amber-500/10' : ''}`}>
-                            <td className="p-2.5 font-semibold text-slate-800 dark:text-slate-200">{v.name}</td>
+                            <td className="p-2.5 font-semibold text-slate-800 dark:text-slate-200">
+                              <span className="flex items-center gap-1.5">
+                                {v.name}
+                                {v.isHidden && (
+                                  <span className="text-[10px] bg-slate-500/20 text-slate-600 dark:text-slate-400 border border-slate-500/30 px-1.5 py-0.5 rounded font-normal">
+                                    Đã ẩn
+                                  </span>
+                                )}
+                              </span>
+                            </td>
                             <td className="p-2.5 font-mono text-amber-600 dark:text-amber-400 font-bold">${formatMoney(v.price)}</td>
                             <td className="p-2.5 font-mono text-slate-600 dark:text-slate-400">{v.originalPrice ? `$${formatMoney(v.originalPrice)}` : '—'}</td>
                             {/* discountBadge is computed and saved server-side on every price edit — read it as-is */}
@@ -1606,6 +1793,17 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                             <td className="p-2.5 font-mono text-emerald-600 dark:text-emerald-400 font-semibold">{v.stockCount.toLocaleString()}</td>
                             <td className="p-2.5 text-right">
                               <div className="flex items-center justify-end gap-1">
+                                <button
+                                  onClick={() => handleToggleVariantVisibility(variantsProduct.id, v)}
+                                  className={`p-1 rounded transition ${
+                                    v.isHidden
+                                      ? 'text-slate-500 dark:text-slate-500 hover:text-emerald-600 hover:dark:text-emerald-400 hover:bg-emerald-50 hover:dark:bg-emerald-950/70'
+                                      : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200 hover:bg-slate-100 hover:dark:bg-slate-800/70'
+                                  }`}
+                                  title={v.isHidden ? 'Hiện lại biến thể' : 'Ẩn biến thể khỏi cửa hàng'}
+                                >
+                                  {v.isHidden ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                                </button>
                                 <button
                                   onClick={() => handleOpenEditVariant(v)}
                                   className="p-1 text-slate-600 dark:text-slate-400 hover:text-purple-600 hover:dark:text-purple-400 hover:bg-purple-50 hover:dark:bg-purple-950/70 rounded transition"
@@ -1740,10 +1938,13 @@ export const AdminPage: React.FC<AdminPageProps> = ({
               </div>
             </div>
 
-            {/* Users Table */}
+            {/* Users Table — capped height with its own scrollbar so a large
+                user base doesn't stretch the whole admin page out; header
+                stays pinned while scrolling. */}
             <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
+              <div className="max-h-[560px] overflow-y-auto">
               <table className="w-full text-left text-xs">
-                <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
+                <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43] sticky top-0 z-10">
                   <tr>
                     <th className="p-3">Tài khoản</th>
                     <th className="p-3">Email</th>
@@ -1853,6 +2054,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                     ))}
                 </tbody>
               </table>
+              </div>
             </div>
 
             {/* Modal Add User */}
@@ -2033,7 +2235,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   <Database className="w-4 h-4 text-purple-600 dark:text-purple-400" />
                   <span>Danh Sách Tài Khoản Trong Kho (Xem Mẫu Bảo Mật)</span>
                 </h3>
-                <span className="text-xs text-slate-600 dark:text-slate-400">Hiển thị mẫu 100 tài khoản</span>
+                <span className="text-xs text-slate-600 dark:text-slate-400">Hiển thị mẫu 100 tài khoản • Bấm vào tên sản phẩm để mở/đóng</span>
               </div>
 
               {inventoryItems.length === 0 ? (
@@ -2041,7 +2243,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   Kho hàng đang trống. Nhập tài khoản ở form phía trên.
                 </div>
               ) : (
-                (() => {
+                <div className="max-h-[520px] overflow-y-auto space-y-3 pr-1">
+                {(() => {
                   const byProduct = new Map<string, typeof inventoryItems>();
                   inventoryItems.forEach((item) => {
                     const list = byProduct.get(item.productId) || [];
@@ -2051,6 +2254,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
                   return Array.from(byProduct.entries()).map(([productId, items]) => {
                     const product = products.find((p) => p.id === productId);
+                    const isExpanded = expandedInventoryProducts.has(productId);
                     const byVariant = new Map<string, typeof items>();
                     items.forEach((item) => {
                       const list = byVariant.get(item.variantId) || [];
@@ -2060,40 +2264,65 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
                     return (
                       <div key={productId} className="border border-[#e1e5e4] dark:border-[#32353d] rounded-lg overflow-hidden">
-                        <div className="bg-[#e5e8e7] dark:bg-[#2d3036] px-3 py-2 text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center justify-between">
-                          <span>{product?.name || productId}</span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setExpandedInventoryProducts((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(productId)) next.delete(productId);
+                              else next.add(productId);
+                              return next;
+                            })
+                          }
+                          className="w-full bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-[#dde1e0] hover:dark:bg-[#363941] px-3 py-2 text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center justify-between transition"
+                        >
+                          <span className="flex items-center gap-1.5">
+                            <ChevronRight className={`w-3.5 h-3.5 text-slate-500 dark:text-slate-500 transition-transform ${isExpanded ? 'rotate-90' : ''}`} />
+                            {product?.name || productId}
+                          </span>
                           <span className="text-slate-600 dark:text-slate-400 font-normal">{items.length} tài khoản</span>
-                        </div>
-                        {Array.from(byVariant.entries()).map(([variantId, variantItems]) => {
+                        </button>
+                        {isExpanded && Array.from(byVariant.entries()).map(([variantId, variantItems]) => {
                           const variant = product?.variants.find((v) => v.id === variantId);
+                          // Chưa bán trước, đã bán sau; trong mỗi nhóm thì mới
+                          // nhập kho nhất lên đầu — so admin sees what's
+                          // actually sellable right now without hunting
+                          // through already-sold rows first.
+                          const sortedItems = [...variantItems].sort((a, b) => {
+                            if (a.isSold !== b.isSold) return a.isSold ? 1 : -1;
+                            return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
+                          });
                           return (
                             <div key={variantId}>
                               <div className="bg-[#eff2f1] dark:bg-[#1d1f24] px-3 py-1.5 text-[11px] font-semibold text-slate-600 dark:text-slate-400">
                                 {variant?.name || variantId}
                               </div>
-                              <table className="w-full text-left text-xs">
-                                <tbody className="divide-y divide-[#e4e8e7] dark:divide-[#2d3036] font-mono text-[11px]">
-                                  {variantItems.map((item) => (
-                                    <tr key={item.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34]">
-                                      <td className="p-2.5 text-slate-700 dark:text-slate-300">{item.accountMasked}</td>
-                                      <td className="p-2.5 text-right w-24">
-                                        {item.isSold ? (
-                                          <span className="bg-red-50 dark:bg-red-950/70 text-red-600 dark:text-red-400 px-1.5 py-0.5 rounded text-[10px]">Đã bán</span>
-                                        ) : (
-                                          <span className="bg-emerald-50 dark:bg-emerald-950/70 text-emerald-600 dark:text-emerald-400 px-1.5 py-0.5 rounded text-[10px]">Sẵn sàng</span>
-                                        )}
-                                      </td>
-                                    </tr>
-                                  ))}
-                                </tbody>
-                              </table>
+                              <div className="max-h-64 overflow-y-auto">
+                                <table className="w-full text-left text-xs">
+                                  <tbody className="divide-y divide-[#e4e8e7] dark:divide-[#2d3036] font-mono text-[11px]">
+                                    {sortedItems.map((item) => (
+                                      <tr key={item.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34]">
+                                        <td className="p-2.5 text-slate-700 dark:text-slate-300">{item.accountMasked}</td>
+                                        <td className="p-2.5 text-right w-24">
+                                          {item.isSold ? (
+                                            <span className="bg-red-50 dark:bg-red-950/70 text-red-600 dark:text-red-400 px-1.5 py-0.5 rounded text-[10px]">Đã bán</span>
+                                          ) : (
+                                            <span className="bg-emerald-50 dark:bg-emerald-950/70 text-emerald-600 dark:text-emerald-400 px-1.5 py-0.5 rounded text-[10px]">Sẵn sàng</span>
+                                          )}
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
                             </div>
                           );
                         })}
                       </div>
                     );
                   });
-                })()
+                })()}
+                </div>
               )}
             </div>
           </div>
@@ -2119,19 +2348,50 @@ export const AdminPage: React.FC<AdminPageProps> = ({
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {cryptoOptions.map((opt) => (
-                <div key={opt.id} className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl p-4 shadow space-y-3 text-xs">
+              {cryptoDepositOptions.map((opt) => (
+                <div key={opt.id} className={`bg-[#eceeed] dark:bg-[#23252a] border rounded-xl p-4 shadow space-y-3 text-xs ${opt.isHidden ? 'border-slate-400/40 opacity-60' : 'border-[#dde2e0] dark:border-[#373b43]'}`}>
                   <div className="flex items-center justify-between pb-2 border-b border-[#e0e4e2] dark:border-[#33363e]">
                     <div className="flex items-center gap-2">
                       <span className="text-xl">{opt.icon}</span>
                       <div>
-                        <div className="font-bold text-slate-900 dark:text-slate-100">{opt.name}</div>
+                        <div className="font-bold text-slate-900 dark:text-slate-100 flex items-center gap-1.5">
+                          {opt.name}
+                          {opt.isHidden && (
+                            <span className="text-[10px] bg-slate-500/20 text-slate-600 dark:text-slate-400 border border-slate-500/30 px-1.5 py-0.5 rounded font-normal">
+                              Đã ẩn
+                            </span>
+                          )}
+                        </div>
                         <div className="text-[11px] text-emerald-600 dark:text-emerald-400 font-mono">{opt.networkLabel} ({opt.token})</div>
                       </div>
                     </div>
-                    <span className="bg-emerald-950 text-emerald-600 dark:text-emerald-400 border border-emerald-500/40 text-[10px] font-bold px-2 py-0.5 rounded">
-                      Node Online
-                    </span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => handleToggleCryptoOptVisibility(opt)}
+                        title={opt.isHidden ? 'Hiện lại trên trang nạp tiền' : 'Ẩn khỏi trang nạp tiền'}
+                        className={`p-1 rounded transition ${
+                          opt.isHidden
+                            ? 'text-slate-500 dark:text-slate-500 hover:text-emerald-600 hover:dark:text-emerald-400 hover:bg-emerald-50 hover:dark:bg-emerald-950/70'
+                            : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200 hover:bg-slate-100 hover:dark:bg-slate-800/70'
+                        }`}
+                      >
+                        {opt.isHidden ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                      </button>
+                      <button
+                        onClick={() => openEditCryptoOpt(opt)}
+                        title="Sửa cấu hình"
+                        className="p-1 text-slate-600 dark:text-slate-400 hover:text-purple-600 hover:dark:text-purple-400 hover:bg-purple-50 hover:dark:bg-purple-950/70 rounded transition"
+                      >
+                        <Edit3 className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        onClick={() => handleDeleteCryptoOpt(opt)}
+                        title="Xóa cổng nạp"
+                        className="p-1 text-red-600 dark:text-red-400 hover:text-red-700 hover:dark:text-red-300 hover:bg-red-50 hover:dark:bg-red-950/70 rounded transition"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
                   </div>
 
                   <div className="space-y-1.5">
@@ -2159,6 +2419,24 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 </div>
               ))}
             </div>
+
+            {missingCryptoNetworkIds.length > 0 && (
+              <div className="bg-[#eceeed] dark:bg-[#23252a] border border-dashed border-[#dde2e0] dark:border-[#373b43] rounded-xl p-4 text-xs">
+                <div className="font-bold text-slate-800 dark:text-slate-200 mb-2">Thêm lại cổng nạp đã xóa:</div>
+                <div className="flex flex-wrap gap-2">
+                  {missingCryptoNetworkIds.map((id) => (
+                    <button
+                      key={id}
+                      onClick={() => openAddCryptoOpt(id)}
+                      className="flex items-center gap-1.5 bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-emerald-500 hover:text-slate-950 text-slate-700 dark:text-slate-300 font-semibold px-3 py-1.5 rounded-lg transition"
+                    >
+                      <PlusCircle className="w-3.5 h-3.5" />
+                      <span>{id.toUpperCase()}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -2663,6 +2941,131 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   );
                 })
               )}
+            </div>
+          </div>
+        )}
+
+        {/* Modal: edit a deposit network's display/RPC config */}
+        {editingCryptoOptId && (
+          <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <div className="bg-[#eceeed] dark:bg-[#23252a] border border-purple-500/50 rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
+              <div className="flex items-center justify-between pb-2 border-b border-[#e0e4e2] dark:border-[#33363e]">
+                <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">Sửa Cổng Nạp "{cryptoOptForm.networkLabel}"</h3>
+                <button onClick={() => setEditingCryptoOptId(null)} className="text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100">✕</button>
+              </div>
+              <div className="space-y-3 text-xs">
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Icon:</label>
+                    <input type="text" value={cryptoOptForm.icon || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, icon: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:border-purple-500 focus:outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Token:</label>
+                    <input type="text" value={cryptoOptForm.token || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, token: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:border-purple-500 focus:outline-none" />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Tên hiển thị:</label>
+                  <input type="text" value={cryptoOptForm.name || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, name: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:border-purple-500 focus:outline-none" />
+                </div>
+                <div>
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Nhãn mạng (networkLabel):</label>
+                  <input type="text" value={cryptoOptForm.networkLabel || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, networkLabel: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:border-purple-500 focus:outline-none" />
+                </div>
+                <div>
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">RPC Endpoint:</label>
+                  <input type="text" value={cryptoOptForm.rpcUrl || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, rpcUrl: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-purple-500 focus:outline-none" />
+                  <p className="text-[10px] text-amber-600 dark:text-amber-400 mt-1">⚠️ Sai RPC/contract sẽ làm quét nạp tiền thật trên mạng này ngừng hoạt động.</p>
+                </div>
+                <div>
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Contract Address:</label>
+                  <input type="text" value={cryptoOptForm.contractAddress || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, contractAddress: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-purple-500 focus:outline-none" />
+                </div>
+                <div>
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Explorer TX URL:</label>
+                  <input type="text" value={cryptoOptForm.explorerTxUrl || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, explorerTxUrl: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-purple-500 focus:outline-none" />
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  <div>
+                    <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Decimals:</label>
+                    <input type="number" value={cryptoOptForm.decimals ?? 18} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, decimals: Number(e.target.value) })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-purple-500 focus:outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Min nạp ($):</label>
+                    <input type="number" step="0.1" value={cryptoOptForm.minDeposit ?? 1} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, minDeposit: Number(e.target.value) })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-purple-500 focus:outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Chain ID:</label>
+                    <input type="number" value={cryptoOptForm.chainId ?? ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, chainId: e.target.value ? Number(e.target.value) : undefined })} placeholder="TRC: để trống" className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-purple-500 focus:outline-none" />
+                  </div>
+                </div>
+              </div>
+              <div className="flex justify-end gap-2 pt-1">
+                <button onClick={() => setEditingCryptoOptId(null)} className="px-4 py-2 bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-[#dde1e0] hover:dark:bg-[#373b44] text-slate-700 dark:text-slate-300 rounded-lg text-xs font-semibold">Hủy</button>
+                <button onClick={handleSaveCryptoOpt} className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-slate-900 dark:text-slate-100 font-bold rounded-lg text-xs transition">Lưu Thay Đổi</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Modal: re-add a previously-deleted deposit network */}
+        {showAddCryptoOptModal && (
+          <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+            <div className="bg-[#eceeed] dark:bg-[#23252a] border border-emerald-500/50 rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
+              <div className="flex items-center justify-between pb-2 border-b border-[#e0e4e2] dark:border-[#33363e]">
+                <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">Thêm Lại Cổng Nạp "{String(cryptoOptForm.id).toUpperCase()}"</h3>
+                <button onClick={() => setShowAddCryptoOptModal(false)} className="text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100">✕</button>
+              </div>
+              <div className="space-y-3 text-xs">
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Icon:</label>
+                    <input type="text" value={cryptoOptForm.icon || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, icon: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:border-emerald-500 focus:outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Token:</label>
+                    <input type="text" value={cryptoOptForm.token || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, token: e.target.value })} placeholder="USDT" className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:border-emerald-500 focus:outline-none" />
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Tên hiển thị:</label>
+                  <input type="text" value={cryptoOptForm.name || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, name: e.target.value })} placeholder='VD: USDT (BNB Smart Chain)' className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:border-emerald-500 focus:outline-none" required />
+                </div>
+                <div>
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Nhãn mạng (networkLabel):</label>
+                  <input type="text" value={cryptoOptForm.networkLabel || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, networkLabel: e.target.value })} placeholder="BEP20 (BSC)" className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:border-emerald-500 focus:outline-none" required />
+                </div>
+                <div>
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">RPC Endpoint:</label>
+                  <input type="text" value={cryptoOptForm.rpcUrl || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, rpcUrl: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-emerald-500 focus:outline-none" required />
+                </div>
+                <div>
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Contract Address:</label>
+                  <input type="text" value={cryptoOptForm.contractAddress || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, contractAddress: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-emerald-500 focus:outline-none" required />
+                </div>
+                <div>
+                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Explorer TX URL:</label>
+                  <input type="text" value={cryptoOptForm.explorerTxUrl || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, explorerTxUrl: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-emerald-500 focus:outline-none" />
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  <div>
+                    <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Decimals:</label>
+                    <input type="number" value={cryptoOptForm.decimals ?? 18} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, decimals: Number(e.target.value) })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-emerald-500 focus:outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Min nạp ($):</label>
+                    <input type="number" step="0.1" value={cryptoOptForm.minDeposit ?? 1} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, minDeposit: Number(e.target.value) })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-emerald-500 focus:outline-none" />
+                  </div>
+                  <div>
+                    <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Chain ID:</label>
+                    <input type="number" value={cryptoOptForm.chainId ?? ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, chainId: e.target.value ? Number(e.target.value) : undefined })} placeholder="TRC: để trống" className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-emerald-500 focus:outline-none" />
+                  </div>
+                </div>
+              </div>
+              <div className="flex justify-end gap-2 pt-1">
+                <button onClick={() => setShowAddCryptoOptModal(false)} className="px-4 py-2 bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-[#dde1e0] hover:dark:bg-[#373b44] text-slate-700 dark:text-slate-300 rounded-lg text-xs font-semibold">Hủy</button>
+                <button onClick={handleCreateCryptoOpt} className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-lg text-xs transition">Thêm Cổng Nạp</button>
+              </div>
             </div>
           </div>
         )}
