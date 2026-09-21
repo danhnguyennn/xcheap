@@ -3,8 +3,14 @@
 # ---- 1) Build the frontend (Vite) + bundle the server (esbuild) ----
 FROM node:20-alpine AS builder
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci
+# package.json only — NOT package-lock.json. The lockfile is committed
+# from a non-Linux dev machine, so it never recorded rollup/esbuild's
+# linux-musl optional binaries, and npm keeps trusting the lockfile's
+# platform resolution even under plain `npm install` (npm/cli#4828) —
+# only a lockfile-free install correctly re-resolves optional deps for
+# the platform it's actually running on (this Alpine/musl image).
+COPY package.json ./
+RUN npm install
 COPY . .
 RUN npm run build
 
