@@ -1,6 +1,12 @@
 services:
   app:
-    build: .
+    build:
+      context: .
+      args:
+        # Vite bakes this into the built JS at build time — must be passed
+        # as a build arg, not just left in .env (which is only read for
+        # the container's *runtime* environment via env_file below).
+        VITE_TURNSTILE_SITE_KEY: ${VITE_TURNSTILE_SITE_KEY}
     restart: unless-stopped
     # No host port published, no public-facing proxy either — cloudflared
     # reaches this container over the private compose network only

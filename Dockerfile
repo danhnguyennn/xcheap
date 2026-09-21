@@ -3,15 +3,19 @@
 # ---- 1) Build the frontend (Vite) + bundle the server (esbuild) ----
 FROM node:20-alpine AS builder
 WORKDIR /app
-# package.json only — NOT package-lock.json. The lockfile is committed
-# from a non-Linux dev machine, so it never recorded rollup/esbuild's
-# linux-musl optional binaries, and npm keeps trusting the lockfile's
-# platform resolution even under plain `npm install` (npm/cli#4828) —
-# only a lockfile-free install correctly re-resolves optional deps for
-# the platform it's actually running on (this Alpine/musl image).
-COPY package.json ./
-RUN npm install
+# package-lock.json must be regenerated (`npm install`) inside a
+# node:20-alpine container, never on a dev machine — a lockfile
+# generated elsewhere never records rollup/esbuild's linux-musl
+# optional binaries, which makes `npm ci` fail here with "Cannot find
+# module @rollup/rollup-linux-x64-musl" (npm/cli#4828).
+COPY package.json package-lock.json ./
+RUN npm ci
 COPY . .
+# Vite only bakes VITE_* vars into the built JS at build time — .env is
+# excluded from the build context on purpose (.dockerignore), so this
+# has to come in as a build ARG instead, passed from docker-compose.yml.
+ARG VITE_TURNSTILE_SITE_KEY
+ENV VITE_TURNSTILE_SITE_KEY=$VITE_TURNSTILE_SITE_KEY
 RUN npm run build
 
 # ---- 2) Install production-only dependencies (no devDependencies) ----
