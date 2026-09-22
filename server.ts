@@ -9,15 +9,75 @@ import { db, generateObjectId, MongoCollection } from './server/mongodb';
 import { getOrCreateUserWallet, ensureUserDepositWallets } from './server/walletVault';
 import { sessionMiddleware, getSessionUser, requireAuth, requireRole, hashPassword, verifyPassword, toPublicUser, generateApiKey } from './server/auth';
 import { ethers } from 'ethers';
+import helmet from 'helmet';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 
 const app = express();
 const PORT = 3434;
 
-// Default 100kb is too small for CTV/admin bulk stock imports (pasting a
+// Standard production security headers (X-Content-Type-Options, X-Frame-
+// Options, Strict-Transport-Security, etc). crossOriginEmbedderPolicy is
+// off because it would block the Turnstile iframe entirely.
+//
+// The CSP itself is production-only: Vite's dev middleware (HMR client,
+// React Fast Refresh) needs eval and an inline-script/websocket connection
+// to the dev server that a real CSP would legitimately block, and that
+// looseness would never reflect what a built production bundle actually
+// needs anyway. The production bundle is a single external module script
+// with no inline scripts or eval, so the strict policy below costs it
+// nothing. Scoped to exactly what this app loads: same-origin
+// scripts/styles, inline styles (Tailwind's runtime + component style
+// attrs), and Cloudflare Turnstile's script + the frame it renders the
+// challenge widget in.
+const isProd = process.env.NODE_ENV === 'production';
+app.use(
+  helmet({
+    crossOriginEmbedderPolicy: false,
+    contentSecurityPolicy: isProd
+      ? {
+          directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'", 'https://challenges.cloudflare.com'],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            imgSrc: ["'self'", 'data:', 'blob:'],
+            connectSrc: ["'self'", 'https://challenges.cloudflare.com'],
+            frameSrc: ['https://challenges.cloudflare.com'],
+            objectSrc: ["'none'"],
+          },
+        }
+      : false,
+  })
+);
+
+// Default 50mb is too small for CTV/admin bulk stock imports (pasting a
 // few thousand account lines easily exceeds it) — 10mb gives generous
 // headroom while still bounding request size sanely.
 app.use(express.json({ limit: '50mb' }));
 app.use(sessionMiddleware() as any);
+
+// Brute-force guard on login specifically — 10 attempts per IP per 15
+// minutes, counting only failed attempts (a run of correct logins from a
+// shared office IP should never trip this). Turnstile already screens out
+// pure bots; this is the second layer that also limits a human (or a
+// token-solving service) hammering real password guesses.
+const loginRateLimiter = rateLimit({
+  windowMs: 30 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  // Keyed by IP + the account being attempted (not IP alone) — a shared
+  // office/NAT IP with several real users logging into their own separate
+  // accounts should never trip this, but 5 failed guesses against one
+  // specific account from one specific IP does. ipKeyGenerator normalizes
+  // IPv6 addresses (collapses a /56 down to one key) so an attacker can't
+  // dodge the limit by cycling through addresses within their own subnet.
+  keyGenerator: (req) => {
+    const identifier = typeof req.body?.identifier === 'string' ? req.body.identifier.trim().toLowerCase() : '';
+    return `${ipKeyGenerator(req.ip || '')}:${identifier}`;
+  },
+  message: { error: 'Quá nhiều lần đăng nhập thất bại. Vui lòng thử lại sau 30 phút.' },
+});
 
 // Serializes concurrent /api/deposit/check-rpc calls per user+network so two
 // requests in flight at once can never both credit the same on-chain delta.
@@ -162,7 +222,10 @@ async function initializeDatabase() {
     for (const u of usersMissingPassword) {
       await userCol.updateOne({ id: u.id }, { $set: { passwordHash: defaultHash } });
     }
-    console.log(`[Auth] Backfilled default password for ${usersMissingPassword.length} legacy account(s) — login with username + "${DEFAULT_DEMO_PASSWORD}"`);
+    // Never log the actual password value — even a one-time startup log is
+    // still a real leak if server logs are shipped anywhere (log
+    // aggregator, CI output, a support ticket screenshot...).
+    console.log(`[Auth] Backfilled default password for ${usersMissingPassword.length} legacy account(s).`);
   }
 
   // One-time backfill: any account created before the API key feature
@@ -227,7 +290,11 @@ app.get('/api/user/me', async (req, res) => {
 
   const orderCol = db.collection<Order>('orders');
   const userOrders = await orderCol.find({ userId: user.id });
-  const totalSpent = Number(userOrders.reduce((sum, o) => sum + o.totalPrice, 0).toFixed(3));
+  // A refunded order's money came back — it was never actually kept as
+  // spending, so it shouldn't count toward "total spent" either.
+  const totalSpent = Number(
+    userOrders.filter((o) => o.status !== 'refunded').reduce((sum, o) => sum + o.totalPrice, 0).toFixed(3)
+  );
   const totalDeposited = await computeTotalDeposited(user.id);
 
   const publicUser: any = toPublicUser(user);
@@ -386,7 +453,7 @@ app.post('/api/auth/register', async (req, res) => {
 });
 
 // 3. Log in with username/email + password
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', loginRateLimiter, async (req, res) => {
   const { identifier, password, turnstileToken } = req.body;
   // Same reasoning as register: identifier/password must be real strings
   // before they're allowed near a MongoDB query — an object like
@@ -406,8 +473,18 @@ app.post('/api/auth/login', async (req, res) => {
     return res.status(401).json({ error: 'Tên đăng nhập hoặc mật khẩu không đúng' });
   }
 
-  req.session.userId = user.id;
-  res.json({ success: true, user: toPublicUser(user) });
+  // Regenerate the session id on login instead of reusing whatever session
+  // (if any) the browser already had — otherwise a session id an attacker
+  // fixed before the victim logged in (session fixation) would carry
+  // straight through into an authenticated session they can also read.
+  req.session.regenerate((err) => {
+    if (err) return res.status(500).json({ error: 'Lỗi tạo phiên đăng nhập' });
+    req.session.userId = user.id;
+    req.session.save((saveErr) => {
+      if (saveErr) return res.status(500).json({ error: 'Lỗi tạo phiên đăng nhập' });
+      res.json({ success: true, user: toPublicUser(user) });
+    });
+  });
 });
 
 // 4. Log out — destroys the session
@@ -1423,31 +1500,26 @@ app.post('/api/admin/notifications/read-all', requireRole('admin'), async (req, 
 });
 
 // 7. Get Orders (MongoDB: find)
+// Always scoped to the caller's own purchases, regardless of role — admin
+// and CTV manage every order platform-wide from their own dedicated
+// endpoints instead (GET /api/admin/orders, GET /api/ctv/orders), not from
+// here. Keeping this one strictly "my own orders" means an admin's personal
+// /orders page never doubles as an accidental all-orders view again.
 app.get('/api/orders', async (req, res) => {
   const orderCol = db.collection<Order>('orders');
   const user = await getSessionUser(req);
   if (!user) return res.status(401).json({ error: 'Vui lòng đăng nhập' });
 
-  let matching = user.role === 'admin' ? await orderCol.find() : await orderCol.find({ userId: user.id });
+  let matching = await orderCol.find({ userId: user.id });
   matching.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
-  // Non-admin accounts can only ever see the last 7 days of their own
-  // purchase history through this endpoint — enforced here, not just hidden
-  // in the UI, so a direct API call can't bypass it by passing a larger
-  // withinDays or omitting it. Order rows themselves are never deleted for
-  // this; it's purely a visibility limit. Admin has no such cap and may
-  // optionally narrow the (system-wide) list with ?withinDays=N.
+  // Can only ever see the last 7 days of purchase history through this
+  // endpoint — enforced here, not just hidden in the UI, so a direct API
+  // call can't bypass it. Order rows themselves are never deleted for this;
+  // it's purely a visibility limit.
   const USER_ORDER_VIEW_WINDOW_DAYS = 7;
-  const withinDays =
-    user.role === 'admin'
-      ? req.query.withinDays
-        ? parseInt(String(req.query.withinDays), 10)
-        : NaN
-      : USER_ORDER_VIEW_WINDOW_DAYS;
-  if (Number.isFinite(withinDays) && withinDays > 0) {
-    const cutoffMs = Date.now() - withinDays * 24 * 60 * 60 * 1000;
-    matching = matching.filter((o) => new Date(o.createdAt).getTime() >= cutoffMs);
-  }
+  const cutoffMs = Date.now() - USER_ORDER_VIEW_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+  matching = matching.filter((o) => new Date(o.createdAt).getTime() >= cutoffMs);
 
   // page/limit are optional — omitting them keeps returning the full list
   // (unchanged behavior for the in-app Orders modal), so this stays
@@ -1477,6 +1549,70 @@ app.get('/api/orders/:orderCode', async (req, res) => {
   }
 
   res.json({ order });
+});
+
+// Admin order management — every order platform-wide. Kept separate from
+// GET /api/orders (which is always "my own purchases only", any role) so
+// an admin's personal order history can never again double as an
+// accidental all-orders view.
+app.get('/api/admin/orders', requireRole('admin'), async (req, res) => {
+  const orderCol = db.collection<Order>('orders');
+  const orders = await orderCol.find();
+  orders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  res.json({ orders });
+});
+
+// CTV order management — only orders for products this CTV actually owns
+// (ctvOwnsProduct, defined further down but hoisted — this route only runs
+// at request time, well after the whole module has finished loading). No
+// "show something anyway" fallback like the chart-stats endpoint has: a
+// CTV who owns nothing sees an empty list here, never another CTV's orders.
+app.get('/api/ctv/orders', requireRole('admin', 'ctv'), async (req, res) => {
+  const prodCol = db.collection<Product>('products');
+  const orderCol = db.collection<Order>('orders');
+
+  const ctvUser = (await getSessionUser(req))!;
+  const allProducts = await prodCol.find();
+  const myProductIds = new Set(allProducts.filter((p) => ctvOwnsProduct(ctvUser, p)).map((p) => p.id));
+
+  const allOrders = await orderCol.find();
+  const myOrders = allOrders
+    .filter((o) => myProductIds.has(o.productId))
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+  res.json({ orders: myOrders });
+});
+
+// Refund — credits the order's totalPrice straight back to the buyer's
+// wallet balance and marks the order refunded. Never touches inventory:
+// the accounts were already handed over (and the buyer has already seen
+// the credentials), so a refund here means "money back", not "un-sell the
+// stock" — that would let a buyer who already grabbed working credentials
+// get both the accounts and their money back. Admin can refund any order;
+// a CTV can only refund an order for one of their own products.
+app.post('/api/orders/:orderCode/refund', requireRole('admin', 'ctv'), async (req, res) => {
+  const orderCol = db.collection<Order>('orders');
+  const userCol = db.collection<User>('users');
+  const prodCol = db.collection<Product>('products');
+
+  const order = await orderCol.findOne({ orderCode: req.params.orderCode });
+  if (!order) return res.status(404).json({ error: 'Không tìm thấy đơn hàng' });
+  if (order.status === 'refunded') return res.status(400).json({ error: 'Đơn hàng này đã được hoàn tiền trước đó' });
+
+  const actor = (await getSessionUser(req))!;
+  if (actor.role === 'ctv') {
+    const product = await prodCol.findOne({ id: order.productId });
+    if (!product || !ctvOwnsProduct(actor, product)) {
+      return res.status(403).json({ error: 'Bạn không có quyền hoàn tiền đơn hàng này' });
+    }
+  }
+
+  await userCol.updateOne({ id: order.userId }, { $inc: { balance: order.totalPrice } });
+  const refundedAt = new Date().toISOString();
+  await orderCol.updateOne({ orderCode: order.orderCode }, { $set: { status: 'refunded', refundedAt } });
+
+  const updated = await orderCol.findOne({ orderCode: order.orderCode });
+  res.json({ success: true, order: updated });
 });
 
 // 8. Deposit Wallets for current user
@@ -2180,12 +2316,17 @@ app.get('/api/admin/stats', requireRole('admin'), async (req, res) => {
 
   const usersCount = await userCol.countDocuments();
   const allOrders = await orderCol.find();
-  const totalRevenue = allOrders.reduce((sum, o) => sum + o.totalPrice, 0);
+  // Refunded orders never count toward revenue — the money was given back,
+  // so it was never actually kept as revenue in the first place.
+  const totalRevenue = allOrders.filter((o) => o.status !== 'refunded').reduce((sum, o) => sum + o.totalPrice, 0);
   const totalStock = await invCol.countDocuments({ isSold: false });
   // Sourced from the orders collection (permanent) rather than counting
   // isSold:true inventory rows — sold warehouse rows past their retention
   // window get pruned (see cleanupOldSoldInventory), which would otherwise
   // make this lifetime "accounts sold" figure silently shrink over time.
+  // Unlike revenue, this intentionally still counts refunded orders'
+  // quantity — the accounts were genuinely handed over regardless of the
+  // later refund, so it stays a fulfillment count, not a revenue figure.
   const totalSold = allOrders.reduce((sum, o) => sum + o.quantity, 0);
 
   const cfg = await configCol.findOne({ key: 'platform' });
@@ -2224,11 +2365,15 @@ app.get('/api/admin/online-count', requireRole('admin'), (req, res) => {
 app.get('/api/admin/stats/charts', requireRole('admin'), async (req, res) => {
   const orderCol = db.collection<Order>('orders');
   const allOrders = await orderCol.find();
+  // Same reasoning as totalRevenue above — a refunded order was never
+  // actually kept as revenue, so it shouldn't show up in the revenue chart
+  // or count toward a product's "top seller" ranking either.
+  const revenueOrders = allOrders.filter((o) => o.status !== 'refunded');
   const period = String(req.query.period || 'week');
 
   res.json({
-    daily: buildChartSeries(allOrders, period),
-    topProducts: buildTopProducts(allOrders, 5),
+    daily: buildChartSeries(revenueOrders, period),
+    topProducts: buildTopProducts(revenueOrders, 5),
     period,
   });
 });
@@ -2272,8 +2417,13 @@ app.get('/api/ctv/stats', requireRole('admin', 'ctv'), async (req, res) => {
 
   const allOrders = await orderCol.find();
   const ctvOrders = allOrders.filter((o) => myProductIds.has(o.productId));
+  // Refunded orders are excluded from revenue specifically — this directly
+  // feeds netProfit/withdrawableBalance below, so counting a refunded
+  // order here would let a CTV withdraw money for a sale that was already
+  // given back to the buyer.
+  const revenueOrders = ctvOrders.filter((o) => o.status !== 'refunded');
 
-  const grossRevenue = Number(ctvOrders.reduce((sum, o) => sum + o.totalPrice, 0).toFixed(3));
+  const grossRevenue = Number(revenueOrders.reduce((sum, o) => sum + o.totalPrice, 0).toFixed(3));
 
   const cfg = await configCol.findOne({ key: 'platform' });
   const feePercent = cfg ? cfg.platformFeePercent : 5.0;
@@ -2337,11 +2487,14 @@ app.get('/api/ctv/stats/charts', requireRole('admin', 'ctv'), async (req, res) =
 
   const allOrders = await orderCol.find();
   const ctvOrders = allOrders.filter((o) => myProductIds.has(o.productId));
+  // Same reasoning as /api/ctv/stats — a refunded order was never actually
+  // kept as revenue, so it's excluded from the revenue chart/ranking too.
+  const revenueOrders = ctvOrders.filter((o) => o.status !== 'refunded');
 
   const period = String(req.query.period || 'week');
   res.json({
-    daily: buildChartSeries(ctvOrders, period),
-    topProducts: buildTopProducts(ctvOrders, 5),
+    daily: buildChartSeries(revenueOrders, period),
+    topProducts: buildTopProducts(revenueOrders, 5),
     period,
   });
 });
@@ -2809,12 +2962,8 @@ function getProxy() {
 app.post("/api/get_messages_oauth2", async (req, res) => {
   try {
     const { email, refresh_token, client_id, list_mail = "all" } = req.body;
-    const now = new Date();
-    const timeNow = new Date(now.getTime() + 7 * 60 * 60 * 1000).toISOString().replace("T", " ").substring(0, 19);
-    console.log(`[${timeNow}] 📬 Thao tác đọc mail -> Email: ${email || "Không rõ"}`);
 
     if (!email || !refresh_token || !client_id) {
-      console.log(`[${timeNow}] ⚠️ Thiếu thông tin bắt buộc cho email: ${email}`);
       return res.status(400).json({
         status: false,
         error: "Thiếu thông tin bắt buộc (email, refresh_token, client_id)"
@@ -2837,7 +2986,6 @@ app.post("/api/get_messages_oauth2", async (req, res) => {
 
     if (!response.ok) {
       const errorText = await response.text();
-      console.log(`[${timeNow}] ❌ Lỗi đọc mail [${email}]: HTTP ${response.status}`);
       return res.status(response.status).json({
         status: false,
         error: `API trả về lỗi Http ${response.status}: ${errorText}`
@@ -2846,18 +2994,14 @@ app.post("/api/get_messages_oauth2", async (req, res) => {
 
     const data = await response.json();
     if (data && data.content === "IMAP connection failed.") {
-      console.log(`[${timeNow}] ❌ Email | Refresh_Token Die [${email}]`);
       return res.json({
         status: false,
         error: `Email | Refresh_Token -> Die`
       });
     }
-    const msgCount = data && Array.isArray(data.messages) ? data.messages.length : 0;
-    console.log(`[${timeNow}] ✅ Thành công đọc mail [${email}] -> Tìm thấy ${msgCount} thư`);
     return res.json(data);
   } catch (error: any) {
-    const timestamp = new Date().toISOString().replace("T", " ").substring(0, 19);
-    console.error(`[${timestamp}] ❌ API proxy error:`, error);
+    console.error('[get_messages_oauth2] proxy error:', error);
     return res.status(500).json({
       status: false,
       error: error.message || "Không thể kết nối"
@@ -2868,11 +3012,8 @@ app.post("/api/get_messages_oauth2", async (req, res) => {
 app.post("/api/renew_token", async (req, res) => {
   try {
     const { email, refresh_token, client_id, password } = req.body;
-    const timeNow = new Date().toLocaleString("sv-SE", { timeZone: "Asia/Ho_Chi_Minh" }).replace(" ", " ");
-    console.log(`[${timeNow}] 🔄 THAO TÁC RENEW TOKEN (MICROSOFT OAUTH2)`);
-    
+
     if (!refresh_token || !client_id) {
-      console.log(`⚠️ Lỗi: Thiếu thông tin bắt buộc (refresh_token hoặc client_id)`);
       return res.status(400).json({
         status: false,
         error: "Thiếu thông tin bắt buộc (refresh_token, client_id)"
@@ -2921,17 +3062,14 @@ app.post("/api/renew_token", async (req, res) => {
           const errorText = await response.text();
           lastStatus = response.status;
           lastError = `Microsoft OAuth2 HTTP ${response.status}: ${errorText}`;
-          console.log(`⚠️ Lần ${attempt}/${maxRetries} không thành công - HTTP ${response.status}`);
         } else {
           const r = await response.json();
           successResult = r;
-          console.log(`✅ Lần ${attempt}/${maxRetries} thành công!`);
           break;
         }
       } catch (err: any) {
         lastStatus = 500;
         lastError = err.message || "Lỗi kết nối / proxy";
-        console.log(`⚠️ Lần ${attempt}/${maxRetries} bị lỗi kết nối: ${lastError}`);
       }
 
       if (attempt < maxRetries) {
@@ -2958,7 +3096,6 @@ app.post("/api/renew_token", async (req, res) => {
     const token = successResult.access_token;
     const expiresIn = successResult.expires_in;
     const new_refresh_token = successResult.refresh_token || refresh_token;
-    console.log(`✅ Thành công Renew Token cho [${email}]`);
 
     return res.json({
       status: true,

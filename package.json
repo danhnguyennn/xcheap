@@ -16,7 +16,9 @@
     "dotenv": "^17.2.3",
     "ethers": "^6.17.0",
     "express": "^4.21.2",
+    "express-rate-limit": "^8.7.0",
     "express-session": "^1.19.0",
+    "helmet": "^8.3.0",
     "mongodb": "^6.21.0"
   },
   "devDependencies": {
@@ -32,7 +34,6 @@
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.25.0",
     "lucide-react": "^0.546.0",
-    "motion": "^12.23.24",
     "otpauth": "^9.5.2",
     "qrcode": "^1.5.4",
     "react": "^19.0.1",

@@ -146,6 +146,9 @@ export interface Order {
   accounts: string[];
   createdAt: string;
   status: 'completed' | 'refunded';
+  // Set only when an admin refunds this order (see POST
+  // /api/admin/orders/:orderCode/refund) — absent on every normal order.
+  refundedAt?: string;
 }
 
 // A "đặt trước" (pre-order) placed against a variant that's currently out of

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense, lazy } from 'react';
 import { User, Product, Language, Category, CryptoOption } from './types';
 import { Header } from './components/Header';
 import { Banner } from './components/Banner';
@@ -14,18 +14,34 @@ import { ProductDetail } from './components/ProductDetail';
 import { DepositModal } from './components/DepositModal';
 import { Footer } from './components/Footer';
 import { ToastContainer } from './components/Toast';
-import { AdminPage } from './pages/AdminPage';
-import { CtvPage } from './pages/CtvPage';
-import { LoginPage } from './pages/LoginPage';
-import { RegisterPage } from './pages/RegisterPage';
-import { AccountPage } from './pages/AccountPage';
-import { ApiDocsPage } from './pages/ApiDocsPage';
-import { OrdersPage } from './pages/OrdersPage';
-import { TermsPage } from './pages/TermsPage';
-import { PrivacyPage } from './pages/PrivacyPage';
-import { ToolsPage } from './pages/ToolsPage';
-import { ShieldAlert } from 'lucide-react';
 import { translations } from './locales/translations';
+
+// Everything below is only ever needed once the visitor actually navigates
+// there — lazy-loaded so the initial bundle only has to ship the storefront
+// (Home/ProductDetail/Deposit, imported above), not the full Admin/CTV
+// panels, Tools, docs and legal pages too. Each still lands in its own
+// chunk split off the ~840kB single bundle this used to all be.
+const AdminPage = lazy(() => import('./pages/AdminPage').then((m) => ({ default: m.AdminPage })));
+const CtvPage = lazy(() => import('./pages/CtvPage').then((m) => ({ default: m.CtvPage })));
+const LoginPage = lazy(() => import('./pages/LoginPage').then((m) => ({ default: m.LoginPage })));
+const RegisterPage = lazy(() => import('./pages/RegisterPage').then((m) => ({ default: m.RegisterPage })));
+const AccountPage = lazy(() => import('./pages/AccountPage').then((m) => ({ default: m.AccountPage })));
+const ApiDocsPage = lazy(() => import('./pages/ApiDocsPage').then((m) => ({ default: m.ApiDocsPage })));
+const OrdersPage = lazy(() => import('./pages/OrdersPage').then((m) => ({ default: m.OrdersPage })));
+const TermsPage = lazy(() => import('./pages/TermsPage').then((m) => ({ default: m.TermsPage })));
+const PrivacyPage = lazy(() => import('./pages/PrivacyPage').then((m) => ({ default: m.PrivacyPage })));
+const ToolsPage = lazy(() => import('./pages/ToolsPage').then((m) => ({ default: m.ToolsPage })));
+
+// Shown only for the brief moment a lazy page chunk is downloading — every
+// one of these pages already renders its own full loading state once
+// mounted, so this just needs to fill the screen without a blank flash.
+function PageLoading() {
+  return (
+    <div className="min-h-[60vh] flex items-center justify-center">
+      <div className="w-8 h-8 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" />
+    </div>
+  );
+}
 
 type Page = 'home' | 'product-detail' | 'admin' | 'ctv' | 'login' | 'register' | 'account' | 'api-docs' | 'orders' | 'terms' | 'privacy' | 'tools';
 
@@ -47,27 +63,17 @@ function buildUrl(page: Page, opts?: { productId?: string; category?: string }):
   return '/';
 }
 
-// Shown in place of a protected page when the logged-in account's role
+// Rendered in place of a protected page when the logged-in account's role
 // isn't allowed to see it — access is decided by who you're actually
-// logged in as, not a button anyone could click.
-function AccessDenied({ language, onBackToStore }: { language: Language; onBackToStore: () => void }) {
-  const t = translations[language];
-  return (
-    <div className="min-h-[60vh] flex flex-col items-center justify-center gap-3 px-4 text-center">
-      <div className="w-14 h-14 rounded-full bg-red-500/15 border border-red-500/40 flex items-center justify-center">
-        <ShieldAlert className="w-7 h-7 text-red-600 dark:text-red-400" />
-      </div>
-      <h2 className="text-slate-900 dark:text-slate-100 font-bold text-base">
-        {t.accessDeniedMessage}
-      </h2>
-      <button
-        onClick={onBackToStore}
-        className="mt-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs px-4 py-2 rounded-lg transition"
-      >
-        {t.authBackToStore}
-      </button>
-    </div>
-  );
+// logged in as, not a button anyone could click. Immediately bounces back
+// to the storefront rather than showing an "access denied" page, same
+// treatment as an unrecognized URL (see applyLocationFromUrl's fallback).
+function RedirectHome({ onRedirect }: { onRedirect: () => void }) {
+  useEffect(() => {
+    onRedirect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  return null;
 }
 
 export default function App() {
@@ -352,6 +358,7 @@ export default function App() {
 
       {/* Main View Router */}
       <main className="flex-1">
+        <Suspense fallback={<PageLoading />}>
         {currentPage === 'login' ? (
           <LoginPage
             language={language}
@@ -370,7 +377,7 @@ export default function App() {
           !authChecked ? null : !user ? (
             <LoginPage language={language} onLoginSuccess={fetchUser} onGoToRegister={() => navigate('register')} onBackToStore={() => navigate('home')} />
           ) : user.role !== 'admin' ? (
-            <AccessDenied language={language} onBackToStore={() => navigate('home')} />
+            <RedirectHome onRedirect={() => navigate('home')} />
           ) : (
             <AdminPage
               user={user}
@@ -397,7 +404,7 @@ export default function App() {
           !authChecked ? null : !user ? (
             <LoginPage language={language} onLoginSuccess={fetchUser} onGoToRegister={() => navigate('register')} onBackToStore={() => navigate('home')} />
           ) : user.role !== 'ctv' && user.role !== 'admin' ? (
-            <AccessDenied language={language} onBackToStore={() => navigate('home')} />
+            <RedirectHome onRedirect={() => navigate('home')} />
           ) : (
             <CtvPage
               user={user}
@@ -429,7 +436,6 @@ export default function App() {
             <OrdersPage
               language={language}
               onBackToStore={() => navigate('home')}
-              isAdmin={user.role === 'admin'}
               onSelectProduct={(p) => navigate('product-detail', { product: p })}
             />
           )
@@ -486,6 +492,7 @@ export default function App() {
             />
           </>
         )}
+        </Suspense>
       </main>
 
       {/* Footer matching Image 2 */}

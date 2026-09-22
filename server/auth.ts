@@ -47,10 +47,18 @@ export function sessionMiddleware() {
     secret,
     resave: false,
     saveUninitialized: false,
+    // Rolling: every authenticated request pushes maxAge back out, so an
+    // account in active use never gets logged out mid-session — only
+    // genuinely idle sessions expire.
+    rolling: true,
     cookie: {
       httpOnly: true,
-      maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
+      maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days of inactivity
       sameSite: 'lax',
+      // Only sent over HTTPS in production. Forcing this in dev would
+      // silently stop the cookie from ever being set (or sent back) on
+      // plain http://localhost, breaking every logged-in request.
+      secure: process.env.NODE_ENV === 'production',
     },
   });
 }

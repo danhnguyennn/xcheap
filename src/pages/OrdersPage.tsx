@@ -4,12 +4,11 @@ import { translations } from '../locales/translations';
 import { formatMoney } from '../utils/pricing';
 import { DeliveredAccounts } from '../components/DeliveredAccounts';
 import { showCopyToast } from '../components/Toast';
-import { ArrowLeft, ShoppingBag, Copy, Download, Check, Calendar, ChevronDown, ChevronUp, Search, ChevronLeft, ChevronRight, History, Star } from 'lucide-react';
+import { ArrowLeft, ShoppingBag, Copy, Download, Check, Calendar, ChevronDown, ChevronUp, Search, ChevronLeft, ChevronRight, Star } from 'lucide-react';
 
 interface OrdersPageProps {
   language: Language;
   onBackToStore: () => void;
-  isAdmin: boolean;
   onSelectProduct: (product: Product) => void;
 }
 
@@ -20,18 +19,13 @@ const PAGE_SIZE = 10;
 // cao (max-h-[90vh]) nên với danh sách đơn hàng dài, user vừa phải cuộn bên
 // trong khung nhỏ vừa dễ bấm nhầm ra ngoài làm đóng popup. Ở dạng trang, có
 // đủ không gian để thêm ô tìm kiếm, phân trang và thao tác thoải mái hơn.
-export const OrdersPage: React.FC<OrdersPageProps> = ({ language, onBackToStore, isAdmin, onSelectProduct }) => {
+export const OrdersPage: React.FC<OrdersPageProps> = ({ language, onBackToStore, onSelectProduct }) => {
   const t = translations[language];
   const [orders, setOrders] = useState<Order[]>([]);
   const [loading, setLoading] = useState(true);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [page, setPage] = useState(1);
-  // Phía user chỉ được xem đơn hàng trong 7 ngày gần nhất — không có lựa
-  // chọn "xem toàn bộ" (server cũng chặn cứng, xem GET /api/orders). Chỉ
-  // admin mới có toggle này vì admin cần nhìn được toàn bộ hoạt động hệ
-  // thống, không riêng gì lịch sử cá nhân.
-  const [showAllTime, setShowAllTime] = useState(false);
   // Thu gọn mặc định — danh sách đơn hàng dài mà bung hết tài khoản ra cùng
   // lúc sẽ thành một bức tường thông tin nhạy cảm, khó dò theo ngày/sản phẩm.
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
@@ -78,19 +72,18 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ language, onBackToStore,
 
   useEffect(() => {
     setLoading(true);
-    const url = isAdmin && showAllTime ? '/api/orders' : `/api/orders?withinDays=${RECENT_WINDOW_DAYS}`;
-    fetch(url)
+    fetch(`/api/orders?withinDays=${RECENT_WINDOW_DAYS}`)
       .then((res) => res.json())
       .then((data) => setOrders(data.orders || []))
       .catch((err) => console.error(err))
       .finally(() => setLoading(false));
-  }, [showAllTime, isAdmin]);
+  }, []);
 
-  // Đổi khoảng thời gian hoặc tìm kiếm mới thì quay lại trang 1, tránh việc
-  // đang ở trang 3 rồi lọc còn 1 trang khiến danh sách trông như trống rỗng.
+  // Tìm kiếm mới thì quay lại trang 1, tránh việc đang ở trang 3 rồi lọc còn
+  // 1 trang khiến danh sách trông như trống rỗng.
   useEffect(() => {
     setPage(1);
-  }, [showAllTime, searchQuery]);
+  }, [searchQuery]);
 
   const handleCopy = (order: Order) => {
     navigator.clipboard.writeText(order.accounts.join('\n'));
@@ -141,7 +134,7 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ language, onBackToStore,
           </div>
         </div>
 
-        {(orders.length > 0 || showAllTime) && (
+        {orders.length > 0 && (
           <div className="relative w-full sm:w-64">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-500 dark:text-slate-500" />
             <input
@@ -177,42 +170,19 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ language, onBackToStore,
         </div>
       )}
 
-      {/* Admin: chuyển giữa "7 ngày gần nhất" và toàn bộ lịch sử hệ thống.
-          User thường: luôn cố định 7 ngày, không có lựa chọn xem thêm — cả
-          UI lẫn server đều khóa cứng ở mức này. */}
+      {/* Luôn cố định 7 ngày gần nhất, không riêng gì role nào — quản lý
+          toàn bộ đơn hàng hệ thống giờ có trang riêng cho Admin/CTV. */}
       <div className="flex items-center justify-between gap-2 mb-4 text-[11px] text-slate-600 dark:text-slate-400">
-        <span>{isAdmin && showAllTime ? t.ordersShowingAllTime : t.ordersShowingRecentTemplate.replace('{n}', String(RECENT_WINDOW_DAYS))}</span>
-        {isAdmin && (
-          <button
-            onClick={() => setShowAllTime((s) => !s)}
-            className="flex items-center gap-1 text-emerald-600 dark:text-emerald-400 hover:text-emerald-700 hover:dark:text-emerald-300 font-semibold"
-          >
-            <History className="w-3 h-3" />
-            <span>{showAllTime ? t.ordersShowRecentOnly : t.ordersShowAllTime}</span>
-          </button>
-        )}
+        <span>{t.ordersShowingRecentTemplate.replace('{n}', String(RECENT_WINDOW_DAYS))}</span>
       </div>
 
       <div className="space-y-3.5 text-xs">
         {loading ? (
           <div className="text-center py-10 text-slate-600 dark:text-slate-400">{t.ordersLoading}</div>
-        ) : orders.length === 0 && isAdmin && showAllTime ? (
-          <div className="text-center py-14 bg-[#f2f4f3] dark:bg-[#1a1b1f] rounded-xl border border-[#e2e6e5] dark:border-[#30333b] text-slate-600 dark:text-slate-400">
-            <ShoppingBag className="w-9 h-9 mx-auto mb-2 text-emerald-500/40" />
-            <p>{t.noOrders}</p>
-          </div>
         ) : orders.length === 0 ? (
           <div className="text-center py-14 bg-[#f2f4f3] dark:bg-[#1a1b1f] rounded-xl border border-[#e2e6e5] dark:border-[#30333b] text-slate-600 dark:text-slate-400">
             <ShoppingBag className="w-9 h-9 mx-auto mb-2 text-emerald-500/40" />
             <p>{t.ordersNoneInWindowTemplate.replace('{n}', String(RECENT_WINDOW_DAYS))}</p>
-            {isAdmin && (
-              <button
-                onClick={() => setShowAllTime(true)}
-                className="mt-3 text-emerald-600 dark:text-emerald-400 hover:text-emerald-700 hover:dark:text-emerald-300 font-semibold text-xs"
-              >
-                {t.ordersShowAllTime}
-              </button>
-            )}
           </div>
         ) : filteredOrders.length === 0 ? (
           <div className="text-center py-14 bg-[#f2f4f3] dark:bg-[#1a1b1f] rounded-xl border border-[#e2e6e5] dark:border-[#30333b] text-slate-600 dark:text-slate-400">
@@ -238,9 +208,15 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ language, onBackToStore,
                   <div className="min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="text-emerald-600 dark:text-emerald-400 font-bold font-mono text-sm">{order.orderCode}</span>
-                      <span className="bg-emerald-50 dark:bg-emerald-950/70 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold px-2 py-0.5 rounded border border-emerald-500/30">
-                        {t.ordersCompleted}
-                      </span>
+                      {order.status === 'refunded' ? (
+                        <span className="bg-red-50 dark:bg-red-950/70 text-red-700 dark:text-red-300 text-[10px] font-bold px-2 py-0.5 rounded border border-red-500/30">
+                          {t.ordersRefunded}
+                        </span>
+                      ) : (
+                        <span className="bg-emerald-50 dark:bg-emerald-950/70 text-emerald-700 dark:text-emerald-300 text-[10px] font-bold px-2 py-0.5 rounded border border-emerald-500/30">
+                          {t.ordersCompleted}
+                        </span>
+                      )}
                     </div>
                     <div className="text-slate-600 dark:text-slate-400 text-[11px] font-medium mt-0.5 truncate">
                       {order.productName} - {order.variantName}

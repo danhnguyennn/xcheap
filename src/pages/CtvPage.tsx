@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Product, User, Language, CtvStats, WithdrawalRequest, Voucher, Review } from '../types';
+import { Product, User, Language, CtvStats, WithdrawalRequest, Voucher, Review, Order } from '../types';
 import { translations } from '../locales/translations';
 import { formatMoney } from '../utils/pricing';
 import { SimpleBarChart, BarChartDatum } from '../components/charts/SimpleBarChart';
@@ -31,6 +31,7 @@ import {
   Eye,
   EyeOff,
   Boxes,
+  Search,
 } from 'lucide-react';
 
 // Must match the server's minimum withdrawal amount (server.ts /api/ctv/withdraw)
@@ -58,7 +59,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
   onSelectProduct,
 }) => {
   const t = translations[language];
-  const [activeTab, setActiveTab] = useState<'overview' | 'upload' | 'withdraw' | 'my-products' | 'vouchers' | 'reviews'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'upload' | 'withdraw' | 'my-products' | 'orders' | 'vouchers' | 'reviews'>('overview');
 
   // Stats & Fee config
   const [stats, setStats] = useState<CtvStats | null>(null);
@@ -74,6 +75,18 @@ export const CtvPage: React.FC<CtvPageProps> = ({
   const [vouchers, setVouchers] = useState<Voucher[]>([]);
   const [myProductReviews, setMyProductReviews] = useState<(Review & { productName: string })[]>([]);
   const [reviewEditableMaxRating, setReviewEditableMaxRating] = useState(3);
+
+  // Order management — scoped to this CTV's own products (see loadMyOrders)
+  const ORDERS_PER_PAGE = 15;
+  const [myOrders, setMyOrders] = useState<Order[]>([]);
+  const [orderSearch, setOrderSearch] = useState('');
+  const [orderStatusFilter, setOrderStatusFilter] = useState<'all' | 'completed' | 'refunded'>('all');
+  const [ordersPage, setOrdersPage] = useState(1);
+  const [refundingOrderCode, setRefundingOrderCode] = useState<string | null>(null);
+
+  useEffect(() => {
+    setOrdersPage(1);
+  }, [orderSearch, orderStatusFilter]);
 
   // Edit description/account-format on an existing product — previously
   // these were only ever set once at creation with no way to fix or add
@@ -119,6 +132,30 @@ export const CtvPage: React.FC<CtvPageProps> = ({
   const showToast = (type: 'success' | 'error', message: string) => {
     setNotification({ type, message });
     setTimeout(() => setNotification(null), 4000);
+  };
+
+  // Refunds an order's totalPrice straight back into the buyer's wallet.
+  // Server re-checks ownership itself (a CTV can only refund an order for
+  // one of their own products) — this isn't just a client-side gate.
+  const handleRefundOrder = async (order: Order) => {
+    if (!window.confirm(`Hoàn ${formatMoney(order.totalPrice)}$ vào ví "${order.username}" cho đơn #${order.orderCode}?\n\nHành động này không thể hoàn tác.`)) {
+      return;
+    }
+    setRefundingOrderCode(order.orderCode);
+    try {
+      const res = await fetch(`/api/orders/${order.orderCode}/refund`, { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        showToast('success', `Đã hoàn $${formatMoney(order.totalPrice)} cho đơn #${order.orderCode}`);
+        loadMyOrders();
+      } else {
+        showToast('error', data.error || 'Lỗi hoàn tiền đơn hàng');
+      }
+    } catch (e) {
+      showToast('error', 'Lỗi hoàn tiền đơn hàng');
+    } finally {
+      setRefundingOrderCode(null);
+    }
   };
 
   // Tách riêng khỏi loadCtvData để đổi khoảng thời gian (Tuần/Tháng/Toàn
@@ -173,6 +210,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
     loadCtvData();
     loadVouchers();
     loadMyReviews();
+    loadMyOrders();
   }, []);
 
   const loadVouchers = async () => {
@@ -200,6 +238,21 @@ export const CtvPage: React.FC<CtvPageProps> = ({
       }
     } catch (err) {
       console.error('Failed to load reviews', err);
+    }
+  };
+
+  // Orders for this CTV's own products only — server scopes
+  // GET /api/ctv/orders the same way as /api/ctv/stats/charts (real
+  // ownership, no "show something anyway" fallback for a CTV with nothing).
+  const loadMyOrders = async () => {
+    try {
+      const res = await fetch('/api/ctv/orders');
+      if (res.ok) {
+        const data = await res.json();
+        setMyOrders(data.orders || []);
+      }
+    } catch (err) {
+      console.error('Failed to load orders', err);
     }
   };
 
@@ -603,14 +656,14 @@ export const CtvPage: React.FC<CtvPageProps> = ({
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setActiveTab('upload')}
-                className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs px-4 py-2.5 rounded-xl transition shadow-[0_0_15px_rgba(245,158,11,0.3)] flex items-center gap-1.5"
+                className="flex items-center gap-1.5 bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-[#dde1e0] hover:dark:bg-[#373b44] text-amber-600 dark:text-amber-400 text-xs font-semibold px-3 py-1.5 rounded-lg border border-amber-500/30 transition"
               >
                 <PackagePlus className="w-4 h-4" />
                 <span>Đăng Hàng Lên Bán</span>
               </button>
               <button
                 onClick={() => setActiveTab('withdraw')}
-                className="bg-emerald-600 hover:bg-emerald-500 text-slate-900 dark:text-slate-100 font-bold text-xs px-4 py-2.5 rounded-xl transition shadow-[0_0_15px_rgba(16,185,129,0.3)] flex items-center gap-1.5"
+                className="flex items-center gap-1.5 bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-[#dde1e0] hover:dark:bg-[#373b44] text-emerald-600 dark:text-emerald-400 text-xs font-semibold px-3 py-1.5 rounded-lg border border-emerald-500/30 transition"
               >
                 <DollarSign className="w-4 h-4" />
                 <span>Rút Tiền</span>
@@ -619,78 +672,99 @@ export const CtvPage: React.FC<CtvPageProps> = ({
           </div>
         </div>
 
-        {/* Tab Navigation */}
-        <div className="flex border-b border-[#e0e4e2] dark:border-[#33363e] overflow-x-auto gap-1 pb-px">
+        {/* Tab Navigation — compact grid, icon on top, matching AdminPage's
+            tab bar exactly (same layout mechanics, amber instead of purple
+            for the active state to keep the CTV portal's accent color). */}
+        <div className="grid grid-cols-4 sm:grid-cols-4 lg:grid-cols-7 gap-1.5 border-b border-[#e0e4e2] dark:border-[#33363e] pb-3 mb-6">
           <button
             onClick={() => setActiveTab('overview')}
-            className={`px-4 py-2.5 text-xs font-bold whitespace-nowrap rounded-t-lg transition flex items-center gap-2 ${
+            title="Thống Kê Doanh Thu & Lợi Nhuận"
+            className={`px-2 py-2 text-[11px] font-bold rounded-lg transition flex flex-col items-center gap-1 text-center ${
               activeTab === 'overview'
-                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 border-b-2 border-amber-500'
+                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 ring-1 ring-amber-500'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200 hover:bg-[#ecefee] hover:dark:bg-[#222429]'
             }`}
           >
             <TrendingUp className="w-4 h-4" />
-            <span>Thống Kê Doanh Thu & Lợi Nhuận</span>
+            <span className="truncate w-full">Thống Kê</span>
           </button>
 
           <button
             onClick={() => setActiveTab('upload')}
-            className={`px-4 py-2.5 text-xs font-bold whitespace-nowrap rounded-t-lg transition flex items-center gap-2 ${
+            title="Đăng Sản Phẩm & Nạp Kho Hàng"
+            className={`px-2 py-2 text-[11px] font-bold rounded-lg transition flex flex-col items-center gap-1 text-center ${
               activeTab === 'upload'
-                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 border-b-2 border-amber-500'
+                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 ring-1 ring-amber-500'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200 hover:bg-[#ecefee] hover:dark:bg-[#222429]'
             }`}
           >
             <PackagePlus className="w-4 h-4" />
-            <span>Đăng Sản Phẩm & Nạp Kho Hàng</span>
+            <span className="truncate w-full">Đăng Bán</span>
           </button>
 
           <button
             onClick={() => setActiveTab('withdraw')}
-            className={`px-4 py-2.5 text-xs font-bold whitespace-nowrap rounded-t-lg transition flex items-center gap-2 ${
+            title="Rút Tiền & Lịch Sử Rút"
+            className={`px-2 py-2 text-[11px] font-bold rounded-lg transition flex flex-col items-center gap-1 text-center ${
               activeTab === 'withdraw'
-                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 border-b-2 border-amber-500'
+                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 ring-1 ring-amber-500'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200 hover:bg-[#ecefee] hover:dark:bg-[#222429]'
             }`}
           >
             <DollarSign className="w-4 h-4" />
-            <span>Rút Tiền & Lịch Sử Rút</span>
+            <span className="truncate w-full">Rút Tiền</span>
           </button>
 
           <button
             onClick={() => setActiveTab('my-products')}
-            className={`px-4 py-2.5 text-xs font-bold whitespace-nowrap rounded-t-lg transition flex items-center gap-2 ${
+            title="Gian Hàng Của Tôi"
+            className={`px-2 py-2 text-[11px] font-bold rounded-lg transition flex flex-col items-center gap-1 text-center ${
               activeTab === 'my-products'
-                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 border-b-2 border-amber-500'
+                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 ring-1 ring-amber-500'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200 hover:bg-[#ecefee] hover:dark:bg-[#222429]'
             }`}
           >
             <ShoppingBag className="w-4 h-4" />
-            <span>Gian Hàng Của Tôi ({myProducts.length})</span>
+            <span className="truncate w-full">Gian Hàng ({myProducts.length})</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('orders')}
+            title="Đơn Hàng"
+            className={`px-2 py-2 text-[11px] font-bold rounded-lg transition flex flex-col items-center gap-1 text-center ${
+              activeTab === 'orders'
+                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 ring-1 ring-amber-500'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200 hover:bg-[#ecefee] hover:dark:bg-[#222429]'
+            }`}
+          >
+            <FileText className="w-4 h-4" />
+            <span className="truncate w-full">Đơn Hàng ({myOrders.length})</span>
           </button>
 
           <button
             onClick={() => setActiveTab('vouchers')}
-            className={`px-4 py-2.5 text-xs font-bold whitespace-nowrap rounded-t-lg transition flex items-center gap-2 ${
+            title="Mã Giảm Giá"
+            className={`px-2 py-2 text-[11px] font-bold rounded-lg transition flex flex-col items-center gap-1 text-center ${
               activeTab === 'vouchers'
-                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 border-b-2 border-amber-500'
+                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 ring-1 ring-amber-500'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200 hover:bg-[#ecefee] hover:dark:bg-[#222429]'
             }`}
           >
             <Ticket className="w-4 h-4" />
-            <span>Mã Giảm Giá ({vouchers.length})</span>
+            <span className="truncate w-full">Mã Giảm Giá ({vouchers.length})</span>
           </button>
 
           <button
             onClick={() => setActiveTab('reviews')}
-            className={`px-4 py-2.5 text-xs font-bold whitespace-nowrap rounded-t-lg transition flex items-center gap-2 ${
+            title="Đánh Giá"
+            className={`px-2 py-2 text-[11px] font-bold rounded-lg transition flex flex-col items-center gap-1 text-center ${
               activeTab === 'reviews'
-                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 border-b-2 border-amber-500'
+                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 ring-1 ring-amber-500'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200 hover:bg-[#ecefee] hover:dark:bg-[#222429]'
             }`}
           >
             <Star className="w-4 h-4" />
-            <span>Đánh Giá ({myProductReviews.length})</span>
+            <span className="truncate w-full">Đánh Giá ({myProductReviews.length})</span>
           </button>
         </div>
 
@@ -1424,6 +1498,150 @@ export const CtvPage: React.FC<CtvPageProps> = ({
                 </tbody>
               </table>
             </div>
+          </div>
+        )}
+
+        {/* TAB: ORDER MANAGEMENT — scoped to this CTV's own products */}
+        {activeTab === 'orders' && (
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">Đơn Hàng Của Tôi</h3>
+                <p className="text-xs text-slate-600 dark:text-slate-400">Đơn hàng thuộc các sản phẩm bạn đăng bán — tìm theo mã đơn/khách/sản phẩm, hoàn tiền khi cần</p>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <select
+                  value={orderStatusFilter}
+                  onChange={(e) => setOrderStatusFilter(e.target.value as 'all' | 'completed' | 'refunded')}
+                  className="bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-2.5 py-1.5 text-xs text-slate-800 dark:text-slate-200"
+                >
+                  <option value="all">Tất cả trạng thái</option>
+                  <option value="completed">Hoàn thành</option>
+                  <option value="refunded">Đã hoàn tiền</option>
+                </select>
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-600 dark:text-slate-400" />
+                  <input
+                    type="text"
+                    value={orderSearch}
+                    onChange={(e) => setOrderSearch(e.target.value)}
+                    placeholder="Tìm mã đơn/khách/sản phẩm..."
+                    className="bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-amber-500"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {(() => {
+              const q = orderSearch.trim().toLowerCase();
+              const filteredOrders = myOrders.filter((o) => {
+                if (orderStatusFilter !== 'all' && o.status !== orderStatusFilter) return false;
+                if (!q) return true;
+                return (
+                  o.orderCode.toLowerCase().includes(q) ||
+                  o.username.toLowerCase().includes(q) ||
+                  o.productName.toLowerCase().includes(q)
+                );
+              });
+              const ordersTotalPages = Math.max(1, Math.ceil(filteredOrders.length / ORDERS_PER_PAGE));
+              const safeOrdersPage = Math.min(ordersPage, ordersTotalPages);
+              const pagedOrders = filteredOrders.slice((safeOrdersPage - 1) * ORDERS_PER_PAGE, safeOrdersPage * ORDERS_PER_PAGE);
+
+              return (
+                <>
+                  {myOrders.length === 0 ? (
+                    <div className="text-center text-xs text-slate-500 dark:text-slate-500 py-6 bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl">
+                      Chưa có đơn hàng nào cho sản phẩm của bạn.
+                    </div>
+                  ) : (
+                    <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
+                      <table className="w-full text-left text-xs">
+                        <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
+                          <tr>
+                            <th className="p-3">Mã đơn</th>
+                            <th className="p-3">Khách hàng</th>
+                            <th className="p-3">Sản phẩm</th>
+                            <th className="p-3">SL</th>
+                            <th className="p-3">Tổng tiền</th>
+                            <th className="p-3">Trạng thái</th>
+                            <th className="p-3">Thời gian</th>
+                            <th className="p-3 text-right">Hành động</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-[#e4e8e7]">
+                          {pagedOrders.map((o) => (
+                            <tr key={o.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34] transition">
+                              <td className="p-3 font-mono font-bold text-slate-900 dark:text-slate-100">#{o.orderCode.toUpperCase()}</td>
+                              <td className="p-3 text-slate-700 dark:text-slate-300">{o.username}</td>
+                              <td className="p-3 text-slate-700 dark:text-slate-300">
+                                <div>{o.productName}</div>
+                                <div className="text-[10px] text-slate-500 dark:text-slate-500">{o.variantName}</div>
+                              </td>
+                              <td className="p-3 text-slate-700 dark:text-slate-300">{o.quantity}</td>
+                              <td className="p-3 font-mono font-bold text-emerald-600 dark:text-emerald-400">${formatMoney(o.totalPrice)}</td>
+                              <td className="p-3">
+                                {o.status === 'refunded' ? (
+                                  <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/30">
+                                    Đã hoàn tiền
+                                  </span>
+                                ) : (
+                                  <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30">
+                                    Hoàn thành
+                                  </span>
+                                )}
+                              </td>
+                              <td className="p-3 font-mono text-[10px] text-slate-600 dark:text-slate-400">
+                                {new Date(o.createdAt).toLocaleString('vi-VN')}
+                              </td>
+                              <td className="p-3 text-right">
+                                {o.status === 'refunded' ? (
+                                  <span className="text-[10px] text-slate-500 dark:text-slate-500">
+                                    {o.refundedAt ? new Date(o.refundedAt).toLocaleDateString('vi-VN') : ''}
+                                  </span>
+                                ) : (
+                                  <button
+                                    onClick={() => handleRefundOrder(o)}
+                                    disabled={refundingOrderCode === o.orderCode}
+                                    className="bg-red-50 dark:bg-red-950/70 hover:bg-red-100 hover:dark:bg-red-900/70 text-red-700 dark:text-red-300 border border-red-500/30 px-2.5 py-1 rounded text-[10px] font-bold disabled:opacity-40 disabled:cursor-not-allowed transition"
+                                  >
+                                    {refundingOrderCode === o.orderCode ? 'Đang hoàn...' : 'Hoàn tiền'}
+                                  </button>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  {ordersTotalPages > 1 && (
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-600 dark:text-slate-400">
+                        Trang {safeOrdersPage}/{ordersTotalPages} ({filteredOrders.length} đơn hàng)
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => setOrdersPage((p) => Math.max(1, p - 1))}
+                          disabled={safeOrdersPage === 1}
+                          className="px-3 py-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e0e4e2] hover:dark:bg-[#2a2d34] border border-[#dde2e0] dark:border-[#373b43] rounded-lg font-semibold text-slate-700 dark:text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                        >
+                          ← Trước
+                        </button>
+                        <button
+                          onClick={() => setOrdersPage((p) => Math.min(ordersTotalPages, p + 1))}
+                          disabled={safeOrdersPage === ordersTotalPages}
+                          className="px-3 py-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e0e4e2] hover:dark:bg-[#2a2d34] border border-[#dde2e0] dark:border-[#373b43] rounded-lg font-semibold text-slate-700 dark:text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                        >
+                          Sau →
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </>
+              );
+            })()}
           </div>
         )}
 

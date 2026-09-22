@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Product, ProductVariant, User, Language, UserRole, CryptoNetwork, CryptoOption, Voucher, Review, ReviewSuggestion } from '../types';
+import { Product, ProductVariant, User, Language, UserRole, CryptoNetwork, CryptoOption, Voucher, Review, ReviewSuggestion, Order } from '../types';
 import { translations } from '../locales/translations';
 import { formatMoney } from '../utils/pricing';
 import { SimpleBarChart, BarChartDatum } from '../components/charts/SimpleBarChart';
@@ -58,7 +58,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   onOpenDeposit,
 }) => {
   const t = translations[language];
-  const [activeTab, setActiveTab] = useState<'overview' | 'categories' | 'products' | 'users' | 'inventory' | 'rpc' | 'ctv-fee' | 'vouchers' | 'reviews'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'categories' | 'products' | 'users' | 'inventory' | 'orders' | 'rpc' | 'ctv-fee' | 'vouchers' | 'reviews'>('overview');
   
   // Data states
   const [stats, setStats] = useState<any>(null);
@@ -167,6 +167,14 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [usersPage, setUsersPage] = useState(1);
   const INVENTORY_PRODUCTS_PER_PAGE = 8;
   const [inventoryPage, setInventoryPage] = useState(1);
+  const ORDERS_PER_PAGE = 15;
+  const [ordersPage, setOrdersPage] = useState(1);
+
+  // Order management
+  const [allOrders, setAllOrders] = useState<Order[]>([]);
+  const [orderSearch, setOrderSearch] = useState('');
+  const [orderStatusFilter, setOrderStatusFilter] = useState<'all' | 'completed' | 'refunded'>('all');
+  const [refundingOrderCode, setRefundingOrderCode] = useState<string | null>(null);
 
   // "Đang online" stat — polled independently of fetchAdminData (which only
   // runs on mount/after an action) so the number actually stays live while
@@ -189,6 +197,10 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   useEffect(() => {
     setUsersPage(1);
   }, [userSearch]);
+
+  useEffect(() => {
+    setOrdersPage(1);
+  }, [orderSearch, orderStatusFilter]);
 
   const showNotification = (successMsg: string | null, errorMsg: string | null = null) => {
     setActionSuccess(successMsg);
@@ -222,7 +234,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const fetchAdminData = async () => {
     setLoading(true);
     try {
-      const [statsRes, usersRes, catsRes, invRes, feeRes, withRes, voucherRes, reviewsRes, suggestionsRes, cryptoOptsRes] = await Promise.all([
+      const [statsRes, usersRes, catsRes, invRes, feeRes, withRes, voucherRes, reviewsRes, suggestionsRes, cryptoOptsRes, ordersRes] = await Promise.all([
         fetch('/api/admin/stats'),
         fetch('/api/admin/users'),
         fetch('/api/categories'),
@@ -233,6 +245,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         fetch('/api/admin/reviews'),
         fetch('/api/review-comment-suggestions'),
         fetch('/api/admin/crypto-options'),
+        fetch('/api/admin/orders'),
       ]);
       fetchChartData(chartPeriod);
 
@@ -283,6 +296,10 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       if (cryptoOptsRes.ok) {
         const cryptoOptsData = await cryptoOptsRes.json();
         setCryptoDepositOptions(cryptoOptsData.options || []);
+      }
+      if (ordersRes.ok) {
+        const ordersData = await ordersRes.json();
+        setAllOrders(ordersData.orders || []);
       }
     } catch (err) {
       console.error('Failed to load admin data', err);
@@ -874,6 +891,30 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     }
   };
 
+  // Refunds an order's totalPrice straight back into the buyer's wallet and
+  // marks it refunded — money-affecting and not reversible from this UI, so
+  // it's gated behind a plain confirm() rather than firing on one click.
+  const handleRefundOrder = async (order: Order) => {
+    if (!window.confirm(`Hoàn ${formatMoney(order.totalPrice)}$ vào ví "${order.username}" cho đơn #${order.orderCode}?\n\nHành động này không thể hoàn tác.`)) {
+      return;
+    }
+    setRefundingOrderCode(order.orderCode);
+    try {
+      const res = await fetch(`/api/orders/${order.orderCode}/refund`, { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        showNotification(`✅ Đã hoàn $${formatMoney(order.totalPrice)} cho đơn #${order.orderCode}`);
+        fetchAdminData();
+      } else {
+        showNotification(null, data.error || 'Lỗi hoàn tiền đơn hàng');
+      }
+    } catch (e) {
+      showNotification(null, 'Lỗi hoàn tiền đơn hàng');
+    } finally {
+      setRefundingOrderCode(null);
+    }
+  };
+
   // Toggle a single variant on/off the storefront (same idea, scoped to one
   // variant of the product rather than the whole listing). Calls
   // refreshAfterVariantChange (defined further down) — safe to reference
@@ -1067,7 +1108,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       <div className="max-w-7xl mx-auto px-4 sm:px-8 mt-6">
         {/* Navigation Tabs — wraps into a compact grid instead of a long
             horizontally-scrolling row, so every section stays one click away. */}
-        <div className="grid grid-cols-4 sm:grid-cols-8 gap-1.5 border-b border-[#e0e4e2] dark:border-[#33363e] pb-3 mb-6">
+        <div className="grid grid-cols-4 sm:grid-cols-5 lg:grid-cols-10 gap-1.5 border-b border-[#e0e4e2] dark:border-[#33363e] pb-3 mb-6">
           <button
             onClick={() => setActiveTab('overview')}
             title="Tổng Quan & Thống Kê"
@@ -1131,6 +1172,19 @@ export const AdminPage: React.FC<AdminPageProps> = ({
           >
             <Database className="w-4 h-4" />
             <span className="truncate w-full">Kho Hàng</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('orders')}
+            title="Quản Lý Đơn Hàng"
+            className={`px-2 py-2 text-[11px] font-bold rounded-lg transition flex flex-col items-center gap-1 text-center ${
+              activeTab === 'orders'
+                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-purple-700 dark:text-purple-300 ring-1 ring-purple-500'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200 hover:bg-[#ecefee] hover:dark:bg-[#222429]'
+            }`}
+          >
+            <FileText className="w-4 h-4" />
+            <span className="truncate w-full">Đơn Hàng ({allOrders.length})</span>
           </button>
 
           <button
@@ -2474,6 +2528,150 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 </>
               )}
             </div>
+          </div>
+        )}
+
+        {/* TAB: ORDER MANAGEMENT */}
+        {activeTab === 'orders' && (
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">Quản Lý Đơn Hàng</h2>
+                <p className="text-xs text-slate-600 dark:text-slate-400">Toàn bộ đơn hàng trên sàn — tìm theo mã đơn/khách/sản phẩm, hoàn tiền khi cần</p>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <select
+                  value={orderStatusFilter}
+                  onChange={(e) => setOrderStatusFilter(e.target.value as 'all' | 'completed' | 'refunded')}
+                  className="bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-2.5 py-1.5 text-xs text-slate-800 dark:text-slate-200"
+                >
+                  <option value="all">Tất cả trạng thái</option>
+                  <option value="completed">Hoàn thành</option>
+                  <option value="refunded">Đã hoàn tiền</option>
+                </select>
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-600 dark:text-slate-400" />
+                  <input
+                    type="text"
+                    value={orderSearch}
+                    onChange={(e) => setOrderSearch(e.target.value)}
+                    placeholder="Tìm mã đơn/khách/sản phẩm..."
+                    className="bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-purple-500"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {(() => {
+              const q = orderSearch.trim().toLowerCase();
+              const filteredOrders = allOrders.filter((o) => {
+                if (orderStatusFilter !== 'all' && o.status !== orderStatusFilter) return false;
+                if (!q) return true;
+                return (
+                  o.orderCode.toLowerCase().includes(q) ||
+                  o.username.toLowerCase().includes(q) ||
+                  o.productName.toLowerCase().includes(q)
+                );
+              });
+              const ordersTotalPages = Math.max(1, Math.ceil(filteredOrders.length / ORDERS_PER_PAGE));
+              const safeOrdersPage = Math.min(ordersPage, ordersTotalPages);
+              const pagedOrders = filteredOrders.slice((safeOrdersPage - 1) * ORDERS_PER_PAGE, safeOrdersPage * ORDERS_PER_PAGE);
+
+              return (
+                <>
+                  {allOrders.length === 0 ? (
+                    <div className="text-center text-xs text-slate-500 dark:text-slate-500 py-6 bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl">
+                      Chưa có đơn hàng nào trên sàn.
+                    </div>
+                  ) : (
+                    <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
+                      <table className="w-full text-left text-xs">
+                        <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
+                          <tr>
+                            <th className="p-3">Mã đơn</th>
+                            <th className="p-3">Khách hàng</th>
+                            <th className="p-3">Sản phẩm</th>
+                            <th className="p-3">SL</th>
+                            <th className="p-3">Tổng tiền</th>
+                            <th className="p-3">Trạng thái</th>
+                            <th className="p-3">Thời gian</th>
+                            <th className="p-3 text-right">Hành động</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-[#e4e8e7]">
+                          {pagedOrders.map((o) => (
+                            <tr key={o.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34] transition">
+                              <td className="p-3 font-mono font-bold text-slate-900 dark:text-slate-100">#{o.orderCode.toUpperCase()}</td>
+                              <td className="p-3 text-slate-700 dark:text-slate-300">{o.username}</td>
+                              <td className="p-3 text-slate-700 dark:text-slate-300">
+                                <div>{o.productName}</div>
+                                <div className="text-[10px] text-slate-500 dark:text-slate-500">{o.variantName}</div>
+                              </td>
+                              <td className="p-3 text-slate-700 dark:text-slate-300">{o.quantity}</td>
+                              <td className="p-3 font-mono font-bold text-emerald-600 dark:text-emerald-400">${formatMoney(o.totalPrice)}</td>
+                              <td className="p-3">
+                                {o.status === 'refunded' ? (
+                                  <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/30">
+                                    Đã hoàn tiền
+                                  </span>
+                                ) : (
+                                  <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30">
+                                    Hoàn thành
+                                  </span>
+                                )}
+                              </td>
+                              <td className="p-3 font-mono text-[10px] text-slate-600 dark:text-slate-400">
+                                {new Date(o.createdAt).toLocaleString('vi-VN')}
+                              </td>
+                              <td className="p-3 text-right">
+                                {o.status === 'refunded' ? (
+                                  <span className="text-[10px] text-slate-500 dark:text-slate-500">
+                                    {o.refundedAt ? new Date(o.refundedAt).toLocaleDateString('vi-VN') : ''}
+                                  </span>
+                                ) : (
+                                  <button
+                                    onClick={() => handleRefundOrder(o)}
+                                    disabled={refundingOrderCode === o.orderCode}
+                                    className="bg-red-50 dark:bg-red-950/70 hover:bg-red-100 hover:dark:bg-red-900/70 text-red-700 dark:text-red-300 border border-red-500/30 px-2.5 py-1 rounded text-[10px] font-bold disabled:opacity-40 disabled:cursor-not-allowed transition"
+                                  >
+                                    {refundingOrderCode === o.orderCode ? 'Đang hoàn...' : 'Hoàn tiền'}
+                                  </button>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+
+                  {ordersTotalPages > 1 && (
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-slate-600 dark:text-slate-400">
+                        Trang {safeOrdersPage}/{ordersTotalPages} ({filteredOrders.length} đơn hàng)
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => setOrdersPage((p) => Math.max(1, p - 1))}
+                          disabled={safeOrdersPage === 1}
+                          className="px-3 py-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e0e4e2] hover:dark:bg-[#2a2d34] border border-[#dde2e0] dark:border-[#373b43] rounded-lg font-semibold text-slate-700 dark:text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                        >
+                          ← Trước
+                        </button>
+                        <button
+                          onClick={() => setOrdersPage((p) => Math.min(ordersTotalPages, p + 1))}
+                          disabled={safeOrdersPage === ordersTotalPages}
+                          className="px-3 py-1.5 bg-[#eceeed] dark:bg-[#23252a] hover:bg-[#e0e4e2] hover:dark:bg-[#2a2d34] border border-[#dde2e0] dark:border-[#373b43] rounded-lg font-semibold text-slate-700 dark:text-slate-300 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                        >
+                          Sau →
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </>
+              );
+            })()}
           </div>
         )}
 
