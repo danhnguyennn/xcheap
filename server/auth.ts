@@ -55,10 +55,16 @@ export function sessionMiddleware() {
       httpOnly: true,
       maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days of inactivity
       sameSite: 'lax',
-      // Only sent over HTTPS in production. Forcing this in dev would
-      // silently stop the cookie from ever being set (or sent back) on
-      // plain http://localhost, breaking every logged-in request.
-      secure: process.env.NODE_ENV === 'production',
+      // 'auto' defers to req.secure instead of a hardcoded true/false. A
+      // flat `true` here silently broke logins: the hop between cloudflared
+      // and this container is plain HTTP, so with NODE_ENV=production
+      // forcing secure:true unconditionally, the browser dropped the
+      // Set-Cookie on login whenever it didn't see the original connection
+      // as HTTPS — the login response still looked successful, but no
+      // session was ever actually stored. 'auto' + app.set('trust proxy', 1)
+      // in server.ts (so req.secure reflects cloudflared's
+      // X-Forwarded-Proto) fixes it while still requiring real HTTPS.
+      secure: 'auto',
     },
   });
 }

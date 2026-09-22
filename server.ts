@@ -15,6 +15,15 @@ import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 const app = express();
 const PORT = 3434;
 
+// The app is only ever reached through cloudflared (see docker-compose.yml —
+// no host port is published), so trusting exactly one hop of X-Forwarded-*
+// headers is safe: cloudflared is the only thing that can ever set them.
+// This is what lets Express see the real client IP (req.ip, used by the
+// login rate limiter below) and the real original protocol (req.secure,
+// used by the session cookie's "secure: auto" — see server/auth.ts) instead
+// of the internal plain-HTTP hop between cloudflared and this container.
+app.set('trust proxy', 1);
+
 // Standard production security headers (X-Content-Type-Options, X-Frame-
 // Options, Strict-Transport-Security, etc). crossOriginEmbedderPolicy is
 // off because it would block the Turnstile iframe entirely.
