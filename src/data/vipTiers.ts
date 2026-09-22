@@ -6,9 +6,9 @@ export interface VipTier {
   discountPercent: number; // automatic order discount granted at this tier, capped at 15%
 }
 
-// Regular-customer loyalty tiers based on lifetime confirmed deposits. Capped
-// at 15% (V5) so it never undercuts the CTV/Admin wholesale discount tiers,
-// which start higher. Only applies to role === 'user' accounts.
+// Regular-customer loyalty tiers based on lifetime confirmed deposits. Only
+// applies to role === 'user' accounts — CTV/admin no longer get any
+// automatic purchase discount (removed; they always pay the listed price).
 //
 // Thresholds are sized against real buying volume (accounts cost ~$0.4 each,
 // and active buyers purchase ~100-1000/day), and the gap between tiers grows
@@ -21,8 +21,8 @@ export const VIP_TIERS: VipTier[] = [
   { key: 'v1', label: 'V1', sub: 'Bronze', threshold: 300, discountPercent: 3 },
   { key: 'v2', label: 'V2', sub: 'Silver', threshold: 1000, discountPercent: 5 },
   { key: 'v3', label: 'V3', sub: 'Gold', threshold: 4000, discountPercent: 8 },
-  { key: 'v4', label: 'V4', sub: 'Platinum', threshold: 20000, discountPercent: 11 },
-  { key: 'v5', label: 'V5', sub: 'Diamond', threshold: 120000, discountPercent: 15 },
+  { key: 'v4', label: 'V4', sub: 'Platinum', threshold: 10000, discountPercent: 11 },
+  { key: 'v5', label: 'V5', sub: 'Diamond', threshold: 25000, discountPercent: 15 },
 ];
 
 export const VIP_MAX_DISCOUNT_PERCENT = 15;

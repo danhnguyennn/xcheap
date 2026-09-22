@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Product, ProductVariant, Language, User, Review, PreOrder } from '../types';
+import { Product, ProductVariant, Language, User, Review, PreOrder, ReviewSuggestion } from '../types';
+import { VIP_TIERS } from '../data/vipTiers';
 import { translations } from '../locales/translations';
 import { ProductShopArt } from './ProductShopArt';
 import { DeliveredAccounts } from './DeliveredAccounts';
@@ -232,13 +233,15 @@ export const ProductDetail: React.FC<ProductDetailProps> = ({
   // Kho câu gợi ý đánh giá — admin quản lý (thêm/sửa/xóa) và lưu trong DB,
   // không còn hardcode trong translations. Chỉ toàn câu khen (không đề xuất
   // câu phàn nàn, kể cả khi user chọn sao thấp — đó là việc họ tự viết,
-  // không phải thứ shop chủ động gợi ý).
-  const [suggestionPool, setSuggestionPool] = useState<string[]>([]);
+  // không phải thứ shop chủ động gợi ý). Mỗi câu có sẵn bản dịch cho cả 4
+  // ngôn ngữ — giữ nguyên object thô ở đây, chỉ chọn đúng ngôn ngữ khi hiển
+  // thị (useMemo bên dưới) để đổi ngôn ngữ không cần fetch lại.
+  const [suggestionPool, setSuggestionPool] = useState<ReviewSuggestion[]>([]);
 
   useEffect(() => {
     fetch('/api/review-comment-suggestions')
       .then((res) => (res.ok ? res.json() : { suggestions: [] }))
-      .then((data) => setSuggestionPool((data.suggestions || []).map((s: { text: string }) => s.text)))
+      .then((data) => setSuggestionPool(data.suggestions || []))
       .catch(() => setSuggestionPool([]));
   }, []);
 
@@ -251,9 +254,9 @@ export const ProductDetail: React.FC<ProductDetailProps> = ({
       const j = Math.floor(Math.random() * (i + 1));
       [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
     }
-    return shuffled.slice(0, 3);
+    return shuffled.slice(0, 3).map((s) => s.text[language] || s.text.vn);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [product.id, suggestionPool]);
+  }, [product.id, suggestionPool, language]);
 
   // Pull the real stock count from the server: right away when the product
   // changes, again immediately after a purchase, and every 15s in between so
@@ -305,20 +308,17 @@ export const ProductDetail: React.FC<ProductDetailProps> = ({
     return () => clearInterval(interval);
   }, [product.id]);
 
-  // Price calculations with CTV discount & coupon
+  // Price calculation with VIP discount & coupon — CTV/admin no longer get
+  // any automatic purchase discount, so this preview must match
+  // computeUnitPriceForUser() server-side exactly: only role 'user' with an
+  // active VIP tier gets a lower unit price here.
   let unitPrice = selectedVariant.price;
   let userDiscountNote = '';
 
   // Rounding to 3 decimals here (matching the server's checkout math) keeps
   // this preview in sync with what the customer is actually charged — 2
   // decimals would silently destroy sub-cent variant prices like $0.055.
-  if (user?.role === 'ctv') {
-    unitPrice = Number((unitPrice * (1 - (user.discountPercent || 12) / 100)).toFixed(3));
-    userDiscountNote = `(CTV -${user.discountPercent || 12}%)`;
-  } else if (user?.role === 'admin') {
-    unitPrice = Number((unitPrice * (1 - (user.discountPercent || 20) / 100)).toFixed(3));
-    userDiscountNote = `(Admin -${user.discountPercent || 20}%)`;
-  } else if (user?.role === 'user' && (user.vipDiscountPercent || 0) > 0) {
+  if (user?.role === 'user' && (user.vipDiscountPercent || 0) > 0) {
     unitPrice = Number((unitPrice * (1 - user.vipDiscountPercent! / 100)).toFixed(3));
     userDiscountNote = `(VIP -${user.vipDiscountPercent}%)`;
   }
@@ -873,14 +873,6 @@ export const ProductDetail: React.FC<ProductDetailProps> = ({
                 <span>{t.pdListedUnitPrice}</span>
                 <span className="font-mono text-slate-800 dark:text-slate-200">${formatMoney(selectedVariant.price)} × {quantity}</span>
               </div>
-              {user && user.discountPercent > 0 && (
-                <div className="flex justify-between text-emerald-600 dark:text-emerald-400">
-                  <span>{t.pdTierDiscount} ({user.role.toUpperCase()} -{user.discountPercent}%):</span>
-                  <span className="font-mono">
-                    -${formatMoney((selectedVariant.price * (user.discountPercent / 100)) * quantity)}
-                  </span>
-                </div>
-              )}
               {user?.role === 'user' && (user.vipDiscountPercent || 0) > 0 && (
                 <div className="flex justify-between text-emerald-600 dark:text-emerald-400">
                   <span>{t.pdVipDiscount} (VIP -{user.vipDiscountPercent}%):</span>
@@ -1185,16 +1177,28 @@ export const ProductDetail: React.FC<ProductDetailProps> = ({
               ) : reviews.length === 0 ? (
                 <div className="text-center text-slate-600 dark:text-slate-400 py-6">{t.noReviewsYet}</div>
               ) : (
-                reviews.map((rev) => (
+                reviews.map((rev) => {
+                  const authorVipTier = rev.authorVipTierKey
+                    ? VIP_TIERS.find((tier) => tier.key === rev.authorVipTierKey)
+                    : undefined;
+                  return (
                   <div key={rev.id} className="p-3 bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e2e6e5] dark:border-[#30333b] rounded-lg">
                     <div className="flex items-center justify-between mb-1">
-                      <span className="font-bold text-slate-900 dark:text-slate-100">{rev.author}</span>
+                      <span className="flex items-center gap-1.5">
+                        <span className="font-bold text-slate-900 dark:text-slate-100">{rev.author}</span>
+                        {authorVipTier && (
+                          <span className="px-1.5 py-0.5 rounded text-[9px] font-bold text-amber-700 dark:text-amber-300 bg-amber-500/15 border border-amber-500/40 uppercase">
+                            VIP {authorVipTier.label}
+                          </span>
+                        )}
+                      </span>
                       <span className="text-[10px] text-slate-600 dark:text-slate-400">{new Date(rev.date).toLocaleDateString()}</span>
                     </div>
                     <div className="text-amber-600 dark:text-amber-400 text-xs mb-1">{'★'.repeat(rev.rating)}{'☆'.repeat(5 - rev.rating)}</div>
                     <p className="text-slate-700 dark:text-slate-300 text-xs">{rev.comment}</p>
                   </div>
-                ))
+                  );
+                })
               )}
             </div>
           )}

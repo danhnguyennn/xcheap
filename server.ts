@@ -4,7 +4,7 @@ import express from 'express';
 import path from 'path';
 import { cryptoOptions } from './src/data/storeData';
 import { getVipTier } from './src/data/vipTiers';
-import { User, UserRole, Product, Order, PreOrder, AdminNotification, DepositTransaction, CryptoNetwork, CryptoOption, WithdrawalRequest, CtvStats, Category, Voucher, Review, ReviewSuggestion } from './src/types';
+import { User, UserRole, Product, Order, PreOrder, AdminNotification, DepositTransaction, CryptoNetwork, CryptoOption, WithdrawalRequest, CtvStats, Category, Voucher, Review, ReviewSuggestion, Language } from './src/types';
 import { db, generateObjectId, MongoCollection } from './server/mongodb';
 import { getOrCreateUserWallet, ensureUserDepositWallets } from './server/walletVault';
 import { sessionMiddleware, getSessionUser, requireAuth, requireRole, hashPassword, verifyPassword, toPublicUser, generateApiKey } from './server/auth';
@@ -88,6 +88,20 @@ const loginRateLimiter = rateLimit({
   message: { error: 'Quá nhiều lần đăng nhập thất bại. Vui lòng thử lại sau 30 phút.' },
 });
 
+// Guard against mass account-creation spam — keyed by IP alone (unlike
+// login, a registration bot varies the username/email on every attempt, so
+// keying by account would never catch it). Every attempt counts, successful
+// or not: creating many accounts is itself the abuse being limited, not just
+// failed attempts.
+const registerRateLimiter = rateLimit({
+  windowMs: 30 * 60 * 1000,
+  limit: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => ipKeyGenerator(req.ip || ''),
+  message: { error: 'Quá nhiều lần đăng ký. Vui lòng thử lại sau 30 phút.' },
+});
+
 // Serializes concurrent /api/deposit/check-rpc calls per user+network so two
 // requests in flight at once can never both credit the same on-chain delta.
 // Safe to be in-memory: it only needs to hold for the lifetime of overlapping
@@ -162,6 +176,60 @@ function takeSampleView(key: string): { allowed: boolean; remaining: number; ret
 // that predates login support, so it doesn't become permanently locked out.
 const DEFAULT_DEMO_PASSWORD = 'Xcheap@2026';
 
+// Starting pool of review-suggestion phrases, translated up front into every
+// language the site supports — admin can add/edit/delete afterward (see
+// /api/admin/review-comment-suggestions), each with its own 4 translations.
+const DEFAULT_REVIEW_SUGGESTIONS: Record<Language, string>[] = [
+  {
+    vn: 'Tài khoản chuẩn như mô tả, giao dịch nhanh chóng!',
+    en: 'Account exactly as described, super fast transaction!',
+    zh: '账号完全符合描述，交易速度很快！',
+    th: 'บัญชีตรงตามที่อธิบายไว้ ทำธุรกรรมรวดเร็วมาก!',
+  },
+  {
+    vn: 'Chất lượng tốt, admin hỗ trợ nhiệt tình. Sẽ ủng hộ tiếp!',
+    en: 'Great quality, admin support is very helpful. Will buy again!',
+    zh: '质量很好，管理员服务热情，还会继续支持！',
+    th: 'คุณภาพดี แอดมินช่วยเหลือดีมาก จะอุดหนุนต่อแน่นอน!',
+  },
+  {
+    vn: 'Uy tín, đúng như cam kết. Rất hài lòng!',
+    en: 'Trustworthy, exactly as promised. Very satisfied!',
+    zh: '很靠谱，完全符合承诺，非常满意！',
+    th: 'น่าเชื่อถือ ตรงตามที่รับปากไว้ พอใจมาก!',
+  },
+  {
+    vn: 'Giao hàng tự động cực nhanh, tài khoản hoạt động tốt!',
+    en: 'Auto-delivery was super fast, account works great!',
+    zh: '自动发货速度超快，账号运行良好！',
+    th: 'ส่งสินค้าอัตโนมัติรวดเร็วมาก บัญชีใช้งานได้ดี!',
+  },
+  {
+    vn: 'Giá tốt, chất lượng ổn, sẽ quay lại mua thêm!',
+    en: 'Good price, solid quality, will come back for more!',
+    zh: '价格实惠，质量稳定，还会再来购买！',
+    th: 'ราคาดี คุณภาพเสถียร จะกลับมาซื้อเพิ่มแน่นอน!',
+  },
+  {
+    vn: 'Shop uy tín, đóng gói thông tin tài khoản rõ ràng, dễ dùng.',
+    en: 'Trustworthy shop, account info is clearly laid out and easy to use.',
+    zh: '商店很靠谱，账号信息整理清晰，使用方便。',
+    th: 'ร้านน่าเชื่อถือ ข้อมูลบัญชีจัดเรียงชัดเจน ใช้งานง่าย',
+  },
+  {
+    vn: 'Trải nghiệm mua hàng tuyệt vời, đúng cam kết bảo hành.',
+    en: 'Excellent shopping experience, warranty exactly as promised.',
+    zh: '购物体验很棒，保修完全兑现承诺。',
+    th: 'ประสบการณ์ซื้อสินค้ายอดเยี่ยม รับประกันตรงตามที่สัญญาไว้',
+  },
+  {
+    vn: 'Rất đáng tiền, tài khoản ổn định sau nhiều ngày sử dụng.',
+    en: 'Totally worth it, account has stayed stable after days of use.',
+    zh: '非常值得，使用多天后账号依然稳定。',
+    th: 'คุ้มค่ามาก บัญชียังเสถียรดีหลังใช้งานมาหลายวัน',
+  },
+];
+
 // Bootstrap MongoDB connection. No demo products/users/stock are seeded —
 // the store starts with whatever is already in the database, and new
 // products, accounts and users are only ever created through real actions
@@ -191,18 +259,24 @@ async function initializeDatabase() {
   const existingSuggestions = await suggestionCol.find();
   if (existingSuggestions.length === 0) {
     console.log('[MongoDB] Seeding default review suggestions...');
-    const defaultSuggestions = [
-      'Tài khoản chuẩn như mô tả, giao dịch nhanh chóng!',
-      'Chất lượng tốt, admin hỗ trợ nhiệt tình. Sẽ ủng hộ tiếp!',
-      'Uy tín, đúng như cam kết. Rất hài lòng!',
-      'Giao hàng tự động cực nhanh, tài khoản hoạt động tốt!',
-      'Giá tốt, chất lượng ổn, sẽ quay lại mua thêm!',
-      'Shop uy tín, đóng gói thông tin tài khoản rõ ràng, dễ dùng.',
-      'Trải nghiệm mua hàng tuyệt vời, đúng cam kết bảo hành.',
-      'Rất đáng tiền, tài khoản ổn định sau nhiều ngày sử dụng.',
-    ];
-    for (const text of defaultSuggestions) {
+    for (const text of DEFAULT_REVIEW_SUGGESTIONS) {
       await suggestionCol.insertOne({ id: 'sug_' + generateObjectId(), text, createdAt: new Date().toISOString() });
+    }
+  } else {
+    // One-time backfill: suggestions created before per-language text existed
+    // are stored as a plain string. Known defaults get their real
+    // translation; anything an admin wrote by hand (no way to know the
+    // translation automatically) falls back to showing that same string in
+    // every language until it's next edited through the admin UI.
+    const legacyStringSuggestions = existingSuggestions.filter((s) => typeof s.text === 'string');
+    if (legacyStringSuggestions.length > 0) {
+      for (const s of legacyStringSuggestions) {
+        const legacyText = s.text as unknown as string;
+        const knownTranslation = DEFAULT_REVIEW_SUGGESTIONS.find((d) => d.vn === legacyText);
+        const text = knownTranslation || { vn: legacyText, en: legacyText, zh: legacyText, th: legacyText };
+        await suggestionCol.updateOne({ id: s.id }, { $set: { text } });
+      }
+      console.log(`[MongoDB] Backfilled per-language text for ${legacyStringSuggestions.length} review suggestion(s).`);
     }
   }
 
@@ -245,6 +319,20 @@ async function initializeDatabase() {
       await userCol.updateOne({ id: u.id }, { $set: { apiKey: generateApiKey() } });
     }
     console.log(`[Auth] Backfilled API key for ${usersMissingApiKey.length} account(s).`);
+  }
+
+  // One-time backfill: CTV/admin accounts created before the automatic
+  // purchase discount was removed still carry their old discountPercent
+  // (e.g. 12/20) in the database. computeUnitPriceForUser() already ignores
+  // this field for these roles, so it never affected what they're actually
+  // charged — but it's zeroed out here too so nothing that reads the raw
+  // field (now or in the future) can show a stale discount for them again.
+  const staleDiscountAccounts = existingUsers.filter((u) => u.role !== 'user' && u.discountPercent);
+  if (staleDiscountAccounts.length > 0) {
+    for (const u of staleDiscountAccounts) {
+      await userCol.updateOne({ id: u.id }, { $set: { discountPercent: 0 } });
+    }
+    console.log(`[Auth] Cleared stale discountPercent on ${staleDiscountAccounts.length} CTV/admin account(s).`);
   }
 }
 
@@ -409,7 +497,7 @@ async function verifyTurnstileToken(token: unknown, remoteIp?: string): Promise<
 }
 
 // 2. Register a new account
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', registerRateLimiter, async (req, res) => {
   const { username, email, password, turnstileToken } = req.body;
   // Every field must actually be a string before it's allowed anywhere near
   // a MongoDB query filter or a stored document — without this, a JSON body
@@ -793,12 +881,46 @@ app.get('/api/products/:id', async (req, res) => {
   res.json({ product });
 });
 
+// Shows just enough of a reviewer's name to feel authentic without exposing
+// their full username to every visitor — always exactly 3 trailing asterisks
+// regardless of the real length, so the mask never leaks how long the
+// original username was either.
+function maskReviewerName(username: string): string {
+  return username.slice(0, Math.min(3, username.length)) + '***';
+}
+
 // Real product reviews — no fabricated reviews are ever mixed in; a product
 // with none yet simply returns an empty list.
 app.get('/api/products/:id/reviews', async (req, res) => {
   const reviewCol = db.collection<Review>('reviews');
+  const userCol = db.collection<User>('users');
+  const depCol = db.collection<DepositTransaction>('deposits');
   const reviews = await reviewCol.find({ productId: req.params.id }, { sort: { date: -1 } });
-  res.json({ reviews });
+
+  // VIP is a deposit-based perk that only ever applies to role 'user' (see
+  // computeUnitPriceForUser) — a CTV/admin reviewer never gets a VIP badge
+  // even if their account happens to carry old deposits. Both lookups are
+  // batched by the reviewer's userId (not per-review) so a product with many
+  // reviews still costs 2 extra queries total, not 2 per review.
+  const userIds = [...new Set(reviews.map((r) => r.userId))];
+  const reviewers = await userCol.find({ id: { $in: userIds } });
+  const reviewerRoleById = new Map(reviewers.map((u) => [u.id, u.role]));
+
+  const confirmedDeposits = await depCol.find({ userId: { $in: userIds }, status: 'confirmed' });
+  const totalDepositedById = new Map<string, number>();
+  for (const d of confirmedDeposits) {
+    totalDepositedById.set(d.userId, (totalDepositedById.get(d.userId) || 0) + d.amount);
+  }
+
+  const publicReviews = reviews.map((r) => {
+    let authorVipTierKey: string | undefined;
+    if (reviewerRoleById.get(r.userId) === 'user') {
+      const vipTier = getVipTier(totalDepositedById.get(r.userId) || 0);
+      if (vipTier.discountPercent > 0) authorVipTierKey = vipTier.key;
+    }
+    return { ...r, author: maskReviewerName(r.author), authorVipTierKey };
+  });
+  res.json({ reviews: publicReviews });
 });
 
 // A review rated this or below is considered "xấu" (bad) and stays
@@ -949,11 +1071,25 @@ app.get('/api/review-comment-suggestions', async (req, res) => {
   res.json({ suggestions });
 });
 
+const REVIEW_SUGGESTION_LANGUAGES: Language[] = ['vn', 'en', 'zh', 'th'];
+
+// Every suggestion needs real text in all 4 languages — a partial object
+// would leave the pill blank for whichever language wasn't filled in.
+function parseReviewSuggestionText(body: any): Record<Language, string> | null {
+  const text: Partial<Record<Language, string>> = {};
+  for (const lang of REVIEW_SUGGESTION_LANGUAGES) {
+    const value = String(body?.text?.[lang] || '').trim().slice(0, 300);
+    if (!value) return null;
+    text[lang] = value;
+  }
+  return text as Record<Language, string>;
+}
+
 // Admin-only CRUD over the review-suggestion phrase pool ("câu đánh giá đề
 // xuất") — add/edit/delete, stored in the review_suggestions collection.
 app.post('/api/admin/review-comment-suggestions', requireRole('admin'), async (req, res) => {
-  const text = String(req.body.text || '').trim().slice(0, 300);
-  if (!text) return res.status(400).json({ error: 'Nội dung gợi ý không được để trống' });
+  const text = parseReviewSuggestionText(req.body);
+  if (!text) return res.status(400).json({ error: 'Vui lòng nhập nội dung gợi ý cho đủ cả 4 ngôn ngữ' });
   const suggestionCol = db.collection<ReviewSuggestion>('review_suggestions');
   const newSuggestion: ReviewSuggestion = { id: 'sug_' + generateObjectId(), text, createdAt: new Date().toISOString() };
   await suggestionCol.insertOne(newSuggestion);
@@ -961,8 +1097,8 @@ app.post('/api/admin/review-comment-suggestions', requireRole('admin'), async (r
 });
 
 app.put('/api/admin/review-comment-suggestions/:id', requireRole('admin'), async (req, res) => {
-  const text = String(req.body.text || '').trim().slice(0, 300);
-  if (!text) return res.status(400).json({ error: 'Nội dung gợi ý không được để trống' });
+  const text = parseReviewSuggestionText(req.body);
+  if (!text) return res.status(400).json({ error: 'Vui lòng nhập nội dung gợi ý cho đủ cả 4 ngôn ngữ' });
   const suggestionCol = db.collection<ReviewSuggestion>('review_suggestions');
   const result = await suggestionCol.updateOne({ id: req.params.id }, { $set: { text } });
   if (result.matchedCount === 0) return res.status(404).json({ error: 'Không tìm thấy gợi ý này' });
@@ -1212,7 +1348,15 @@ async function fulfillPendingPreorders(productId: string, variantId: string): Pr
 
 // 6. Buy / Checkout endpoint (MongoDB: Transaction & Updates)
 app.post('/api/orders/checkout', async (req, res) => {
-  const { productId, variantId, quantity = 1, couponCode } = req.body;
+  const { productId, variantId, couponCode } = req.body;
+  // Must be a validated positive integer before it ever reaches
+  // invCol.find(..., { limit: quantity }) below: MongoCollection.find()
+  // only applies .limit() when it's truthy, so quantity: 0 silently
+  // returned (and let a buyer claim + receive for free) the entire unsold
+  // stock of a variant, and a negative quantity flipped totalPrice negative,
+  // crediting the buyer's balance instead of charging it. Mirrors the same
+  // validation already used for pre-orders below (POST /:id/preorder).
+  const quantity = Math.max(1, Math.floor(Number(req.body.quantity)) || 1);
   const userCol = db.collection<User>('users');
   const prodCol = db.collection<Product>('products');
   const invCol = db.collection<any>('inventory');
@@ -3126,62 +3270,6 @@ app.post("/api/renew_token", async (req, res) => {
       error: error.message || "Không thể kết nối tới Microsoft OAuth2 endpoint"
     });
   }
-});
-
-// Backward-compatible Bulk Renew Token Hotmail / Outlook
-app.post('/api/tools/renew-hotmail-token', async (req, res) => {
-  const { tokensInput } = req.body;
-  if (!tokensInput || typeof tokensInput !== 'string') {
-    return res.status(400).json({ error: 'Vui lòng cung cấp Refresh Token hoặc danh sách token' });
-  }
-
-  const lines = tokensInput.split('\n').map((l) => l.trim()).filter(Boolean);
-  const results = lines.map((line, idx) => {
-    const parts = line.split('|');
-    let email = '';
-    let refreshToken = line;
-    let clientId = 'default-ms-graph-client';
-
-    if (parts.length >= 2) {
-      if (parts[0].includes('@')) {
-        email = parts[0];
-        refreshToken = parts[1];
-        if (parts[2]) clientId = parts[2];
-      } else {
-        refreshToken = parts[0];
-        clientId = parts[1];
-      }
-    } else if (line.includes('@')) {
-      email = line;
-    }
-
-    const isLive = !refreshToken.toLowerCase().includes('die') && !refreshToken.toLowerCase().includes('expired');
-    const fakeAccessToken =
-      'EwBoA+128da' +
-      Math.random().toString(36).substring(2, 12) +
-      Math.random().toString(36).substring(2, 12) +
-      '...AQAB';
-
-    return {
-      id: idx + 1,
-      input: line,
-      email: email || `user_mail_${idx + 1}@hotmail.com`,
-      refreshToken: refreshToken.slice(0, 16) + '...',
-      accessToken: isLive ? fakeAccessToken : null,
-      tokenType: 'Bearer',
-      expiresIn: isLive ? 3600 : 0,
-      scope: 'Mail.ReadWrite, IMAP.AccessAsUser.All, User.Read, offline_access',
-      status: isLive ? 'HOẠT ĐỘNG' : 'HẾT HẠN',
-      renewedAt: new Date().toLocaleTimeString(),
-    };
-  });
-
-  res.json({
-    total: results.length,
-    liveCount: results.filter((r) => r.status === 'HOẠT ĐỘNG').length,
-    dieCount: results.filter((r) => r.status !== 'HOẠT ĐỘNG').length,
-    results,
-  });
 });
 
 // Vite dev middleware or static serving

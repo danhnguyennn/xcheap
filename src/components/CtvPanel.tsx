@@ -75,18 +75,17 @@ export const CtvPanel: React.FC<CtvPanelProps> = ({
 
         {/* Body */}
         <div className="p-5 overflow-y-auto space-y-4 text-xs">
-          {/* CTV Privilege Banner */}
+          {/* CTV Privilege Banner — no automatic purchase discount anymore
+              (removed); this now only describes what CTV actually gets:
+              the ability to supply/manage their own stock below. */}
           <div className="p-3.5 bg-gradient-to-r from-amber-950/40 to-[#eceeed] dark:to-[#23252a] border border-amber-500/30 rounded-xl space-y-2">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1.5">
               <span className="font-bold text-amber-700 dark:text-amber-300 text-xs flex items-center gap-1.5">
-                <Sparkles className="w-4 h-4" /> Chiết khấu đại lý CTV của bạn
-              </span>
-              <span className="bg-amber-500 text-slate-950 font-black text-xs px-2 py-0.5 rounded">
-                -{user.discountPercent || 12}% Giá Sỉ
+                <Sparkles className="w-4 h-4" /> Đặc quyền đại lý CTV
               </span>
             </div>
             <p className="text-[11px] text-slate-700 dark:text-slate-300">
-              Tài khoản của bạn ({user.username}) tự động được khấu trừ trực tiếp {user.discountPercent || 12}% trên mọi danh mục khi đặt mua tài khoản.
+              Tài khoản của bạn ({user.username}) có thể tự nhập kho và bán tài khoản trực tiếp trên hệ thống — quản lý nguồn hàng ngay bên dưới.
             </p>
           </div>
 

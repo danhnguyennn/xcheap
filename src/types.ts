@@ -208,6 +208,10 @@ export interface Review {
   date: string;
   comment: string;
   editedAt?: string;
+  // Only present when the reviewer is a regular user (role 'user') with an
+  // active VIP tier at the time the review list was fetched — a CTV/admin
+  // reviewer never gets one, since they don't receive the VIP perk either.
+  authorVipTierKey?: string;
 }
 
 // Quick-pick phrases shown in the review form — managed by admin (add/edit/
@@ -216,7 +220,7 @@ export interface Review {
 // nothing negative is ever suggested to a reviewer.
 export interface ReviewSuggestion {
   id: string;
-  text: string;
+  text: Record<Language, string>;
   createdAt: string;
 }
 

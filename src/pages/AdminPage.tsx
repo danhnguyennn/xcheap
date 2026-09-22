@@ -48,6 +48,9 @@ interface AdminPageProps {
   onOpenDeposit: () => void;
 }
 
+const EMPTY_SUGGESTION_TEXT: Record<Language, string> = { vn: '', en: '', zh: '', th: '' };
+const SUGGESTION_LANGUAGE_LABELS: Record<Language, string> = { vn: 'VN', en: 'EN', zh: 'ZH', th: 'TH' };
+
 export const AdminPage: React.FC<AdminPageProps> = ({
   user,
   products,
@@ -82,10 +85,10 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [productReviews, setProductReviews] = useState<(Review & { productName: string })[]>([]);
   const [reviewEditableMaxRating, setReviewEditableMaxRating] = useState(3);
   const [reviewSuggestions, setReviewSuggestions] = useState<ReviewSuggestion[]>([]);
-  const [newSuggestionText, setNewSuggestionText] = useState('');
+  const [newSuggestionText, setNewSuggestionText] = useState<Record<Language, string>>(EMPTY_SUGGESTION_TEXT);
   const [isAddingSuggestion, setIsAddingSuggestion] = useState(false);
   const [editingSuggestionId, setEditingSuggestionId] = useState<string | null>(null);
-  const [editingSuggestionText, setEditingSuggestionText] = useState('');
+  const [editingSuggestionText, setEditingSuggestionText] = useState<Record<Language, string>>(EMPTY_SUGGESTION_TEXT);
   const [chartDaily, setChartDaily] = useState<{ date: string; revenue: number; orders: number }[]>([]);
   const [chartTopProducts, setChartTopProducts] = useState<{ name: string; revenue: number; orders: number }[]>([]);
   const [chartPeriod, setChartPeriod] = useState<'week' | 'month' | 'all'>('week');
@@ -461,8 +464,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   };
 
   const handleAddSuggestion = async () => {
-    if (!newSuggestionText.trim()) {
-      showNotification(null, 'Vui lòng nhập nội dung câu gợi ý');
+    if (Object.values(newSuggestionText).some((v) => !v.trim())) {
+      showNotification(null, 'Vui lòng nhập nội dung câu gợi ý cho đủ cả 4 ngôn ngữ');
       return;
     }
     setIsAddingSuggestion(true);
@@ -470,12 +473,12 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       const res = await fetch('/api/admin/review-comment-suggestions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: newSuggestionText.trim() }),
+        body: JSON.stringify({ text: newSuggestionText }),
       });
       const data = await res.json();
       if (res.ok) {
         setReviewSuggestions((prev) => [...prev, data.suggestion]);
-        setNewSuggestionText('');
+        setNewSuggestionText(EMPTY_SUGGESTION_TEXT);
         showNotification('✅ Đã thêm câu gợi ý đánh giá');
       } else {
         showNotification(null, data.error || 'Lỗi thêm câu gợi ý');
@@ -488,15 +491,15 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   };
 
   const handleSaveEditedSuggestion = async (id: string) => {
-    if (!editingSuggestionText.trim()) {
-      showNotification(null, 'Nội dung câu gợi ý không được để trống');
+    if (Object.values(editingSuggestionText).some((v) => !v.trim())) {
+      showNotification(null, 'Nội dung câu gợi ý không được để trống ở bất kỳ ngôn ngữ nào');
       return;
     }
     try {
       const res = await fetch(`/api/admin/review-comment-suggestions/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: editingSuggestionText.trim() }),
+        body: JSON.stringify({ text: editingSuggestionText }),
       });
       const data = await res.json();
       if (res.ok) {
@@ -1472,7 +1475,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
             {/* Categories Table */}
             <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
-              <table className="w-full text-left text-xs">
+              <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs min-w-[640px]">
                 <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
                   <tr>
                     <th className="p-3">Biểu tượng</th>
@@ -1526,12 +1530,13 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   })}
                 </tbody>
               </table>
+              </div>
             </div>
 
             {/* Modal Add Category */}
             {showAddCatModal && (
               <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                <div className="bg-[#eceeed] dark:bg-[#23252a] border border-purple-500/50 rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4">
+                <div className="bg-[#eceeed] dark:bg-[#23252a] border border-purple-500/50 rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
                   <div className="flex items-center justify-between pb-2 border-b border-[#e0e4e2] dark:border-[#33363e]">
                     <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
                       {editingCatId ? <Edit3 className="w-4 h-4 text-purple-600 dark:text-purple-400" /> : <FolderPlus className="w-4 h-4 text-purple-600 dark:text-purple-400" />}
@@ -1632,15 +1637,15 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 <p className="text-xs text-slate-600 dark:text-slate-400">Danh sách sản phẩm tài khoản số đang bày bán</p>
               </div>
 
-              <div className="flex items-center gap-2">
-                <div className="relative">
+              <div className="flex items-center gap-2 flex-wrap">
+                <div className="relative flex-1 min-w-[140px]">
                   <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-600 dark:text-slate-400" />
                   <input
                     type="text"
                     value={productSearch}
                     onChange={(e) => setProductSearch(e.target.value)}
                     placeholder="Tìm sản phẩm..."
-                    className="bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-purple-500"
+                    className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-purple-500"
                   />
                 </div>
                 <button
@@ -1655,7 +1660,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
             {/* Products Table */}
             <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
-              <table className="w-full text-left text-xs">
+              <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs min-w-[640px]">
                 <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
                   <tr>
                     <th className="p-3">Sản phẩm</th>
@@ -1759,12 +1765,13 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                     })}
                 </tbody>
               </table>
+              </div>
             </div>
 
             {/* Modal Add Product */}
             {showAddProdModal && (
               <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                <div className="bg-[#eceeed] dark:bg-[#23252a] border border-purple-500/50 rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4">
+                <div className="bg-[#eceeed] dark:bg-[#23252a] border border-purple-500/50 rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
                   <div className="flex items-center justify-between pb-2 border-b border-[#e0e4e2] dark:border-[#33363e]">
                     <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
                       {editingProdId ? <Edit3 className="w-4 h-4 text-purple-600 dark:text-purple-400" /> : <PlusCircle className="w-4 h-4 text-purple-600 dark:text-purple-400" />}
@@ -1786,7 +1793,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                       />
                     </div>
 
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                       <div>
                         <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Danh mục:</label>
                         <select
@@ -1895,7 +1902,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
                   {/* Existing variants list */}
                   <div className="bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-xl overflow-hidden">
-                    <table className="w-full text-left text-xs">
+                    <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs min-w-[640px]">
                       <thead className="bg-[#e9ece9] dark:bg-[#17191d] text-slate-600 dark:text-slate-400 border-b border-[#dee2e0] dark:border-[#363a43]">
                         <tr>
                           <th className="p-2.5">Tên biến thể</th>
@@ -1960,6 +1968,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                         })}
                       </tbody>
                     </table>
+              </div>
                   </div>
 
                   {/* Add / Edit variant form */}
@@ -1987,7 +1996,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                       />
                     </div>
 
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                       <div>
                         <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Giá bán ($):</label>
                         <input
@@ -2051,15 +2060,15 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 <p className="text-xs text-slate-600 dark:text-slate-400">Phân quyền CTV (chiết khấu sỉ), Admin, hoặc nạp/trừ số dư</p>
               </div>
 
-              <div className="flex items-center gap-2">
-                <div className="relative">
+              <div className="flex items-center gap-2 flex-wrap">
+                <div className="relative flex-1 min-w-[140px]">
                   <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-600 dark:text-slate-400" />
                   <input
                     type="text"
                     value={userSearch}
                     onChange={(e) => setUserSearch(e.target.value)}
                     placeholder="Tìm tên/email..."
-                    className="bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-purple-500"
+                    className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-purple-500"
                   />
                 </div>
                 <button
@@ -2081,7 +2090,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
               return (
                 <>
             <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
-              <table className="w-full text-left text-xs">
+              <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs min-w-[640px]">
                 <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
                   <tr>
                     <th className="p-3">Tài khoản</th>
@@ -2190,6 +2200,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                     ))}
                 </tbody>
               </table>
+              </div>
             </div>
 
             {/* Pagination */}
@@ -2223,7 +2234,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
             {/* Modal Add User */}
             {showAddUserModal && (
               <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                <div className="bg-[#eceeed] dark:bg-[#23252a] border border-purple-500/50 rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4">
+                <div className="bg-[#eceeed] dark:bg-[#23252a] border border-purple-500/50 rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
                   <div className="flex items-center justify-between pb-2 border-b border-[#e0e4e2] dark:border-[#33363e]">
                     <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
                       <Users className="w-4 h-4 text-purple-600 dark:text-purple-400" />
@@ -2257,7 +2268,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                       />
                     </div>
 
-                    <div className="grid grid-cols-2 gap-2">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                       <div>
                         <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Quyền hạn:</label>
                         <select
@@ -2475,7 +2486,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                                 {variant?.name || variantId}
                               </div>
                               <div className="max-h-64 overflow-y-auto">
-                                <table className="w-full text-left text-xs">
+                                <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs min-w-[640px]">
                                   <tbody className="divide-y divide-[#e4e8e7] dark:divide-[#2d3036] font-mono text-[11px]">
                                     {sortedItems.map((item) => (
                                       <tr key={item.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34]">
@@ -2491,6 +2503,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                                     ))}
                                   </tbody>
                                 </table>
+              </div>
                               </div>
                             </div>
                           );
@@ -2540,7 +2553,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 <p className="text-xs text-slate-600 dark:text-slate-400">Toàn bộ đơn hàng trên sàn — tìm theo mã đơn/khách/sản phẩm, hoàn tiền khi cần</p>
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <select
                   value={orderStatusFilter}
                   onChange={(e) => setOrderStatusFilter(e.target.value as 'all' | 'completed' | 'refunded')}
@@ -2550,14 +2563,14 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   <option value="completed">Hoàn thành</option>
                   <option value="refunded">Đã hoàn tiền</option>
                 </select>
-                <div className="relative">
+                <div className="relative flex-1 min-w-[140px]">
                   <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-600 dark:text-slate-400" />
                   <input
                     type="text"
                     value={orderSearch}
                     onChange={(e) => setOrderSearch(e.target.value)}
                     placeholder="Tìm mã đơn/khách/sản phẩm..."
-                    className="bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-purple-500"
+                    className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-purple-500"
                   />
                 </div>
               </div>
@@ -2586,7 +2599,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                     </div>
                   ) : (
                     <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
-                      <table className="w-full text-left text-xs">
+                      <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs min-w-[640px]">
                         <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
                           <tr>
                             <th className="p-3">Mã đơn</th>
@@ -2643,6 +2657,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                           ))}
                         </tbody>
                       </table>
+              </div>
                     </div>
                   )}
 
@@ -2875,8 +2890,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   Hiện tại không có yêu cầu rút tiền nào từ CTV.
                 </div>
               ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left text-xs">
+                  <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs min-w-[640px]">
                     <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
                       <tr>
                         <th className="p-3">Mã đơn</th>
@@ -2966,7 +2981,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                       ))}
                     </tbody>
                   </table>
-                </div>
+              </div>
               )}
             </div>
           </div>
@@ -3072,7 +3087,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
             {/* Vouchers table */}
             <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
-              <table className="w-full text-left text-xs">
+              <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs min-w-[640px]">
                 <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
                   <tr>
                     <th className="p-3">Mã</th>
@@ -3143,6 +3159,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   )}
                 </tbody>
               </table>
+              </div>
             </div>
           </div>
         )}
@@ -3161,19 +3178,28 @@ export const AdminPage: React.FC<AdminPageProps> = ({
             </div>
 
             <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl p-4 space-y-2.5">
-              <div className="flex flex-col sm:flex-row gap-2">
-                <input
-                  type="text"
-                  value={newSuggestionText}
-                  onChange={(e) => setNewSuggestionText(e.target.value)}
-                  placeholder="Nhập câu gợi ý mới..."
-                  maxLength={300}
-                  className="flex-1 bg-[#f3f5f4] dark:bg-[#181a1e] border border-[#e0e4e2] dark:border-[#33363e] focus:border-emerald-500 rounded-lg px-3 py-2 text-xs text-slate-800 dark:text-slate-200 placeholder-slate-500 dark:placeholder-slate-500 focus:outline-none transition"
-                />
+              <div className="space-y-1.5">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                  {(Object.keys(SUGGESTION_LANGUAGE_LABELS) as Language[]).map((lang) => (
+                    <div key={lang} className="flex items-center gap-1.5">
+                      <span className="w-7 flex-shrink-0 text-[10px] font-bold text-slate-500 dark:text-slate-500">
+                        {SUGGESTION_LANGUAGE_LABELS[lang]}
+                      </span>
+                      <input
+                        type="text"
+                        value={newSuggestionText[lang]}
+                        onChange={(e) => setNewSuggestionText((prev) => ({ ...prev, [lang]: e.target.value }))}
+                        placeholder={`Câu gợi ý (${SUGGESTION_LANGUAGE_LABELS[lang]})...`}
+                        maxLength={300}
+                        className="flex-1 bg-[#f3f5f4] dark:bg-[#181a1e] border border-[#e0e4e2] dark:border-[#33363e] focus:border-emerald-500 rounded-lg px-3 py-2 text-xs text-slate-800 dark:text-slate-200 placeholder-slate-500 dark:placeholder-slate-500 focus:outline-none transition"
+                      />
+                    </div>
+                  ))}
+                </div>
                 <button
                   onClick={handleAddSuggestion}
                   disabled={isAddingSuggestion}
-                  className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs px-4 py-2 rounded-lg transition disabled:opacity-50 flex items-center justify-center gap-1.5 flex-shrink-0"
+                  className="w-full sm:w-auto bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs px-4 py-2 rounded-lg transition disabled:opacity-50 flex items-center justify-center gap-1.5"
                 >
                   <PlusCircle className="w-3.5 h-3.5" />
                   <span>Thêm</span>
@@ -3187,34 +3213,52 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   reviewSuggestions.map((s) => (
                     <div
                       key={s.id}
-                      className="flex items-center gap-2 bg-[#f3f5f4] dark:bg-[#181a1e] border border-[#e0e4e2] dark:border-[#33363e] rounded-lg px-3 py-2"
+                      className="flex items-start gap-2 bg-[#f3f5f4] dark:bg-[#181a1e] border border-[#e0e4e2] dark:border-[#33363e] rounded-lg px-3 py-2"
                     >
                       {editingSuggestionId === s.id ? (
                         <>
-                          <input
-                            type="text"
-                            value={editingSuggestionText}
-                            onChange={(e) => setEditingSuggestionText(e.target.value)}
-                            maxLength={300}
-                            className="flex-1 bg-[#eceeed] dark:bg-[#23252a] border border-emerald-500/40 rounded px-2 py-1 text-xs text-slate-800 dark:text-slate-200 focus:outline-none"
-                          />
+                          <div className="flex-1 space-y-1">
+                            {(Object.keys(SUGGESTION_LANGUAGE_LABELS) as Language[]).map((lang) => (
+                              <div key={lang} className="flex items-center gap-1.5">
+                                <span className="w-7 flex-shrink-0 text-[10px] font-bold text-slate-500 dark:text-slate-500">
+                                  {SUGGESTION_LANGUAGE_LABELS[lang]}
+                                </span>
+                                <input
+                                  type="text"
+                                  value={editingSuggestionText[lang]}
+                                  onChange={(e) => setEditingSuggestionText((prev) => ({ ...prev, [lang]: e.target.value }))}
+                                  maxLength={300}
+                                  className="flex-1 bg-[#eceeed] dark:bg-[#23252a] border border-emerald-500/40 rounded px-2 py-1 text-xs text-slate-800 dark:text-slate-200 focus:outline-none"
+                                />
+                              </div>
+                            ))}
+                          </div>
                           <button
                             onClick={() => handleSaveEditedSuggestion(s.id)}
-                            className="text-emerald-600 dark:text-emerald-400 hover:text-emerald-700 hover:dark:text-emerald-300 flex-shrink-0"
+                            className="text-emerald-600 dark:text-emerald-400 hover:text-emerald-700 hover:dark:text-emerald-300 flex-shrink-0 mt-1.5"
                             title="Lưu"
                           >
                             <Check className="w-4 h-4" />
                           </button>
                           <button
                             onClick={() => setEditingSuggestionId(null)}
-                            className="text-slate-500 dark:text-slate-500 hover:text-slate-800 hover:dark:text-slate-200 flex-shrink-0 text-[11px] font-semibold"
+                            className="text-slate-500 dark:text-slate-500 hover:text-slate-800 hover:dark:text-slate-200 flex-shrink-0 text-[11px] font-semibold mt-1.5"
                           >
                             Hủy
                           </button>
                         </>
                       ) : (
                         <>
-                          <span className="flex-1 text-xs text-slate-800 dark:text-slate-200">{s.text}</span>
+                          <div className="flex-1 space-y-0.5">
+                            {(Object.keys(SUGGESTION_LANGUAGE_LABELS) as Language[]).map((lang) => (
+                              <div key={lang} className="flex items-baseline gap-1.5">
+                                <span className="w-7 flex-shrink-0 text-[10px] font-bold text-slate-500 dark:text-slate-500">
+                                  {SUGGESTION_LANGUAGE_LABELS[lang]}
+                                </span>
+                                <span className="text-xs text-slate-800 dark:text-slate-200">{s.text[lang]}</span>
+                              </div>
+                            ))}
+                          </div>
                           <button
                             onClick={() => {
                               setEditingSuggestionId(s.id);
@@ -3301,7 +3345,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 <button onClick={() => setEditingCryptoOptId(null)} className="text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100">✕</button>
               </div>
               <div className="space-y-3 text-xs">
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   <div>
                     <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Icon:</label>
                     <input type="text" value={cryptoOptForm.icon || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, icon: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:border-purple-500 focus:outline-none" />
@@ -3332,7 +3376,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Explorer TX URL:</label>
                   <input type="text" value={cryptoOptForm.explorerTxUrl || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, explorerTxUrl: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-purple-500 focus:outline-none" />
                 </div>
-                <div className="grid grid-cols-3 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   <div>
                     <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Decimals:</label>
                     <input type="number" value={cryptoOptForm.decimals ?? 18} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, decimals: Number(e.target.value) })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-purple-500 focus:outline-none" />
@@ -3364,7 +3408,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 <button onClick={() => setShowAddCryptoOptModal(false)} className="text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100">✕</button>
               </div>
               <div className="space-y-3 text-xs">
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   <div>
                     <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Icon:</label>
                     <input type="text" value={cryptoOptForm.icon || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, icon: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:border-emerald-500 focus:outline-none" />
@@ -3394,7 +3438,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Explorer TX URL:</label>
                   <input type="text" value={cryptoOptForm.explorerTxUrl || ''} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, explorerTxUrl: e.target.value })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-emerald-500 focus:outline-none" />
                 </div>
-                <div className="grid grid-cols-3 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   <div>
                     <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Decimals:</label>
                     <input type="number" value={cryptoOptForm.decimals ?? 18} onChange={(e) => setCryptoOptForm({ ...cryptoOptForm, decimals: Number(e.target.value) })} className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-emerald-500 focus:outline-none" />

@@ -1411,7 +1411,8 @@ export const CtvPage: React.FC<CtvPageProps> = ({
             </div>
 
             <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
-              <table className="w-full text-left text-xs">
+              <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs min-w-[640px]">
                 <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
                   <tr>
                     <th className="p-3">Sản phẩm</th>
@@ -1497,6 +1498,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
                   })}
                 </tbody>
               </table>
+              </div>
             </div>
           </div>
         )}
@@ -1510,7 +1512,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
                 <p className="text-xs text-slate-600 dark:text-slate-400">Đơn hàng thuộc các sản phẩm bạn đăng bán — tìm theo mã đơn/khách/sản phẩm, hoàn tiền khi cần</p>
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <select
                   value={orderStatusFilter}
                   onChange={(e) => setOrderStatusFilter(e.target.value as 'all' | 'completed' | 'refunded')}
@@ -1520,14 +1522,14 @@ export const CtvPage: React.FC<CtvPageProps> = ({
                   <option value="completed">Hoàn thành</option>
                   <option value="refunded">Đã hoàn tiền</option>
                 </select>
-                <div className="relative">
+                <div className="relative flex-1 min-w-[140px]">
                   <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-600 dark:text-slate-400" />
                   <input
                     type="text"
                     value={orderSearch}
                     onChange={(e) => setOrderSearch(e.target.value)}
                     placeholder="Tìm mã đơn/khách/sản phẩm..."
-                    className="bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-amber-500"
+                    className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-amber-500"
                   />
                 </div>
               </div>
@@ -1556,7 +1558,8 @@ export const CtvPage: React.FC<CtvPageProps> = ({
                     </div>
                   ) : (
                     <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
-                      <table className="w-full text-left text-xs">
+                      <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs min-w-[640px]">
                         <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
                           <tr>
                             <th className="p-3">Mã đơn</th>
@@ -1613,6 +1616,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
                           ))}
                         </tbody>
                       </table>
+              </div>
                     </div>
                   )}
 
@@ -1745,7 +1749,8 @@ export const CtvPage: React.FC<CtvPageProps> = ({
 
             {/* Vouchers table */}
             <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
-              <table className="w-full text-left text-xs">
+              <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs min-w-[640px]">
                 <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
                   <tr>
                     <th className="p-3">Mã</th>
@@ -1814,6 +1819,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
                   )}
                 </tbody>
               </table>
+              </div>
             </div>
           </div>
         )}
@@ -1880,7 +1886,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
           fields a CTV can touch on an existing listing after creation. */}
       {editingDescProductId && (
         <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-[#eceeed] dark:bg-[#23252a] border border-amber-500/50 rounded-2xl max-w-lg w-full p-5 shadow-2xl space-y-4">
+          <div className="bg-[#eceeed] dark:bg-[#23252a] border border-amber-500/50 rounded-2xl max-w-lg w-full p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between pb-2 border-b border-[#e0e4e2] dark:border-[#33363e]">
               <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">Sửa Mô Tả Sản Phẩm</h3>
               <button
@@ -1944,7 +1950,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
           the storefront without touching its inventory. */}
       {variantsModalProduct && (
         <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-[#eceeed] dark:bg-[#23252a] border border-amber-500/50 rounded-2xl max-w-lg w-full p-5 shadow-2xl space-y-4">
+          <div className="bg-[#eceeed] dark:bg-[#23252a] border border-amber-500/50 rounded-2xl max-w-lg w-full p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between pb-2 border-b border-[#e0e4e2] dark:border-[#33363e]">
               <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
                 Biến Thể Của "{variantsModalProduct.name}"

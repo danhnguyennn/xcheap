@@ -383,16 +383,11 @@ export const Header: React.FC<HeaderProps> = ({
                   <div className="text-emerald-600 dark:text-emerald-400 font-mono font-bold text-sm mt-1">
                     ${formatMoney(user.balance)}
                   </div>
-                  {(user.role !== 'user' || user.discountPercent > 0 || (user.vipDiscountPercent || 0) > 0) && (
+                  {(user.role !== 'user' || (user.vipDiscountPercent || 0) > 0) && (
                     <div className="mt-1 flex items-center gap-1.5">
                       {user.role !== 'user' && (
                         <span className="px-1.5 py-0.5 rounded text-[10px] font-bold uppercase bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/40">
                           {user.role}
-                        </span>
-                      )}
-                      {user.discountPercent > 0 && (
-                        <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-semibold">
-                          -{user.discountPercent}% {t.discountLabel}
                         </span>
                       )}
                       {user.role === 'user' && (user.vipDiscountPercent || 0) > 0 && (
