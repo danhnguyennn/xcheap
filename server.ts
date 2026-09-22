@@ -109,20 +109,23 @@ const registerRateLimiter = rateLimit({
 // requests, not across restarts (a restart has no in-flight requests to race).
 const depositCheckInProgress = new Set<string>();
 
-// "Online now" count for the admin dashboard — every open tab (logged in or
-// guest) pings this every ~20s with a random id it generated once and kept
-// in localStorage, so the same visitor across multiple tabs still counts as
-// one person. In-memory by design: this is a live "right now" figure, not
-// historical data worth persisting across a restart.
+// "Online now" count for the admin dashboard — keyed by real account id
+// (from the session, not a client-supplied value), so the same account open
+// across several tabs/browsers/devices still only ever counts once, and a
+// guest with no session never counts at all. This also closes what the old
+// client-generated-visitorId design let anyone do: spam the ping endpoint
+// with random ids to inflate the count arbitrarily — a session can't be
+// forged the same way. In-memory by design: this is a live "right now"
+// figure, not historical data worth persisting across a restart.
 const ONLINE_WINDOW_MS = 60 * 1000;
-const lastSeenByVisitor = new Map<string, number>();
+const lastSeenByUserId = new Map<string, number>();
 
-function countOnlineVisitors(): number {
+function countOnlineUsers(): number {
   const cutoff = Date.now() - ONLINE_WINDOW_MS;
   let count = 0;
-  for (const [visitorId, lastSeen] of lastSeenByVisitor) {
+  for (const [userId, lastSeen] of lastSeenByUserId) {
     if (lastSeen < cutoff) {
-      lastSeenByVisitor.delete(visitorId);
+      lastSeenByUserId.delete(userId);
     } else {
       count++;
     }
@@ -2497,20 +2500,21 @@ app.get('/api/admin/stats', requireRole('admin'), async (req, res) => {
   });
 });
 
-// Presence ping — called every ~20s by every open tab (see App.tsx), guest
-// or logged in, with a random id that tab generated once and stashed in
-// localStorage. No auth required: guests count toward "online now" too.
-app.post('/api/presence/ping', (req, res) => {
-  const { visitorId } = req.body;
-  if (typeof visitorId === 'string' && visitorId.length > 0 && visitorId.length <= 100) {
-    lastSeenByVisitor.set(visitorId, Date.now());
+// Presence ping — called every ~20s by every open tab (see App.tsx). Stays
+// public (no requireAuth) so a guest tab's ping doesn't throw a 401 every
+// 20s; it simply records nothing when there's no session. Only a real
+// logged-in account ever counts toward "online now".
+app.post('/api/presence/ping', async (req, res) => {
+  const user = await getSessionUser(req);
+  if (user) {
+    lastSeenByUserId.set(user.id, Date.now());
   }
   res.json({ ok: true });
 });
 
 // Admin-only — polled every ~20s by the admin dashboard (see AdminPage.tsx).
 app.get('/api/admin/online-count', requireRole('admin'), (req, res) => {
-  res.json({ count: countOnlineVisitors() });
+  res.json({ count: countOnlineUsers() });
 });
 
 // 17b. Admin Chart Stats — revenue/orders bucketed by the requested period

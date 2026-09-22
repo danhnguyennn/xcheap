@@ -268,27 +268,14 @@ export default function App() {
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
 
-  // Presence heartbeat for the admin "online now" stat — every tab (guest or
-  // logged in) pings every 20s with a per-browser id kept in localStorage,
-  // so several tabs from the same visitor still only count as one person.
+  // Presence heartbeat for the admin "online now" stat — every tab pings
+  // every 20s; the server identifies the account from the session cookie
+  // itself (see POST /api/presence/ping), so there's no client-side id to
+  // generate or store here anymore. A guest tab still pings on the same
+  // schedule, it just doesn't count toward anything server-side.
   useEffect(() => {
-    let visitorId: string;
-    try {
-      visitorId = localStorage.getItem('xcheap_visitor_id') || '';
-      if (!visitorId) {
-        visitorId = crypto.randomUUID();
-        localStorage.setItem('xcheap_visitor_id', visitorId);
-      }
-    } catch {
-      visitorId = crypto.randomUUID(); // private-window localStorage may throw — still ping, just not persisted
-    }
-
     const ping = () => {
-      fetch('/api/presence/ping', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ visitorId }),
-      }).catch(() => {});
+      fetch('/api/presence/ping', { method: 'POST' }).catch(() => {});
     };
     ping();
     const interval = setInterval(ping, 20000);
