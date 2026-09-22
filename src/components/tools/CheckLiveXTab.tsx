@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { ShieldCheck, Copy, Check, Play, Square } from 'lucide-react';
+import { ShieldCheck, Copy, Check, Play, Square, Upload, Download } from 'lucide-react';
 import { Language } from '../../types';
 import { translations } from '../../locales/translations';
 import { parseXTokens } from './GetCookieXTab';
@@ -161,6 +161,38 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
     setIsRunning(false);
   };
 
+  // Reads a .txt file and merges its lines into whatever's already pasted in
+  // — same behavior as the account-upload buttons on the CTV stock pages —
+  // rather than replacing it, so a file can be added on top of manual pastes.
+  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const fileText = String(reader.result || '').trim();
+      setInputRaw((prev) => (prev.trim() ? prev.trim() + '\n' + fileText : fileText));
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  // Downloads whatever the active status filter currently shows (ALL by
+  // default), so the file always matches what's on screen instead of always
+  // being the full unfiltered list.
+  const handleDownloadResults = () => {
+    if (filteredResults.length === 0) return;
+    const text = filteredResults.map((r) => r.outputLine).join('\n');
+    const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `CheckLiveX_${filter}_${Date.now()}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
   const handleCopyLine = (text: string, idx: number) => {
     navigator.clipboard.writeText(text);
     setCopiedLineIdx(idx);
@@ -240,26 +272,33 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
     <div className="space-y-3.5">
       {/* Input area */}
       <div>
-        <div className="flex items-center justify-between gap-2 mb-1">
+        <div className="flex items-center justify-between gap-2 mb-1 flex-wrap">
           <label className="font-bold text-slate-800 dark:text-slate-200 text-xs flex items-center gap-1.5">
             <ShieldCheck className="w-3.5 h-3.5 text-emerald-500" />
             <span>Danh sách tài khoản X (Twitter) cần kiểm tra:</span>
           </label>
-          <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
-            {lines.length} dòng
-          </span>
+          <div className="flex items-center gap-2">
+            <label className="flex items-center gap-1.5 text-[11px] font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 px-2.5 py-1 rounded-lg cursor-pointer transition">
+              <Upload className="w-3.5 h-3.5" />
+              <span>Tải file .txt</span>
+              <input type="file" accept=".txt" onChange={handleFileSelect} disabled={isRunning} className="hidden" />
+            </label>
+            <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
+              {lines.length} dòng
+            </span>
+          </div>
         </div>
 
         <textarea
           rows={5}
           value={inputRaw}
           onChange={(e) => setInputRaw(e.target.value)}
-          placeholder={`username|password|2fa|oauth_token|oauth_token_secret\noauth_token|oauth_token_secret\nusername`}
+          placeholder={`username\nusername\nusername`}
           disabled={isRunning}
           className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl p-3 font-mono text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-500 disabled:opacity-60"
         />
         <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
-          Hỗ trợ: <code className="text-emerald-700 dark:text-emerald-300 font-mono">username|password|2fa|oauth_token|oauth_secret</code>, <code className="text-emerald-700 dark:text-emerald-300 font-mono">oauth_token|oauth_secret</code>, hoặc <code className="text-emerald-700 dark:text-emerald-300 font-mono">username</code>.
+          Định dạng: <code className="text-emerald-700 dark:text-emerald-300 font-mono">username</code>, mỗi tài khoản 1 dòng
         </p>
       </div>
 
@@ -461,6 +500,15 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
                   </>
                 )}
               </button>
+
+              <button
+                onClick={handleDownloadResults}
+                className="text-slate-700 dark:text-slate-300 hover:text-slate-900 hover:dark:text-slate-100 text-xs font-semibold flex items-center gap-1.5 bg-[#f2f4f3] dark:bg-[#1a1b1f] px-2.5 py-1.5 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] cursor-pointer"
+                title="Tải xuống kết quả đang lọc (.txt)"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Tải Xuống ({filteredResults.length})</span>
+              </button>
             </div>
           </div>
 
@@ -475,8 +523,9 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
               return (
                 <div
                   key={idx}
-                  className="flex items-center gap-2 px-2.5 py-2 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] bg-[#fafcfb] dark:bg-[#181a1e] hover:border-emerald-500/30 transition text-xs group"
+                  className="flex flex-col gap-1 px-2.5 py-2 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] bg-[#fafcfb] dark:bg-[#181a1e] hover:border-emerald-500/30 transition text-xs group"
                 >
+                  <div className="flex items-center gap-2">
                   <span className="font-mono text-[10px] text-slate-500 dark:text-slate-400 bg-[#e7ebe9] dark:bg-[#282a30] px-1.5 py-0.5 rounded font-bold flex-shrink-0">
                     #{item.id}
                   </span>
@@ -533,6 +582,17 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
                       <Copy className="w-3.5 h-3.5" />
                     )}
                   </button>
+                  </div>
+
+                  {/* Same follower/following/post stats shown inline on sm+
+                      (span above) — on mobile there's no room for them in the
+                      row, so they drop to their own line here instead of
+                      disappearing entirely. */}
+                  {item.reason && (
+                    <div className="sm:hidden pl-1 text-[10px] text-slate-500 dark:text-slate-400 font-mono break-words">
+                      {item.reason}
+                    </div>
+                  )}
                 </div>
               );
             })}

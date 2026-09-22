@@ -14,7 +14,7 @@ import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { twitterChecker } from './server/twitterChecker';
 
 const app = express();
-const PORT = 3000;
+const PORT = 3434;
 
 // The app is only ever reached through cloudflared (see docker-compose.yml —
 // no host port is published), so trusting exactly one hop of X-Forwarded-*
@@ -3389,7 +3389,7 @@ app.post('/api/tools/x-get-cookie', async (req, res) => {
     // Clean and split raw line
     const rawParts = raw ? raw.split('|').map((s: string) => s.trim()).filter(Boolean) : [];
     const parts = rawParts.filter(
-      (p) => !p.includes(';') && !p.toLowerCase().includes('auth_token=') && !p.toLowerCase().includes('ct0=')
+      (p: string) => !p.includes(';') && !p.toLowerCase().includes('auth_token=') && !p.toLowerCase().includes('ct0=')
     );
 
     // Extract username if available

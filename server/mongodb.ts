@@ -258,6 +258,13 @@ export class MongoDBEngine {
   private collections: Map<string, MongoCollection<any>> = new Map();
   private legacyJsonDir: string;
   public isConnected: boolean = false;
+  // server.ts calls init() from two independent startup paths (seeding in
+  // initializeDatabase(), then again before app.listen() in start()) — both
+  // need the connection ready, but without this guard each call opened its
+  // own MongoClient, doubling every startup log line and leaking the first
+  // client. Caching the in-flight/completed promise makes every caller after
+  // the first just await the same connection instead of reconnecting.
+  private initPromise: Promise<void> | null = null;
 
   constructor(uri: string, dbName: string, legacyJsonDir: string) {
     this.uri = uri;
@@ -275,6 +282,13 @@ export class MongoDBEngine {
   }
 
   public async init(): Promise<void> {
+    if (!this.initPromise) {
+      this.initPromise = this.connect();
+    }
+    return this.initPromise;
+  }
+
+  private async connect(): Promise<void> {
     if (process.env.MONGODB_URI) {
       try {
         console.log(`[MongoDB] Attempting connection to ${this.uri}...`);

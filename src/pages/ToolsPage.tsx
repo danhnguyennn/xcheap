@@ -810,7 +810,7 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
                   rows={4}
                   value={hotmailTokensInput}
                   onChange={(e) => setHotmailTokensInput(e.target.value)}
-                  placeholder={`email|pass|refresh_token|client_id\nemail|refresh_token\nemail|pass|refresh_token\nrefresh_token`}
+                  placeholder={`email|pass|refresh_token|client_id\nemail|pass|refresh_token|client_id`}
                   className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl p-3 font-mono text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-500"
                 />
 

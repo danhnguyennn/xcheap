@@ -406,7 +406,7 @@ export const EmailReaderTab: React.FC<EmailReaderTabProps> = ({ language }) => {
           rows={5}
           value={inputText}
           onChange={(e) => setInputText(e.target.value)}
-          placeholder={`user1@hotmail.com|PassWord#123|M.C543_BAY.0.U.-token1...|000000004017045b\nuser2@outlook.com|Secr3t#456|M.C543_BAY.0.U.-token2...|000000004017045b`}
+          placeholder={`user1@hotmail.com|PassWord#123|M.C543_BAY.0.U.-token1...|9e5f94bc-e8a4-4e73-b8be-63364c29d753\nuser2@outlook.com|Secr3t#456|M.C543_BAY.0.U.-token2...|9e5f94bc-e8a4-4e73-b8be-63364c29d753`}
           className="w-full bg-[#f8faf9] dark:bg-[#16181b] border border-[#dce0df] dark:border-[#30333b] rounded-xl p-3 font-mono text-[11px] text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-500 leading-relaxed shadow-inner"
         />
 

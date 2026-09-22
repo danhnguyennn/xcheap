@@ -239,7 +239,7 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
     <div className="space-y-3.5">
       {/* Input area */}
       <div>
-        <div className="flex items-center justify-between gap-2 mb-1">
+        <div className="flex items-center justify-between gap-2 mb-1 flex-wrap">
           <label className="font-bold text-slate-800 dark:text-slate-200 text-xs flex items-center gap-1.5">
             <Cookie className="w-3.5 h-3.5 text-amber-500" />
             <span>Danh sách tài khoản X (Twitter):</span>
@@ -253,12 +253,12 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
           rows={4}
           value={inputRaw}
           onChange={(e) => setInputRaw(e.target.value)}
-          placeholder={`username|password|2fa|oauth_token|oauth_token_secret\noauth_token|oauth_token_secret`}
+          placeholder={`username|oauth_token|oauth_token_secret\nusername|oauth_token|oauth_token_secret\nusername|oauth_token|oauth_token_secret`}
           disabled={isRunning}
           className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl p-3 font-mono text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-500 disabled:opacity-60"
         />
         <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
-          Định dạng: <code className="text-emerald-700 dark:text-emerald-300 font-mono">username|pass|2fa|oauth_token|oauth_token_secret</code> hoặc <code className="text-emerald-700 dark:text-emerald-300 font-mono">oauth_token|oauth_token_secret</code>.
+          Định dạng: <code className="text-emerald-700 dark:text-emerald-300 font-mono">username|oauth_token|oauth_token_secret</code>, mỗi tài khoản 1 dòng
         </p>
       </div>
 
@@ -301,7 +301,7 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
       {results.length > 0 && (
         <div className="space-y-2.5 pt-2 border-t border-[#e2e6e5] dark:border-[#30333b]">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <span className="text-xs font-bold text-slate-900 dark:text-slate-100">
                 Kết Quả Get Cookie:
               </span>
@@ -315,7 +315,7 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
               )}
             </div>
 
-            <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-1.5 flex-wrap">
               {successCount > 0 && (
                 <button
                   onClick={handleCopyOnlyCookies}
@@ -391,7 +391,7 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
                   </span>
 
                   <span
-                    className={`text-[10px] font-bold px-1.5 py-0.5 rounded flex-shrink-0 ${
+                    className={`text-[10px] font-bold px-1.5 py-0.5 rounded flex-shrink-0 whitespace-nowrap ${
                       isSuccess
                         ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30'
                         : isProcessing
