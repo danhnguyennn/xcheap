@@ -11,9 +11,10 @@ import { sessionMiddleware, getSessionUser, requireAuth, requireRole, hashPasswo
 import { ethers } from 'ethers';
 import helmet from 'helmet';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
+import { twitterChecker } from './server/twitterChecker';
 
 const app = express();
-const PORT = 3434;
+const PORT = 3000;
 
 // The app is only ever reached through cloudflared (see docker-compose.yml —
 // no host port is published), so trusting exactly one hop of X-Forwarded-*
@@ -3272,8 +3273,265 @@ app.post("/api/renew_token", async (req, res) => {
   }
 });
 
+// Helper for signing Twitter OAuth 1.0a requests
+function generateTwitterOAuthHeader(
+  url: string,
+  method: string,
+  oauthToken: string,
+  oauthTokenSecret: string,
+  consumerKey = '3nVuSoBZnx6U4vzUxf5w',
+  consumerSecret = 'Bcs59EFbbsdF6Sl9Ng71smgStWEGwXXKSjYvPVt7qys'
+): string {
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const oauthParams: Record<string, string> = {
+    oauth_consumer_key: consumerKey,
+    oauth_nonce: nonce,
+    oauth_signature_method: 'HMAC-SHA1',
+    oauth_timestamp: timestamp,
+    oauth_token: oauthToken,
+    oauth_version: '1.0',
+  };
+
+  const parsedUrl = new URL(url);
+  const baseUrl = `${parsedUrl.protocol}//${parsedUrl.host}${parsedUrl.pathname}`;
+  const allParams: Record<string, string> = { ...oauthParams };
+  parsedUrl.searchParams.forEach((value, key) => {
+    allParams[key] = value;
+  });
+
+  const sortedKeys = Object.keys(allParams).sort();
+  const paramString = sortedKeys
+    .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(allParams[k])}`)
+    .join('&');
+
+  const baseString = [
+    method.toUpperCase(),
+    encodeURIComponent(baseUrl),
+    encodeURIComponent(paramString),
+  ].join('&');
+
+  const signingKey = `${encodeURIComponent(consumerSecret)}&${encodeURIComponent(oauthTokenSecret)}`;
+  const signature = crypto
+    .createHmac('sha1', signingKey)
+    .update(baseString)
+    .digest('base64');
+
+  oauthParams.oauth_signature = signature;
+
+  const headerParts = Object.keys(oauthParams)
+    .sort()
+    .map((k) => `${encodeURIComponent(k)}="${encodeURIComponent(oauthParams[k])}"`);
+
+  return `OAuth ${headerParts.join(', ')}`;
+}
+
+// 24. Tools: X (Twitter) Check Live API using converted CheckTwitter GraphQL engine
+app.post('/api/tools/x-check-live', async (req, res) => {
+  try {
+    const { username: rawUsername, raw_line } = req.body;
+    let username = (rawUsername || '').trim();
+    const rawLine = (raw_line || '').trim();
+
+    if (!username && rawLine) {
+      const parts = rawLine.split('|').map((s: string) => s.trim()).filter(Boolean);
+      if (parts.length > 0) {
+        username = parts[0];
+      }
+    }
+    username = username.replace(/^@/, '').trim();
+
+    if (!username) {
+      return res.json({
+        isLive: false,
+        status: 'WRONG',
+        rawStatus: 'WRONG',
+        reason: 'Không tìm thấy tên người dùng (Username)',
+        username: '',
+      });
+    }
+
+    // Call the CheckTwitter GraphQL engine
+    const checkResult = await twitterChecker.checkLive(username);
+
+    return res.json({
+      isLive: checkResult.isLive,
+      status: checkResult.status,
+      rawStatus: checkResult.rawStatus,
+      reason: checkResult.reason,
+      following: checkResult.following,
+      followers: checkResult.followers,
+      post: checkResult.post,
+      created_at: checkResult.created_at,
+      username: checkResult.username || username,
+    });
+  } catch (error: any) {
+    console.error('Error in x-check-live:', error);
+    return res.status(500).json({
+      isLive: false,
+      status: 'DIE',
+      rawStatus: 'ERROR',
+      reason: error.message || 'Thất bại',
+      username: '',
+    });
+  }
+});
+
+// 25. Tools: X (Twitter) Get Cookie API using cloudflare-api.site
+app.post('/api/tools/x-get-cookie', async (req, res) => {
+  try {
+    const { username: rawUsername, oauth_token, oauth_token_secret, raw_line } = req.body;
+    let username = (rawUsername || '').trim();
+    let oauthToken = (oauth_token || '').trim();
+    let oauthTokenSecret = (oauth_token_secret || '').trim();
+    const raw = (raw_line || '').trim();
+
+    // Clean and split raw line
+    const rawParts = raw ? raw.split('|').map((s: string) => s.trim()).filter(Boolean) : [];
+    const parts = rawParts.filter(
+      (p) => !p.includes(';') && !p.toLowerCase().includes('auth_token=') && !p.toLowerCase().includes('ct0=')
+    );
+
+    // Extract username if available
+    if (!username && parts.length > 0) {
+      username = parts[0];
+    }
+    username = username.replace(/^@/, '');
+    const displayLabel = username || parts[0] || raw || 'Account';
+
+    // Extract oauthToken and oauthTokenSecret if not provided directly
+    if ((!oauthToken || !oauthTokenSecret) && parts.length >= 2) {
+      if (parts.length === 2) {
+        oauthToken = parts[0];
+        oauthTokenSecret = parts[1];
+      } else if (parts.length === 3) {
+        oauthToken = parts[1];
+        oauthTokenSecret = parts[2];
+      } else if (parts.length === 4) {
+        oauthToken = parts[2];
+        oauthTokenSecret = parts[3];
+      } else if (parts.length >= 5) {
+        oauthToken = parts[parts.length - 2];
+        oauthTokenSecret = parts[parts.length - 1];
+      }
+    }
+
+    // Call cloudflare-api.site as specified by user
+    if (oauthToken && oauthTokenSecret) {
+      try {
+        const jsonCreate = {
+          type: 'get_cookie',
+          oauth_token: oauthToken,
+          oauth_token_secret: oauthTokenSecret,
+        };
+
+        const resCreate = await fetch('https://cloudflare-api.site/createTask', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(jsonCreate),
+          signal: AbortSignal.timeout(20000),
+        });
+
+        if (!resCreate.ok) {
+          return res.json({
+            success: false,
+            error: 'Thất bại',
+            output: `${displayLabel} | Thất bại`,
+          });
+        }
+
+        const createData: any = await resCreate.json();
+        const taskId = createData?.taskId;
+
+        if (!taskId) {
+          return res.json({
+            success: false,
+            error: 'Thất bại',
+            output: `${displayLabel} | Thất bại`,
+          });
+        }
+
+        // Poll getTaskResult: max_retry = 30, interval = 2s
+        const maxRetry = 30;
+        for (let attempt = 0; attempt < maxRetry; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+
+          try {
+            const resResult = await fetch('https://cloudflare-api.site/getTaskResult', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ taskId }),
+              signal: AbortSignal.timeout(20000),
+            });
+
+            if (resResult.ok) {
+              const data: any = await resResult.json();
+
+              if (data?.status === 'ready') {
+                const cookie = data?.result?.cookies || '';
+                if (cookie) {
+                  return res.json({
+                    success: true,
+                    cookie,
+                    output: `${displayLabel} | ${cookie}`,
+                    username: displayLabel,
+                  });
+                } else {
+                  return res.json({
+                    success: false,
+                    error: 'Thất bại',
+                    output: `${displayLabel} | Thất bại`,
+                    username: displayLabel,
+                  });
+                }
+              }
+
+              if (data?.status === 'failed') {
+                return res.json({
+                  success: false,
+                  error: 'Thất bại',
+                  output: `${displayLabel} | Thất bại`,
+                });
+              }
+            }
+          } catch (pollErr: any) {
+            console.warn(`[getTaskResult] attempt ${attempt + 1} warn:`, pollErr.message);
+          }
+        }
+
+        return res.json({
+          success: false,
+          error: 'Thất bại',
+          output: `${displayLabel} | Thất bại`,
+        });
+      } catch (apiErr: any) {
+        console.error('Error contacting cloudflare-api.site:', apiErr);
+        return res.json({
+          success: false,
+          error: 'Thất bại',
+          output: `${displayLabel} | Thất bại`,
+        });
+      }
+    }
+
+    return res.json({
+      success: false,
+      error: 'Thất bại',
+      output: `${displayLabel} | Thất bại`,
+    });
+  } catch (error: any) {
+    return res.status(500).json({
+      success: false,
+      error: 'Thất bại',
+      output: `Thất bại`,
+    });
+  }
+});
+
 // Vite dev middleware or static serving
 async function start() {
+  await db.init();
+
   if (process.env.NODE_ENV !== 'production') {
     // Loaded lazily and only in dev — esbuild bundles a static top-level
     // import into an unconditional require(), which would otherwise force

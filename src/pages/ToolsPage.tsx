@@ -2,8 +2,10 @@ import React, { useEffect, useState } from 'react';
 import { TOTP, Secret } from 'otpauth';
 import { Language } from '../types';
 import { translations } from '../locales/translations';
-import { ArrowLeft, Wrench, Key, Mail, Split, Copy, Check, RefreshCw } from 'lucide-react';
+import { ArrowLeft, Wrench, Key, Mail, Split, Copy, Check, RefreshCw, ShieldCheck, Cookie, Download, Trash2, Clipboard, Sparkles } from 'lucide-react';
 import { EmailReaderTab } from '../components/tools/EmailReaderTab';
+import { CheckLiveXTab } from '../components/tools/CheckLiveXTab';
+import { GetCookieXTab } from '../components/tools/GetCookieXTab';
 
 // Real RFC 6238 TOTP — the exact same algorithm an authenticator app (Google
 // Authenticator, Authy...) runs over a secret you already hold, not a guess
@@ -26,7 +28,7 @@ function computeTotp(secretKeyRaw: string): string | null {
   }
 }
 
-type ToolKey = '2fa' | 'splitter' | 'email' | 'renew-hotmail';
+type ToolKey = '2fa' | 'splitter' | 'email' | 'renew-hotmail' | 'check-live-x' | 'get-cookie-x';
 
 interface ToolsPageProps {
   language: Language;
@@ -45,6 +47,8 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
     { key: 'splitter', icon: <Split className="w-3.5 h-3.5" />, label: t.toolsSplitterTabLabel },
     { key: 'email', icon: <Mail className="w-3.5 h-3.5" />, label: t.toolsEmailReader || 'Email Reader' },
     { key: 'renew-hotmail', icon: <RefreshCw className="w-3.5 h-3.5" />, label: t.renewHotmail },
+    { key: 'check-live-x', icon: <ShieldCheck className="w-3.5 h-3.5" />, label: t.checkLiveX || 'Check Live X' },
+    { key: 'get-cookie-x', icon: <Cookie className="w-3.5 h-3.5" />, label: t.getCookieX || 'Get Cookie X' },
   ];
 
   // 2FA TOTP Generator state
@@ -73,6 +77,61 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
   const [parsedFields, setParsedFields] = useState<string[]>([]);
   const [outputFields, setOutputFields] = useState<string[]>([]);
   const [copiedSplitOutput, setCopiedSplitOutput] = useState(false);
+  const [splitterNotice, setSplitterNotice] = useState<string | null>(null);
+
+  const showSplitterNotice = (msg: string) => {
+    setSplitterNotice(msg);
+    setTimeout(() => setSplitterNotice(null), 3000);
+  };
+
+  const handlePasteRawText = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        setRawText(text);
+        showSplitterNotice('Đã dán dữ liệu từ Clipboard');
+      }
+    } catch {
+      showSplitterNotice('Vui lòng dùng phím tắt Ctrl+V để dán');
+    }
+  };
+
+  const handleRemoveDuplicatesRawText = () => {
+    const rawLines = rawText.split('\n').map((l) => l.trim()).filter(Boolean);
+    if (rawLines.length === 0) return;
+    const unique = Array.from(new Set(rawLines));
+    setRawText(unique.join('\n'));
+    const diff = rawLines.length - unique.length;
+    showSplitterNotice(`Đã loại bỏ ${diff} dòng trùng lặp (${unique.length} dòng duy nhất)`);
+  };
+
+  const handleCleanRawText = () => {
+    const rawLines = rawText.split('\n').map((l) => l.trim()).filter(Boolean);
+    setRawText(rawLines.join('\n'));
+    showSplitterNotice(`Đã làm sạch khoảng trắng và dòng trống (${rawLines.length} dòng)`);
+  };
+
+  const handleClearRawText = () => {
+    setRawText('');
+    setSplitRows(null);
+    setParsedFields([]);
+    setOutputFields([]);
+    showSplitterNotice('Đã xóa dữ liệu');
+  };
+
+  const handleDownloadSplitOutput = () => {
+    if (splitOutputLines.length === 0) return;
+    const blob = new Blob([splitOutputLines.join('\n')], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Formatted_Text_${Date.now()}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    showSplitterNotice('Đã tải file kết quả');
+  };
 
   const activeInputFields =
     inputPresetIdx === 'custom'
@@ -485,68 +544,181 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
                 </div>
               </div>
 
+              {/* Toast for text format actions */}
+              {splitterNotice && (
+                <div className="bg-emerald-500/10 border border-emerald-500/30 text-emerald-800 dark:text-emerald-300 text-xs px-3.5 py-2 rounded-xl flex items-center justify-between transition animate-fadeIn">
+                  <div className="flex items-center gap-2">
+                    <Check className="w-4 h-4 text-emerald-600 dark:text-emerald-400 shrink-0" />
+                    <span className="font-medium">{splitterNotice}</span>
+                  </div>
+                  <button
+                    onClick={() => setSplitterNotice(null)}
+                    className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 cursor-pointer ml-2 text-sm"
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
+
               <div>
-                <label className="font-bold text-slate-800 dark:text-slate-200 block mb-1">
-                  {t.toolsPasteDataLabel}
-                </label>
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <label className="font-bold text-slate-800 dark:text-slate-200 block">
+                    {t.toolsPasteDataLabel}
+                  </label>
+                  {rawText && (
+                    <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
+                      {rawText.split('\n').filter((l) => l.trim()).length} dòng
+                    </span>
+                  )}
+                </div>
+
+                {/* Quick text action toolbar */}
+                <div className="flex flex-wrap items-center gap-1.5 p-1.5 mb-1.5 bg-[#f0f3f2] dark:bg-[#141518] rounded-xl border border-[#e2e6e5] dark:border-[#30333b]">
+                  <button
+                    type="button"
+                    onClick={handlePasteRawText}
+                    className="text-[11px] font-semibold bg-white dark:bg-[#22242a] hover:bg-slate-50 hover:dark:bg-[#2c2f37] text-slate-700 dark:text-slate-200 border border-[#e2e6e5] dark:border-[#30333b] px-2.5 py-1 rounded-lg transition flex items-center gap-1 cursor-pointer shadow-xs"
+                    title="Dán nhanh văn bản từ Clipboard"
+                  >
+                    <Clipboard className="w-3 h-3 text-emerald-500" />
+                    <span>Dán (Paste)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleRemoveDuplicatesRawText}
+                    disabled={!rawText.trim()}
+                    className="text-[11px] font-semibold bg-white dark:bg-[#22242a] hover:bg-slate-50 hover:dark:bg-[#2c2f37] text-slate-700 dark:text-slate-200 border border-[#e2e6e5] dark:border-[#30333b] px-2.5 py-1 rounded-lg transition flex items-center gap-1 cursor-pointer disabled:opacity-50 shadow-xs"
+                    title="Lọc và xóa các dòng trùng lặp"
+                  >
+                    <Sparkles className="w-3 h-3 text-blue-500" />
+                    <span>Lọc trùng</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleCleanRawText}
+                    disabled={!rawText.trim()}
+                    className="text-[11px] font-semibold bg-white dark:bg-[#22242a] hover:bg-slate-50 hover:dark:bg-[#2c2f37] text-slate-700 dark:text-slate-200 border border-[#e2e6e5] dark:border-[#30333b] px-2.5 py-1 rounded-lg transition flex items-center gap-1 cursor-pointer disabled:opacity-50 shadow-xs"
+                    title="Xóa khoảng trắng thừa và dòng trống"
+                  >
+                    <span>Làm sạch dòng</span>
+                  </button>
+
+                  {rawText && (
+                    <button
+                      type="button"
+                      onClick={handleClearRawText}
+                      className="text-[11px] font-semibold text-rose-600 dark:text-rose-400 hover:text-rose-700 px-2.5 py-1 rounded-lg transition flex items-center gap-1 cursor-pointer ml-auto"
+                      title="Xóa toàn bộ văn bản nhập"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                      <span>Xóa trắng</span>
+                    </button>
+                  )}
+                </div>
+
                 <textarea
-                  rows={4}
+                  rows={5}
                   value={rawText}
                   onChange={(e) => setRawText(e.target.value)}
                   placeholder={activeInputFields.join(' | ')}
-                  className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] rounded-lg p-3 font-mono text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-500"
+                  className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl p-3 font-mono text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-500 resize-y"
                 />
-                <button
-                  onClick={handleSplit}
-                  className="mt-2 bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 font-bold px-4 py-2 rounded-lg transition"
-                >
-                  {t.toolsSplitDataBtn}
-                </button>
+
+                <div className="flex items-center gap-2 mt-2">
+                  <button
+                    onClick={handleSplit}
+                    disabled={!rawText.trim()}
+                    className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold px-4 py-2 rounded-xl transition cursor-pointer shadow-xs flex items-center gap-1.5"
+                  >
+                    <Split className="w-3.5 h-3.5" />
+                    <span>{t.toolsSplitDataBtn}</span>
+                  </button>
+                </div>
               </div>
 
               {splitRows && (
-                <div className="space-y-3">
-                  {/* Wide, many-column table — on a phone it always needs to
-                      scroll sideways, so a fade + hint make that obvious
-                      instead of the table just looking cut off */}
-                  <p className="sm:hidden text-[10px] text-slate-500 dark:text-slate-500 flex items-center gap-1">
-                    <span>←</span>
-                    <span>Vuốt ngang để xem đủ các cột</span>
-                    <span>→</span>
-                  </p>
-                  <div className="relative">
-                    <div className="overflow-x-auto">
-                    <table className="w-full text-left font-mono text-[11px] border border-[#e2e6e5] dark:border-[#30333b] rounded-lg overflow-hidden">
-                      <thead className="bg-[#f2f4f3] dark:bg-[#1a1b1f] text-slate-600 dark:text-slate-400 border-b border-[#e2e6e5] dark:border-[#30333b]">
-                        <tr>
-                          {parsedFields.map((f) => (
-                            <th key={f} className="p-2 whitespace-nowrap">{f}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-[#e2e6e5]">
-                        {splitRows.map((row, idx) => (
-                          <tr key={idx} className="bg-[#f5f6f6] dark:bg-[#16181b]">
-                            {parsedFields.map((f) => (
-                              <td key={f} className="p-2 text-slate-700 dark:text-slate-300 max-w-[160px] truncate" title={row[f]}>
-                                {row[f] || '—'}
-                              </td>
-                            ))}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                <div className="space-y-3 pt-2 border-t border-[#e2e6e5] dark:border-[#30333b]">
+                  {/* Table Preview (limited to 10 rows for high performance) */}
+                  <div>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <span className="font-bold text-slate-800 dark:text-slate-200 text-xs">
+                        Bảng xem trước dữ liệu:
+                      </span>
+                      <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
+                        Hiển thị {Math.min(10, splitRows.length)} / {splitRows.length} dòng
+                      </span>
                     </div>
-                    {/* Right-edge fade — purely decorative, pointer-events
-                        disabled so it never blocks the horizontal scroll it's
-                        hinting at */}
-                    <div className="sm:hidden pointer-events-none absolute top-0 right-0 bottom-0 w-8 bg-gradient-to-l from-[#f5f6f6] dark:from-[#16181b] to-transparent rounded-r-lg" />
+
+                    <div className="relative">
+                      <div className="overflow-x-auto max-h-56 border border-[#e2e6e5] dark:border-[#30333b] rounded-xl">
+                        <table className="w-full text-left font-mono text-[11px]">
+                          <thead className="bg-[#f2f4f3] dark:bg-[#1a1b1f] text-slate-600 dark:text-slate-400 border-b border-[#e2e6e5] dark:border-[#30333b] sticky top-0">
+                            <tr>
+                              <th className="p-2 w-10 text-center">#</th>
+                              {parsedFields.map((f) => (
+                                <th key={f} className="p-2 whitespace-nowrap">{f}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-[#e2e6e5] dark:divide-[#30333b]">
+                            {splitRows.slice(0, 10).map((row, idx) => (
+                              <tr key={idx} className="bg-[#f5f6f6] dark:bg-[#16181b] hover:bg-slate-100 hover:dark:bg-[#202227]">
+                                <td className="p-2 text-center text-slate-400 text-[10px]">{idx + 1}</td>
+                                {parsedFields.map((f) => (
+                                  <td key={f} className="p-2 text-slate-700 dark:text-slate-300 max-w-[160px] truncate" title={row[f]}>
+                                    {row[f] || '—'}
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
                   </div>
 
+                  {/* Output field selector & quick presets */}
                   <div>
-                    <label className="font-bold text-slate-800 dark:text-slate-200 block mb-1.5">
-                      {t.toolsOutputFormatLabel}
-                    </label>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="font-bold text-slate-800 dark:text-slate-200 block">
+                        {t.toolsOutputFormatLabel}
+                      </label>
+
+                      {/* Quick Field Selection Presets */}
+                      <div className="flex items-center gap-1 text-[10px]">
+                        <button
+                          type="button"
+                          onClick={() => setOutputFields([...availableOutputFields])}
+                          className="px-2 py-0.5 rounded bg-[#f0f3f2] dark:bg-[#282a30] text-slate-700 dark:text-slate-300 hover:text-emerald-600 font-semibold cursor-pointer"
+                        >
+                          Chọn tất cả
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOutputFields(['Username'])}
+                          className="px-2 py-0.5 rounded bg-[#f0f3f2] dark:bg-[#282a30] text-slate-700 dark:text-slate-300 hover:text-emerald-600 font-semibold cursor-pointer"
+                        >
+                          Chỉ Username
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOutputFields(['Username', 'Password'])}
+                          className="px-2 py-0.5 rounded bg-[#f0f3f2] dark:bg-[#282a30] text-slate-700 dark:text-slate-300 hover:text-emerald-600 font-semibold cursor-pointer"
+                        >
+                          User | Pass
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setOutputFields([])}
+                          className="px-2 py-0.5 rounded text-rose-600 dark:text-rose-400 hover:underline font-semibold cursor-pointer"
+                        >
+                          Bỏ chọn
+                        </button>
+                      </div>
+                    </div>
+
                     <div className="flex flex-wrap gap-1.5">
                       {availableOutputFields.map((f) => {
                         const selectedPos = outputFields.indexOf(f);
@@ -556,13 +728,13 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
                             key={f}
                             type="button"
                             onClick={() => toggleOutputField(f)}
-                            className={`flex items-center gap-1 text-[11px] font-mono font-semibold px-2.5 py-1.5 rounded-lg border transition ${
+                            className={`flex items-center gap-1 text-[11px] font-mono font-semibold px-2.5 py-1.5 rounded-lg border transition cursor-pointer ${
                               isSelected
-                                ? 'bg-emerald-500 border-emerald-400 text-slate-950'
+                                ? 'bg-emerald-600 border-emerald-500 text-white shadow-xs'
                                 : 'bg-[#f5f6f6] dark:bg-[#16181b] border-[#e2e6e5] dark:border-[#30333b] text-slate-600 dark:text-slate-400 hover:border-emerald-500/40'
                             }`}
                           >
-                            {isSelected && <span className="opacity-70">{selectedPos + 1}.</span>}
+                            {isSelected && <span className="opacity-80">{selectedPos + 1}.</span>}
                             <span>{f}</span>
                           </button>
                         );
@@ -573,30 +745,53 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
                     )}
                   </div>
 
+                  {/* Formatted Output Result Box */}
                   <div>
-                    <div className="flex items-center justify-between mb-1">
-                      <label className="font-bold text-slate-800 dark:text-slate-200">
-                        {t.toolsOutputResultLabel}
-                      </label>
-                      <button
-                        onClick={handleCopySplitOutput}
-                        disabled={splitOutputLines.length === 0}
-                        className="text-emerald-600 dark:text-emerald-400 hover:text-emerald-700 hover:dark:text-emerald-300 font-semibold flex items-center gap-1 text-[11px] disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        {copiedSplitOutput ? <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                        <span>{copiedSplitOutput ? t.pdCopiedLabel : t.toolsCopyOutputBtn}</span>
-                      </button>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <div className="flex items-center gap-2">
+                        <label className="font-bold text-slate-800 dark:text-slate-200">
+                          {t.toolsOutputResultLabel}
+                        </label>
+                        {splitOutputLines.length > 0 && (
+                          <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
+                            ({splitOutputLines.length} dòng)
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={handleCopySplitOutput}
+                          disabled={splitOutputLines.length === 0}
+                          className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-1.5 rounded-lg transition flex items-center gap-1 text-xs disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer shadow-xs"
+                        >
+                          {copiedSplitOutput ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                          <span>{copiedSplitOutput ? t.pdCopiedLabel : 'Sao chép kết quả'}</span>
+                        </button>
+
+                        <button
+                          onClick={handleDownloadSplitOutput}
+                          disabled={splitOutputLines.length === 0}
+                          className="bg-[#f0f3f2] dark:bg-[#22242a] hover:bg-slate-200 hover:dark:bg-[#2c2f37] border border-[#e2e6e5] dark:border-[#30333b] text-slate-700 dark:text-slate-200 font-semibold px-2.5 py-1.5 rounded-lg transition flex items-center gap-1 text-xs disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                          title="Tải về máy file .txt"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Tải .TXT</span>
+                        </button>
+                      </div>
                     </div>
+
                     {outputFields.length === 0 ? (
-                      <div className="text-[11px] text-slate-600 dark:text-slate-400 bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] rounded-lg p-3 text-center">
+                      <div className="text-[11px] text-slate-600 dark:text-slate-400 bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl p-4 text-center">
                         {t.toolsNoOutputFieldsHint}
                       </div>
                     ) : (
                       <textarea
                         readOnly
-                        rows={Math.max(6, splitOutputLines.length)}
+                        rows={7}
                         value={splitOutputLines.join('\n')}
-                        className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-emerald-500/30 rounded-lg p-3 font-mono text-[11px] text-emerald-700 dark:text-emerald-300 focus:outline-none resize-none"
+                        onClick={(e) => (e.target as HTMLTextAreaElement).select()}
+                        className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-emerald-500/30 rounded-xl p-3 font-mono text-xs text-slate-800 dark:text-slate-200 focus:outline-none resize-y min-h-[140px] max-h-[350px]"
                       />
                     )}
                   </div>
@@ -717,6 +912,9 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
               )}
             </div>
           )}
+
+          {activeTab === 'check-live-x' && <CheckLiveXTab language={language} />}
+          {activeTab === 'get-cookie-x' && <GetCookieXTab language={language} />}
         </div>
       </div>
     </div>

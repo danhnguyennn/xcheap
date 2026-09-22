@@ -16,7 +16,6 @@ import {
   ChevronUp,
   FileText,
   ShieldAlert,
-  Sparkles,
 } from 'lucide-react';
 import { EmailDetailModal, EmailDetailData } from './EmailDetailModal';
 import { Language } from '../../types';
@@ -106,10 +105,6 @@ export function detectOtp(subject: string = '', content: string = ''): string | 
 const DEFAULT_CLIENT_ID = '000000004017045b';
 // Admin preset concurrency (5 concurrent requests)
 const ADMIN_CONCURRENCY = 5;
-
-const SAMPLE_INPUT = `ronan_xcheap1@hotmail.com|PassWord2026@|M.C543_BAY.0.U.-CtwJ!1829481928a9b1c2d3e4f5g|000000004017045b
-alex_trader2@outlook.com|Secr3t#2026|M.C543_BAY.0.U.-AzwK!9182391028a1b2c3d4e5f6g|000000004017045b
-sarah_mmo99@hotmail.com|OldPass123|M.C543_BAY.0.U.-DieInvalidToken999123847291a8|000000004017045b`;
 
 interface EmailReaderTabProps {
   language: Language;
@@ -397,13 +392,6 @@ export const EmailReaderTab: React.FC<EmailReaderTabProps> = ({ language }) => {
               </select>
             </div>
 
-            <button
-              onClick={() => setInputText(SAMPLE_INPUT)}
-              className="text-[11px] text-emerald-700 dark:text-emerald-400 hover:underline flex items-center gap-1 bg-emerald-500/10 px-2.5 py-1 rounded-lg border border-emerald-500/20 font-medium cursor-pointer"
-            >
-              <Sparkles className="w-3 h-3" />
-              <span>{t.emailReaderPasteSample}</span>
-            </button>
             <button
               onClick={() => setInputText('')}
               className="text-[11px] text-slate-500 hover:text-red-500 dark:hover:text-red-400 flex items-center gap-1 hover:bg-red-500/10 px-2 py-1 rounded-lg transition cursor-pointer"
