@@ -21,7 +21,7 @@ export const VIP_TIERS: VipTier[] = [
   { key: 'v1', label: 'V1', sub: 'Bronze', threshold: 300, discountPercent: 3 },
   { key: 'v2', label: 'V2', sub: 'Silver', threshold: 1000, discountPercent: 5 },
   { key: 'v3', label: 'V3', sub: 'Gold', threshold: 4000, discountPercent: 8 },
-  { key: 'v4', label: 'V4', sub: 'Platinum', threshold: 10000, discountPercent: 11 },
+  { key: 'v4', label: 'V4', sub: 'Platinum', threshold: 12000, discountPercent: 11 },
   { key: 'v5', label: 'V5', sub: 'Diamond', threshold: 25000, discountPercent: 15 },
 ];
 
