@@ -35,6 +35,11 @@ export interface User {
   // (toPublicUser) — it's only ever re-attached on a user's own /api/user/me
   // response, never when listing/returning OTHER accounts.
   apiKey?: string;
+  // Bumped whenever the password changes. Every login session records the
+  // value it was created under; a session whose recorded value no longer
+  // matches is treated as logged out (see getSessionUser). Server-side only —
+  // stripped from public User responses like passwordHash.
+  authVersion?: number;
   phone?: string;
   telegram?: string;
   createdAt: string;
@@ -78,7 +83,10 @@ export interface Product {
   image: string;
   rating: number;
   reviewCount: number;
-  seller: {
+  // Internal: the login name of whoever listed the product. Only ever sent to
+  // admin/CTV — stripped from the public product API (the storefront doesn't
+  // render it), so it's absent on anything a guest/shopper received.
+  seller?: {
     name: string;
     statusText: string;
     isActive: boolean;
@@ -118,6 +126,14 @@ export interface Product {
   // unreachable when saved) — the frontend falls back to the original
   // Vietnamese text rather than showing anything made up.
   descriptionTranslations?: Partial<Record<'en' | 'zh' | 'th', string>>;
+  // Whitelist of CTV account ids admin has explicitly granted permission to
+  // upload stock into this product — CTV no longer creates products (only
+  // admin does, via POST /api/admin/products), so this is the only way a
+  // CTV gets access to a storefront at all. Several CTVs can be granted the
+  // same product, which is exactly why income has to be attributed per
+  // uploaded row (see Order.uploaderBreakdown) rather than per product.
+  // Admin-only info — never sent on the public-facing GET /api/products.
+  authorizedCtvIds?: string[];
 }
 
 export interface AccountStockItem {
@@ -149,6 +165,34 @@ export interface Order {
   // Set only when an admin refunds this order (see POST
   // /api/admin/orders/:orderCode/refund) — absent on every normal order.
   refundedAt?: string;
+  // Snapshot, at purchase time, of which CTV(s) uploaded the specific
+  // inventory rows this order claimed — admin can authorize several CTVs on
+  // the same product, so income has to be attributed per uploaded row, not
+  // per product. Captured on the order itself (never re-derived from the
+  // inventory rows later) because sold inventory rows get pruned after
+  // their retention window — see cleanupOldSoldInventory in server.ts —
+  // which would otherwise make a CTV's lifetime income silently shrink as
+  // old rows are cleaned up. Absent on orders placed before this feature
+  // existed, and an entry is skipped for any claimed row that (for the
+  // same legacy reason) has no uploader recorded on it.
+  uploaderBreakdown?: { userId: string; username: string; quantity: number }[];
+}
+
+// A manual balance adjustment admin makes against a CTV's earned income —
+// e.g. a penalty for a bad batch of accounts, or correcting a mistake.
+// Always negative in effect (see POST /api/admin/ctv-deductions): it's
+// subtracted from withdrawableBalance alongside real withdrawals, and kept
+// as a permanent, visible record for both admin and the CTV themselves
+// rather than silently editing any stored balance number.
+export interface CtvDeduction {
+  id: string;
+  ctvUserId: string;
+  ctvUsername: string;
+  amount: number;
+  reason: string;
+  createdAt: string;
+  adminId: string;
+  adminUsername: string;
 }
 
 // A "đặt trước" (pre-order) placed against a variant that's currently out of
@@ -255,11 +299,17 @@ export interface CtvStats {
   feePercent: number;
   feeAmount: number;
   netProfit: number;
+  totalDeducted: number;
   withdrawableBalance: number;
   totalUploaded: number;
   totalSold: number;
   totalInStock: number;
   withdrawals: WithdrawalRequest[];
+  deductions: CtvDeduction[];
+  // This CTV's own contribution to each product it's authorized on — a
+  // product can be stocked by several CTVs now, so this is this CTV's
+  // personal slice of it, not the product's overall numbers.
+  byProduct: { productId: string; productName: string; totalInStock: number; totalSold: number; grossRevenue: number }[];
 }
 
 export interface Voucher {

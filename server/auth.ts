@@ -8,6 +8,8 @@ import { User, UserRole } from '../src/types';
 declare module 'express-session' {
   interface SessionData {
     userId?: string;
+    // The account's authVersion at the moment this session was created.
+    authVersion?: number;
   }
 }
 
@@ -32,8 +34,8 @@ export function generateApiKey(): string {
 // only ever re-attached on a user's own /api/user/me response (see
 // server.ts) — every other route that lists or returns other accounts
 // (e.g. the admin user list) must never leak it.
-export function toPublicUser(user: User): Omit<User, 'passwordHash' | 'apiKey'> {
-  const { passwordHash, apiKey, ...publicUser } = user;
+export function toPublicUser(user: User): Omit<User, 'passwordHash' | 'apiKey' | 'authVersion'> {
+  const { passwordHash, apiKey, authVersion, ...publicUser } = user;
   return publicUser;
 }
 
@@ -93,7 +95,12 @@ export async function getSessionUser(req: Request): Promise<User | null> {
   const userId = req.session.userId;
   if (userId) {
     const user = await userCol.findOne({ id: userId });
-    if (user) return user;
+    // A session created before the password was last changed carries an older
+    // authVersion and no longer counts as logged in — that's how "change
+    // password" signs every OTHER device out. Sessions from before this field
+    // existed have none, which reads as 0 and matches accounts that have never
+    // changed their password.
+    if (user && (req.session.authVersion ?? 0) === (user.authVersion ?? 0)) return user;
   }
 
   const apiKey = extractApiKey(req);

@@ -4,6 +4,7 @@
  */
 
 import React, { useState, useEffect, Suspense, lazy } from 'react';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { User, Product, Language, Category, CryptoOption } from './types';
 import { Header } from './components/Header';
 import { Banner } from './components/Banner';
@@ -258,7 +259,6 @@ export default function App() {
 
   useEffect(() => {
     fetchUser();
-    fetchProducts();
     fetchCategories();
     fetchCryptoOptions();
     applyLocationFromUrl();
@@ -267,6 +267,17 @@ export default function App() {
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
   }, []);
+
+  // The product list is role-dependent: admin/CTV get hidden products and
+  // internal fields (e.g. authorizedCtvIds — what tells a CTV which storefronts
+  // they may stock) that a guest response strips. So it has to be fetched
+  // again whenever WHO is logged in changes (login, logout, role change) —
+  // otherwise a CTV who just signed in keeps the guest copy and sees "no
+  // storefronts granted" until they reload the page. Also covers first load.
+  useEffect(() => {
+    fetchProducts();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, user?.role]);
 
   // Presence heartbeat for the admin "online now" stat — every tab pings
   // every 20s; the server identifies the account from the session cookie
@@ -345,6 +356,7 @@ export default function App() {
 
       {/* Main View Router */}
       <main className="flex-1">
+        <ErrorBoundary resetKey={currentPage + (selectedProduct?.id || '')}>
         <Suspense fallback={<PageLoading />}>
         {currentPage === 'login' ? (
           <LoginPage
@@ -373,7 +385,6 @@ export default function App() {
               onBackToStore={() => navigate('home')}
               onRefreshProducts={fetchProducts}
               onRefreshUser={fetchUser}
-              onOpenDeposit={() => setIsDepositOpen(true)}
             />
           )
         ) : currentPage === 'account' ? (
@@ -480,6 +491,7 @@ export default function App() {
           </>
         )}
         </Suspense>
+        </ErrorBoundary>
       </main>
 
       {/* Footer matching Image 2 */}

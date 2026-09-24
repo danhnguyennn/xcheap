@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import { MongoClient, Db, Collection, Filter, Document } from 'mongodb';
 
 // Define MongoDB Document interface
@@ -8,6 +9,15 @@ export interface MongoDoc {
   _id?: any;
   id?: string;
   [key: string]: any;
+}
+
+// The dedupe key of an inventory row: the account's username — always the
+// first "|"-separated field of the account line — trimmed and lowercased.
+// Stored on every row (usernameKey, indexed) so bulk import can look up
+// "does this username already exist anywhere in the warehouse?" for just the
+// usernames in the pasted batch, instead of loading the entire inventory.
+export function inventoryUsernameKey(accountData: string): string {
+  return String(accountData || '').split('|')[0].trim().toLowerCase();
 }
 
 // Generate a MongoDB ObjectId-like 24-character hex id
@@ -33,7 +43,9 @@ const STANDARD_COLLECTIONS = [
   'reviews',
   'review_suggestions',
   'preorders',
-  'admin_notifications'
+  'admin_notifications',
+  'ctv_deductions',
+  'deposit_checkpoints'
 ];
 
 function matchesFilter(item: any, query: Record<string, any>): boolean {
@@ -200,6 +212,81 @@ export class MongoCollection<T extends MongoDoc> {
     return { matchedCount: 1, modifiedCount: 1 };
   }
 
+  // MongoDB: bulkWrite() with a list of updateOne-style operations — one
+  // network round-trip for N updates instead of N. Used where a request
+  // needs to claim/release many inventory rows at once (e.g. buying a large
+  // quantity in one checkout); doing that with N sequential updateOne calls
+  // made large purchases take seconds to minutes instead of near-instant.
+  public async bulkWrite(
+    ops: { filter: Record<string, any>; update: { $set?: Partial<T> } }[]
+  ): Promise<{ matchedCount: number; modifiedCount: number }> {
+    if (ops.length === 0) return { matchedCount: 0, modifiedCount: 0 };
+
+    if (this.col) {
+      try {
+        const now = new Date().toISOString();
+        const bulkOps = ops.map((op) => ({
+          updateOne: {
+            filter: op.filter as Filter<Document>,
+            update: { $set: { ...op.update.$set, updatedAt: now } },
+          },
+        }));
+        const result = await this.col.bulkWrite(bulkOps, { ordered: false });
+        return { matchedCount: result.matchedCount, modifiedCount: result.modifiedCount };
+      } catch (err) {
+        console.warn(`[MongoDB] bulkWrite on collection ${this.name} failed, updating in-memory:`, err);
+      }
+    }
+
+    // In-memory fallback — same semantics as updateOne, applied per op.
+    let matchedCount = 0;
+    for (const op of ops) {
+      const index = this.memoryDocs.findIndex((item) => matchesFilter(item, op.filter));
+      if (index === -1) continue;
+      matchedCount++;
+      const target: any = this.memoryDocs[index];
+      if (op.update.$set) {
+        Object.assign(target, op.update.$set);
+        target.updatedAt = new Date().toISOString();
+      }
+    }
+    return { matchedCount, modifiedCount: matchedCount };
+  }
+
+  // Group-and-aggregate in the database: returns one row per distinct value of
+  // groupField (count of matching docs, plus the sum of sumField when given).
+  // Lets callers get "how many unsold rows per variant" or "average rating per
+  // product" without pulling every document into memory just to count them.
+  public async groupBy(
+    groupField: string,
+    filter: Record<string, any> = {},
+    sumField?: string
+  ): Promise<{ key: any; count: number; sum: number }[]> {
+    if (this.col) {
+      try {
+        const rows = await this.col
+          .aggregate([
+            { $match: filter as Filter<Document> },
+            { $group: { _id: '$' + groupField, count: { $sum: 1 }, sum: { $sum: sumField ? '$' + sumField : 0 } } },
+          ])
+          .toArray();
+        return rows.map((r: any) => ({ key: r._id, count: Number(r.count), sum: Number(r.sum) }));
+      } catch (err) {
+        console.warn(`[MongoDB] groupBy on collection ${this.name} failed, using in-memory:`, err);
+      }
+    }
+    const groups = new Map<any, { key: any; count: number; sum: number }>();
+    for (const item of this.memoryDocs as any[]) {
+      if (!matchesFilter(item, filter)) continue;
+      const key = item[groupField];
+      const g = groups.get(key) || { key, count: 0, sum: 0 };
+      g.count += 1;
+      if (sumField) g.sum += Number(item[sumField]) || 0;
+      groups.set(key, g);
+    }
+    return Array.from(groups.values());
+  }
+
   // MongoDB: deleteOne()
   public async deleteOne(query: Record<string, any>): Promise<{ acknowledged: boolean; deletedCount: number }> {
     if (this.col) {
@@ -303,6 +390,7 @@ export class MongoDBEngine {
         }
 
         await this.migrateLegacyJsonIfPresent();
+        await this.ensureInventoryIndexesAndKeys();
       } catch (err) {
         console.warn(`[MongoDB] Connection to ${this.uri} failed or timed out. Operating in high-performance in-memory database mode.`);
         this.isConnected = false;
@@ -313,6 +401,35 @@ export class MongoDBEngine {
     }
 
     await this.seedDefaultStoreDataIfEmpty();
+  }
+
+  // Indexes for the hot inventory lookups (bulk-import duplicate check,
+  // per-variant stock counts), plus a one-time backfill of usernameKey on rows
+  // that were imported before that field existed — so the duplicate check
+  // still sees every account already in the warehouse, old rows included.
+  private async ensureInventoryIndexesAndKeys(): Promise<void> {
+    if (!this.database) return;
+    try {
+      const inv = this.database.collection('inventory');
+      await inv.createIndex({ usernameKey: 1 });
+      await inv.createIndex({ variantId: 1, isSold: 1 });
+
+      const missing = await inv.find({ usernameKey: { $exists: false } }, { projection: { _id: 1, accountData: 1 } }).toArray();
+      if (missing.length > 0) {
+        const BATCH = 1000;
+        for (let i = 0; i < missing.length; i += BATCH) {
+          await inv.bulkWrite(
+            missing.slice(i, i + BATCH).map((row: any) => ({
+              updateOne: { filter: { _id: row._id }, update: { $set: { usernameKey: inventoryUsernameKey(row.accountData) } } },
+            })),
+            { ordered: false }
+          );
+        }
+        console.log(`[MongoDB] Backfilled usernameKey on ${missing.length} inventory row(s).`);
+      }
+    } catch (err) {
+      console.warn('[MongoDB] Could not ensure inventory indexes/keys:', err);
+    }
   }
 
   private async migrateLegacyJsonIfPresent(): Promise<void> {
@@ -342,60 +459,32 @@ export class MongoDBEngine {
     const userCol = this.collection<any>('users');
     const userCount = await userCol.countDocuments({});
     if (userCount === 0) {
-      console.log('[MongoDB] Seeding default store users (admin, demo, ctv)...');
-      const passwordHash = bcrypt.hashSync('Xcheap@2026', 10);
+      // A brand-new database needs one admin to get in with. Its password is
+      // generated fresh here and printed ONCE to the server log — never a fixed
+      // value baked into the source (anyone who can read the code could
+      // otherwise log in as admin on every fresh install). No demo/CTV accounts
+      // with made-up balances are created. Change the password after first login.
+      const initialPassword = crypto.randomBytes(12).toString('base64url');
+      console.log('[MongoDB] Seeding initial admin account...');
+      console.log('==================================================================');
+      console.log(` INITIAL ADMIN LOGIN  username: admin   password: ${initialPassword}`);
+      console.log(' Shown only once — sign in and change it right away.');
+      console.log('==================================================================');
       await userCol.insertMany([
         {
           id: 'user_admin',
           username: 'admin',
           email: 'admin@xcheap.top',
           role: 'admin',
-          balance: 1000,
+          balance: 0,
           discountPercent: 0,
-          depositWallets: {
-            bsc: '0x71C8F794B35261739943265147492166F3643B94',
-            polygon: '0x71C8F794B35261739943265147492166F3643B94',
-            base: '0x71C8F794B35261739943265147492166F3643B94',
-            trc: 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
-          },
-          passwordHash,
+          // Real deposit addresses are generated on first use (see
+          // ensureUserDepositWallets) — nothing hardcoded here.
+          depositWallets: {},
+          passwordHash: bcrypt.hashSync(initialPassword, 10),
           apiKey: 'xck_admin_seed_' + generateObjectId(),
           createdAt: new Date().toISOString(),
         },
-        {
-          id: 'user_demo',
-          username: 'demo',
-          email: 'demo@xcheap.top',
-          role: 'user',
-          balance: 85.5,
-          discountPercent: 0,
-          depositWallets: {
-            bsc: '0x32A89F439265147492166F3643B9471C8F794B35',
-            polygon: '0x32A89F439265147492166F3643B9471C8F794B35',
-            base: '0x32A89F439265147492166F3643B9471C8F794B35',
-            trc: 'TYDemoUserWalletTronAddress2026x99',
-          },
-          passwordHash,
-          apiKey: 'xck_demo_seed_' + generateObjectId(),
-          createdAt: new Date().toISOString(),
-        },
-        {
-          id: 'user_ctv',
-          username: 'ctv_seller',
-          email: 'ctv@xcheap.top',
-          role: 'ctv',
-          balance: 240,
-          discountPercent: 10,
-          depositWallets: {
-            bsc: '0x88F794B35261739943265147492166F3643B9471',
-            polygon: '0x88F794B35261739943265147492166F3643B9471',
-            base: '0x88F794B35261739943265147492166F3643B9471',
-            trc: 'TCtvPartnerWalletTronAddress2026k1',
-          },
-          passwordHash,
-          apiKey: 'xck_ctv_seed_' + generateObjectId(),
-          createdAt: new Date().toISOString(),
-        }
       ]);
     }
 
@@ -632,6 +721,7 @@ export class MongoDBEngine {
             productId: prodId,
             variantId: varId,
             accountData: line,
+            usernameKey: inventoryUsernameKey(line),
             isSold: false,
             createdAt: new Date().toISOString(),
           });

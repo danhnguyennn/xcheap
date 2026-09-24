@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Product, ProductVariant, User, Language, UserRole, CryptoNetwork, CryptoOption, Voucher, Review, ReviewSuggestion, Order } from '../types';
+import { Product, ProductVariant, User, Language, UserRole, CryptoNetwork, CryptoOption, Voucher, Review, ReviewSuggestion, Order, CtvDeduction } from '../types';
 import { translations } from '../locales/translations';
 import { formatMoney } from '../utils/pricing';
 import { SimpleBarChart, BarChartDatum } from '../components/charts/SimpleBarChart';
@@ -35,7 +35,8 @@ import {
   Star,
   Eye,
   EyeOff,
-  Flame
+  Flame,
+  UserCheck
 } from 'lucide-react';
 
 interface AdminPageProps {
@@ -45,7 +46,6 @@ interface AdminPageProps {
   onBackToStore: () => void;
   onRefreshProducts: () => void;
   onRefreshUser: () => void;
-  onOpenDeposit: () => void;
 }
 
 const EMPTY_SUGGESTION_TEXT: Record<Language, string> = { vn: '', en: '', zh: '', th: '' };
@@ -58,7 +58,6 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   onBackToStore,
   onRefreshProducts,
   onRefreshUser,
-  onOpenDeposit,
 }) => {
   const t = translations[language];
   const [activeTab, setActiveTab] = useState<'overview' | 'categories' | 'products' | 'users' | 'inventory' | 'orders' | 'rpc' | 'ctv-fee' | 'vouchers' | 'reviews'>('overview');
@@ -101,6 +100,35 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [isCreatingVoucher, setIsCreatingVoucher] = useState(false);
   const [platformFee, setPlatformFee] = useState<number>(5);
   const [adminWithdrawals, setAdminWithdrawals] = useState<any[]>([]);
+  const [ctvBreakdown, setCtvBreakdown] = useState<
+    {
+      userId: string;
+      username: string;
+      role: string;
+      totalUploaded: number;
+      totalSold: number;
+      totalInStock: number;
+      grossRevenue: number;
+      netProfit: number;
+      totalDeducted: number;
+      withdrawableBalance: number;
+    }[]
+  >([]);
+  const [ctvDeductions, setCtvDeductions] = useState<CtvDeduction[]>([]);
+  // "Cấp quyền CTV" modal — lets admin grant/revoke which CTV accounts may
+  // upload stock into a given product (Product.authorizedCtvIds). Several
+  // CTVs can be granted the same product at once.
+  const [showCtvAccessModal, setShowCtvAccessModal] = useState(false);
+  const [ctvAccessProduct, setCtvAccessProduct] = useState<Product | null>(null);
+  // Deduction modal — admin manually subtracts from a CTV's withdrawable
+  // balance (e.g. a penalty), always with a reason, always permanently
+  // recorded (see CtvDeduction).
+  const [showDeductModal, setShowDeductModal] = useState(false);
+  const [deductTargetUserId, setDeductTargetUserId] = useState('');
+  const [deductTargetUsername, setDeductTargetUsername] = useState('');
+  const [deductAmount, setDeductAmount] = useState<number>(0);
+  const [deductReason, setDeductReason] = useState('');
+  const [isSubmittingDeduction, setIsSubmittingDeduction] = useState(false);
   const [customFeeInput, setCustomFeeInput] = useState<number>(5);
   const [loading, setLoading] = useState(false);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
@@ -237,7 +265,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const fetchAdminData = async () => {
     setLoading(true);
     try {
-      const [statsRes, usersRes, catsRes, invRes, feeRes, withRes, voucherRes, reviewsRes, suggestionsRes, cryptoOptsRes, ordersRes] = await Promise.all([
+      const [statsRes, usersRes, catsRes, invRes, feeRes, withRes, voucherRes, reviewsRes, suggestionsRes, cryptoOptsRes, ordersRes, ctvBreakdownRes, ctvDeductionsRes] = await Promise.all([
         fetch('/api/admin/stats'),
         fetch('/api/admin/users'),
         fetch('/api/categories'),
@@ -249,6 +277,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         fetch('/api/review-comment-suggestions'),
         fetch('/api/admin/crypto-options'),
         fetch('/api/admin/orders'),
+        fetch('/api/admin/ctv-breakdown'),
+        fetch('/api/admin/ctv-deductions'),
       ]);
       fetchChartData(chartPeriod);
 
@@ -303,6 +333,14 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       if (ordersRes.ok) {
         const ordersData = await ordersRes.json();
         setAllOrders(ordersData.orders || []);
+      }
+      if (ctvBreakdownRes.ok) {
+        const ctvBreakdownData = await ctvBreakdownRes.json();
+        setCtvBreakdown(ctvBreakdownData.breakdown || []);
+      }
+      if (ctvDeductionsRes.ok) {
+        const ctvDeductionsData = await ctvDeductionsRes.json();
+        setCtvDeductions(ctvDeductionsData.deductions || []);
       }
     } catch (err) {
       console.error('Failed to load admin data', err);
@@ -550,8 +588,16 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   };
 
   const handleApproveWithdrawal = async (id: string) => {
+    // Mã giao dịch thật của lần chuyển tiền — hệ thống không tự bịa ra. Để
+    // trống vẫn duyệt được; bấm Hủy để không duyệt.
+    const txHash = window.prompt('Dán mã giao dịch (txHash) của lần chuyển tiền cho CTV (có thể để trống):');
+    if (txHash === null) return;
     try {
-      const res = await fetch(`/api/admin/withdrawals/${id}/complete`, { method: 'POST' });
+      const res = await fetch(`/api/admin/withdrawals/${id}/complete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ txHash: txHash.trim() }),
+      });
       const data = await res.json();
       if (res.ok) {
         showNotification(`✅ Đã duyệt và hoàn tất chuyển tiền cho yêu cầu #${id.toUpperCase()}!`);
@@ -742,6 +788,9 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         setShowAddCatModal(false);
         resetCategoryForm();
         fetchAdminData();
+        // Renaming/re-slugging a category carries its products along, so the
+        // storefront product list has to be reloaded too.
+        onRefreshProducts();
       } else {
         showNotification(null, data.error || (isEditing ? 'Lỗi cập nhật danh mục' : 'Lỗi thêm danh mục'));
       }
@@ -758,6 +807,9 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       if (res.ok) {
         showNotification(`✅ Đã xóa danh mục "${name}"`);
         fetchAdminData();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        showNotification(null, data.error || 'Lỗi xóa danh mục');
       }
     } catch (e) {
       showNotification(null, 'Lỗi xóa danh mục');
@@ -891,6 +943,84 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       }
     } catch (e) {
       showNotification(null, 'Lỗi cập nhật Hot Deal');
+    }
+  };
+
+  const handleOpenCtvAccess = (prod: Product) => {
+    setCtvAccessProduct(prod);
+    setShowCtvAccessModal(true);
+  };
+
+  // Grants/revokes one CTV's permission to upload stock into ctvAccessProduct.
+  // Applied optimistically to the open modal's local copy so the checkbox
+  // list doesn't flicker while onRefreshProducts() re-fetches in the
+  // background.
+  const handleToggleCtvAuthorization = async (ctv: User, authorized: boolean) => {
+    if (!ctvAccessProduct) return;
+    try {
+      const res = await fetch(`/api/admin/products/${ctvAccessProduct.id}/authorize-ctv`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ctvUserId: ctv.id, authorized }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setCtvAccessProduct(data.product);
+        onRefreshProducts();
+        showNotification(
+          authorized
+            ? `✅ Đã cấp quyền cho "${ctv.username}" bán "${ctvAccessProduct.name}"`
+            : `✅ Đã thu hồi quyền của "${ctv.username}" với "${ctvAccessProduct.name}"`
+        );
+      } else {
+        const data = await res.json().catch(() => ({}));
+        showNotification(null, data.error || 'Lỗi cập nhật quyền CTV');
+      }
+    } catch (e) {
+      showNotification(null, 'Lỗi cập nhật quyền CTV');
+    }
+  };
+
+  const handleOpenDeductModal = (userId: string, username: string) => {
+    setDeductTargetUserId(userId);
+    setDeductTargetUsername(username);
+    setDeductAmount(0);
+    setDeductReason('');
+    setShowDeductModal(true);
+  };
+
+  // Manually subtracts from a CTV's withdrawable balance — always requires a
+  // reason and is kept as a permanent, visible record (CtvDeduction), never
+  // a silent balance edit.
+  const handleSubmitDeduction = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!deductAmount || deductAmount <= 0) {
+      showNotification(null, 'Số tiền trừ phải lớn hơn 0');
+      return;
+    }
+    if (!deductReason.trim()) {
+      showNotification(null, 'Vui lòng nhập lý do trừ tiền');
+      return;
+    }
+    setIsSubmittingDeduction(true);
+    try {
+      const res = await fetch('/api/admin/ctv-deductions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ctvUserId: deductTargetUserId, amount: deductAmount, reason: deductReason.trim() }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showNotification(`✅ Đã trừ $${formatMoney(deductAmount)} của "${deductTargetUsername}"`);
+        setShowDeductModal(false);
+        fetchAdminData();
+      } else {
+        showNotification(null, data.error || 'Lỗi trừ tiền CTV');
+      }
+    } catch (e) {
+      showNotification(null, 'Lỗi trừ tiền CTV');
+    } finally {
+      setIsSubmittingDeduction(false);
     }
   };
 
@@ -1711,7 +1841,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                             {totalStock.toLocaleString()}
                           </td>
                           <td className="p-3 text-slate-600 dark:text-slate-400">
-                            {prod.seller.name}
+                            {prod.seller?.name ?? '—'}
                           </td>
                           <td className="p-3 text-right">
                             <div className="flex items-center justify-end gap-1">
@@ -1743,6 +1873,22 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                                 title="Quản lý biến thể"
                               >
                                 <Boxes className="w-4 h-4" />
+                              </button>
+                              <button
+                                onClick={() => handleOpenCtvAccess(prod)}
+                                className={`p-1 rounded transition relative ${
+                                  (prod.authorizedCtvIds?.length ?? 0) > 0
+                                    ? 'text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/70'
+                                    : 'text-slate-600 dark:text-slate-400 hover:text-emerald-600 hover:dark:text-emerald-400 hover:bg-emerald-50 hover:dark:bg-emerald-950/70'
+                                }`}
+                                title="Cấp quyền CTV bán sản phẩm này"
+                              >
+                                <UserCheck className="w-4 h-4" />
+                                {(prod.authorizedCtvIds?.length ?? 0) > 0 && (
+                                  <span className="absolute -top-1 -right-1 bg-emerald-600 text-white text-[9px] font-bold w-3.5 h-3.5 rounded-full flex items-center justify-center leading-none">
+                                    {prod.authorizedCtvIds!.length}
+                                  </span>
+                                )}
                               </button>
                               <button
                                 onClick={() => handleOpenEditProduct(prod)}
@@ -2045,6 +2191,69 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                       </button>
                     </div>
                   </form>
+                </div>
+              </div>
+            )}
+
+            {/* Modal: Cấp quyền CTV — grant/revoke which CTV accounts may
+                upload stock into ctvAccessProduct. Several CTVs can be
+                checked at once on the same product. */}
+            {showCtvAccessModal && ctvAccessProduct && (
+              <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                <div className="bg-[#eceeed] dark:bg-[#23252a] border border-emerald-500/50 rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
+                  <div className="flex items-center justify-between pb-2 border-b border-[#e0e4e2] dark:border-[#33363e]">
+                    <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                      <UserCheck className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                      <span>Cấp Quyền CTV — {ctvAccessProduct.name}</span>
+                    </h3>
+                    <button
+                      onClick={() => { setShowCtvAccessModal(false); setCtvAccessProduct(null); }}
+                      className="text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100"
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  <p className="text-[11px] text-slate-600 dark:text-slate-400">
+                    Chỉ CTV được tick mới thấy và nạp hàng được vào gian hàng này. Có thể cấp cho nhiều CTV cùng lúc.
+                  </p>
+
+                  <div className="space-y-1.5">
+                    {allUsers.filter((u) => u.role === 'ctv').length === 0 ? (
+                      <div className="text-center py-6 text-slate-600 dark:text-slate-400 text-xs">
+                        Chưa có tài khoản CTV nào.
+                      </div>
+                    ) : (
+                      allUsers
+                        .filter((u) => u.role === 'ctv')
+                        .map((ctv) => {
+                          const isAuthorized = ctvAccessProduct.authorizedCtvIds?.includes(ctv.id) ?? false;
+                          return (
+                            <label
+                              key={ctv.id}
+                              className="flex items-center justify-between gap-2 p-2.5 bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-lg text-xs cursor-pointer hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34] transition"
+                            >
+                              <span className="font-semibold text-slate-800 dark:text-slate-200">{ctv.username}</span>
+                              <input
+                                type="checkbox"
+                                checked={isAuthorized}
+                                onChange={(e) => handleToggleCtvAuthorization(ctv, e.target.checked)}
+                                className="w-4 h-4 accent-emerald-500"
+                              />
+                            </label>
+                          );
+                        })
+                    )}
+                  </div>
+
+                  <div className="flex justify-end pt-1">
+                    <button
+                      onClick={() => { setShowCtvAccessModal(false); setCtvAccessProduct(null); }}
+                      className="px-4 py-2 bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-[#dde1e0] hover:dark:bg-[#373b44] text-slate-700 dark:text-slate-300 rounded-lg text-xs font-semibold"
+                    >
+                      Xong
+                    </button>
+                  </div>
                 </div>
               </div>
             )}
@@ -2700,13 +2909,6 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   Mỗi người dùng được cấp một địa chỉ ví riêng biệt. Hệ thống quét RPC node và cộng tiền tự động.
                 </p>
               </div>
-              <button
-                onClick={onOpenDeposit}
-                className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs px-3.5 py-2 rounded-lg flex items-center gap-1.5 shadow"
-              >
-                <Coins className="w-4 h-4" />
-                <span>Mở Cửa Sổ Nạp Thử Nghiệm</span>
-              </button>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -2862,6 +3064,193 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 </div>
               </div>
             </div>
+
+            {/* Thu nhập tách riêng theo từng người bán — CTV, và cả tài
+                khoản admin nào tự đăng/upload hàng của chính mình (không bị
+                bỏ qua chỉ vì role là admin). Chỉ hiện người thực sự có sản
+                phẩm hoặc từng bị trừ tiền — không hiện tài khoản CTV/admin
+                hoàn toàn rỗng. */}
+            <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-2xl p-5 shadow space-y-4">
+              <div className="border-b border-[#e0e4e2] dark:border-[#33363e] pb-3">
+                <h3 className="text-base font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                  <UserCheck className="w-5 h-5 text-amber-600 dark:text-amber-400" />
+                  <span>Thu Nhập Tách Riêng Theo Từng Người Bán ({ctvBreakdown.length})</span>
+                </h3>
+                <p className="text-xs text-slate-600 dark:text-slate-400">
+                  Gồm CTV và cả tài khoản Admin nào tự đăng bán hàng riêng — tính theo đúng gian hàng họ được cấp quyền/tự nạp
+                </p>
+              </div>
+
+              {ctvBreakdown.length === 0 ? (
+                <div className="text-center py-10 text-slate-600 dark:text-slate-400 text-xs">
+                  Chưa có ai đăng bán sản phẩm nào.
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs min-w-[820px]">
+                    <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
+                      <tr>
+                        <th className="p-3">Người bán</th>
+                        <th className="p-3">Vai trò</th>
+                        <th className="p-3">Tồn kho</th>
+                        <th className="p-3">Đã bán</th>
+                        <th className="p-3 text-emerald-600 dark:text-emerald-400 font-bold">Doanh thu</th>
+                        <th className="p-3 text-emerald-600 dark:text-emerald-400 font-bold">Lợi nhuận ròng</th>
+                        <th className="p-3 text-rose-600 dark:text-rose-400 font-bold">Đã trừ</th>
+                        <th className="p-3 text-amber-600 dark:text-amber-400 font-bold">Khả dụng rút</th>
+                        <th className="p-3 text-right">Thao tác</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-[#e4e8e7]">
+                      {ctvBreakdown.map((row) => (
+                        <tr key={row.userId} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34] transition">
+                          <td className="p-3 font-bold text-slate-800 dark:text-slate-200">{row.username}</td>
+                          <td className="p-3">
+                            <span
+                              className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
+                                row.role === 'admin'
+                                  ? 'bg-purple-500/20 text-purple-600 dark:text-purple-400 border border-purple-500/30'
+                                  : 'bg-amber-500/20 text-amber-600 dark:text-amber-400 border border-amber-500/30'
+                              }`}
+                            >
+                              {row.role}
+                            </span>
+                          </td>
+                          <td className="p-3 font-mono text-slate-700 dark:text-slate-300">{row.totalInStock.toLocaleString()}</td>
+                          <td className="p-3 font-mono text-slate-700 dark:text-slate-300">{row.totalSold.toLocaleString()}</td>
+                          <td className="p-3 font-mono font-bold text-emerald-600 dark:text-emerald-400">
+                            ${formatMoney(row.grossRevenue)}
+                          </td>
+                          <td className="p-3 font-mono text-slate-700 dark:text-slate-300">
+                            ${formatMoney(row.netProfit)}
+                          </td>
+                          <td className="p-3 font-mono text-rose-600 dark:text-rose-400">
+                            {row.totalDeducted > 0 ? `-$${formatMoney(row.totalDeducted)}` : '—'}
+                          </td>
+                          <td className="p-3 font-mono font-bold text-amber-600 dark:text-amber-400">
+                            ${formatMoney(row.withdrawableBalance)}
+                          </td>
+                          <td className="p-3 text-right">
+                            {row.role === 'ctv' && (
+                              <button
+                                onClick={() => handleOpenDeductModal(row.userId, row.username)}
+                                className="text-[11px] font-semibold px-2.5 py-1 rounded-lg border border-rose-500/30 text-rose-600 dark:text-rose-400 hover:bg-rose-50 hover:dark:bg-rose-950/70 transition"
+                              >
+                                Trừ tiền
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            {/* Lịch sử admin trừ tiền CTV — mỗi lần trừ được lưu vĩnh viễn,
+                cả admin lẫn CTV bị trừ đều xem lại được. */}
+            <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-2xl p-5 shadow space-y-4">
+              <div className="border-b border-[#e0e4e2] dark:border-[#33363e] pb-3">
+                <h3 className="text-base font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                  <AlertCircle className="w-5 h-5 text-rose-600 dark:text-rose-400" />
+                  <span>Lịch Sử Trừ Tiền CTV ({ctvDeductions.length})</span>
+                </h3>
+              </div>
+
+              {ctvDeductions.length === 0 ? (
+                <div className="text-center py-8 text-slate-600 dark:text-slate-400 text-xs">
+                  Chưa có lần trừ tiền nào.
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {ctvDeductions.map((d) => (
+                    <div
+                      key={d.id}
+                      className="flex items-center justify-between gap-3 p-3 bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-lg text-xs"
+                    >
+                      <div className="min-w-0">
+                        <div className="font-bold text-slate-800 dark:text-slate-200">
+                          {d.ctvUsername} <span className="font-normal text-slate-600 dark:text-slate-400">— {d.reason}</span>
+                        </div>
+                        <div className="text-[10px] text-slate-500 dark:text-slate-500">
+                          {new Date(d.createdAt).toLocaleString()} · bởi admin {d.adminUsername}
+                        </div>
+                      </div>
+                      <div className="font-mono font-bold text-rose-600 dark:text-rose-400 flex-shrink-0">
+                        -${formatMoney(d.amount)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Modal: Trừ tiền CTV */}
+            {showDeductModal && (
+              <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                <div className="bg-[#eceeed] dark:bg-[#23252a] border border-rose-500/50 rounded-2xl max-w-sm w-full p-5 shadow-2xl space-y-4">
+                  <div className="flex items-center justify-between pb-2 border-b border-[#e0e4e2] dark:border-[#33363e]">
+                    <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                      <AlertCircle className="w-4 h-4 text-rose-600 dark:text-rose-400" />
+                      <span>Trừ Tiền — {deductTargetUsername}</span>
+                    </h3>
+                    <button
+                      onClick={() => setShowDeductModal(false)}
+                      className="text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100"
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  <form onSubmit={handleSubmitDeduction} className="space-y-3 text-xs">
+                    <div>
+                      <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Số tiền trừ ($):</label>
+                      <input
+                        type="number"
+                        step="0.001"
+                        min="0.001"
+                        value={deductAmount || ''}
+                        onChange={(e) => setDeductAmount(Number(e.target.value))}
+                        className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-rose-500 focus:outline-none"
+                        required
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Lý do trừ tiền:</label>
+                      <textarea
+                        value={deductReason}
+                        onChange={(e) => setDeductReason(e.target.value)}
+                        placeholder="Ví dụ: nạp lô tài khoản die, vi phạm quy định..."
+                        rows={3}
+                        maxLength={500}
+                        className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:border-rose-500 focus:outline-none resize-none"
+                        required
+                      />
+                    </div>
+                    <p className="text-[10px] text-slate-500 dark:text-slate-500">
+                      Số tiền sẽ bị trừ thẳng vào số dư khả dụng rút của CTV và được lưu vĩnh viễn trong lịch sử — CTV cũng sẽ nhìn thấy lần trừ này.
+                    </p>
+                    <div className="flex justify-end gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => setShowDeductModal(false)}
+                        className="px-4 py-2 bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-[#dde1e0] hover:dark:bg-[#373b44] text-slate-700 dark:text-slate-300 rounded-lg"
+                      >
+                        Hủy
+                      </button>
+                      <button
+                        type="submit"
+                        disabled={isSubmittingDeduction}
+                        className="px-4 py-2 bg-rose-600 hover:bg-rose-500 disabled:opacity-50 text-white font-bold rounded-lg transition"
+                      >
+                        {isSubmittingDeduction ? 'Đang trừ...' : 'Xác Nhận Trừ Tiền'}
+                      </button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+            )}
 
             {/* Quản lý các yêu cầu rút tiền từ CTV */}
             <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-2xl p-5 shadow space-y-4">

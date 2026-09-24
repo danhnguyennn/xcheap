@@ -37,7 +37,7 @@ interface ProductDetailProps {
   onRequireLogin: () => void;
 }
 
-export const ProductDetail: React.FC<ProductDetailProps> = ({
+const ProductDetailContent: React.FC<ProductDetailProps> = ({
   product,
   user,
   language,
@@ -1301,4 +1301,30 @@ export const ProductDetail: React.FC<ProductDetailProps> = ({
       )}
     </div>
   );
+};
+
+// A product whose variants are all hidden (or that has none) has nothing
+// purchasable to select — the detail view assumes at least one variant, so
+// this guard shows a plain "unavailable" panel instead of letting it crash the
+// whole page on the first read of the selected variant's price.
+export const ProductDetail: React.FC<ProductDetailProps> = (props) => {
+  if (!props.product.variants || props.product.variants.length === 0) {
+    return (
+      <div className="max-w-2xl mx-auto px-4 py-16 text-center space-y-4">
+        <h2 className="text-lg font-bold text-slate-900 dark:text-slate-100">{props.product.name}</h2>
+        <p className="text-sm text-slate-600 dark:text-slate-400">
+          {props.language === 'vn'
+            ? 'Sản phẩm này hiện tạm ngừng bán.'
+            : 'This product is temporarily unavailable.'}
+        </p>
+        <button
+          onClick={props.onBack}
+          className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm px-4 py-2 rounded-lg transition"
+        >
+          {props.language === 'vn' ? 'Quay lại cửa hàng' : 'Back to store'}
+        </button>
+      </div>
+    );
+  }
+  return <ProductDetailContent {...props} />;
 };

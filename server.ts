@@ -4,8 +4,8 @@ import express from 'express';
 import path from 'path';
 import { cryptoOptions } from './src/data/storeData';
 import { getVipTier } from './src/data/vipTiers';
-import { User, UserRole, Product, Order, PreOrder, AdminNotification, DepositTransaction, CryptoNetwork, CryptoOption, WithdrawalRequest, CtvStats, Category, Voucher, Review, ReviewSuggestion, Language } from './src/types';
-import { db, generateObjectId, MongoCollection } from './server/mongodb';
+import { User, UserRole, Product, Order, PreOrder, AdminNotification, DepositTransaction, CryptoNetwork, CryptoOption, WithdrawalRequest, CtvStats, Category, Voucher, Review, ReviewSuggestion, Language, CtvDeduction } from './src/types';
+import { db, generateObjectId, MongoCollection, inventoryUsernameKey } from './server/mongodb';
 import { getOrCreateUserWallet, ensureUserDepositWallets } from './server/walletVault';
 import { sessionMiddleware, getSessionUser, requireAuth, requireRole, hashPassword, verifyPassword, toPublicUser, generateApiKey } from './server/auth';
 import { ethers } from 'ethers';
@@ -24,6 +24,28 @@ const PORT = 3434;
 // used by the session cookie's "secure: auto" — see server/auth.ts) instead
 // of the internal plain-HTTP hop between cloudflared and this container.
 app.set('trust proxy', 1);
+
+// Express 4 does not catch a rejected promise from an async route handler:
+// any DB hiccup or thrown error inside one becomes an unhandled rejection,
+// which on Node 20 terminates the whole process (every user offline, the
+// request never answered). Wrap every handler/middleware registered through
+// get/post/put/delete so a rejection is forwarded to the error handler
+// installed just before listen() instead. Error-handling middleware (arity 4)
+// is left alone.
+for (const method of ['get', 'post', 'put', 'delete', 'patch'] as const) {
+  const original = (app as any)[method].bind(app);
+  (app as any)[method] = (routePath: any, ...handlers: any[]) => {
+    if (handlers.length === 0) return original(routePath); // app.get('setting')
+    return original(
+      routePath,
+      ...handlers.map((h) =>
+        typeof h === 'function' && h.length < 4
+          ? (req: express.Request, res: express.Response, next: express.NextFunction) => Promise.resolve(h(req, res, next)).catch(next)
+          : h
+      )
+    );
+  };
+}
 
 // Standard production security headers (X-Content-Type-Options, X-Frame-
 // Options, Strict-Transport-Security, etc). crossOriginEmbedderPolicy is
@@ -359,8 +381,110 @@ async function cleanupOldSoldInventory(): Promise<void> {
   }
 }
 
+// One-time-safe migration for data created BEFORE income moved from "which
+// products a CTV owns" to "which rows a CTV actually uploaded" (see
+// Order.uploaderBreakdown / ctvShareOfOrder). The old rule credited a seller
+// with every order on a product they created (createdByUserId). Orders and
+// stock that already exist have no uploader recorded, so without this every
+// seller's historical income would read $0 the moment the new code starts —
+// and they'd be unable to withdraw earnings from past sales. This re-applies
+// the OLD ownership rule to legacy data only, so the numbers come out the
+// same as before the change:
+//   1. an order with no uploaderBreakdown at all is credited, in full, to the
+//      owner of its product;
+//   2. unsold stock with no uploader is stamped with its product's owner (so
+//      future sales of that stock credit them too);
+//   3. a CTV who created a product is granted authorization on it (they used
+//      to be able to restock their own products; now that takes an explicit
+//      grant).
+// Idempotent: it only touches records still missing the data, so running it on
+// every startup is harmless once everything is migrated.
+async function migrateLegacyOwnershipToUploaders(): Promise<void> {
+  const userCol = db.collection<User>('users');
+  const prodCol = db.collection<Product>('products');
+  const orderCol = db.collection<Order>('orders');
+  const invCol = db.collection<any>('inventory');
+
+  const sellers = await userCol.find({ role: { $in: ['ctv', 'admin'] } });
+  const products = await prodCol.find();
+  if (sellers.length === 0 || products.length === 0) return;
+
+  const ownerOf = (product: Product): User | undefined => {
+    if (product.createdByUserId) return sellers.find((u) => u.id === product.createdByUserId);
+    // Products older than createdByUserId: exact display-name match only,
+    // same conservative rule the old ownership check used.
+    const sellerName = product.seller?.name?.toLowerCase() || '';
+    if (!sellerName) return undefined;
+    return sellers.find((u) => sellerName === u.username.toLowerCase() || sellerName === `ctv ${u.username.toLowerCase()}`);
+  };
+  const ownerByProductId = new Map<string, User>();
+  for (const p of products) {
+    const owner = ownerOf(p);
+    if (owner) ownerByProductId.set(p.id, owner);
+  }
+
+  const orders = await orderCol.find();
+  const orderOps = orders
+    .filter((o) => o.uploaderBreakdown === undefined && ownerByProductId.has(o.productId))
+    .map((o) => {
+      const owner = ownerByProductId.get(o.productId)!;
+      return { filter: { id: o.id }, update: { $set: { uploaderBreakdown: [{ userId: owner.id, username: owner.username, quantity: o.quantity }] } } };
+    });
+  if (orderOps.length > 0) await orderCol.bulkWrite(orderOps);
+
+  const unsold = await invCol.find({ isSold: false });
+  const invOps = unsold
+    .filter((row: any) => !row.uploadedByUserId && ownerByProductId.has(row.productId))
+    .map((row: any) => {
+      const owner = ownerByProductId.get(row.productId)!;
+      return { filter: { id: row.id }, update: { $set: { uploadedByUserId: owner.id, uploadedByUsername: owner.username } } };
+    });
+  if (invOps.length > 0) await invCol.bulkWrite(invOps);
+
+  const authOps = products
+    .filter((p) => {
+      const owner = ownerByProductId.get(p.id);
+      return owner?.role === 'ctv' && !(p.authorizedCtvIds || []).includes(owner.id);
+    })
+    .map((p) => ({ filter: { id: p.id }, update: { $set: { authorizedCtvIds: [...(p.authorizedCtvIds || []), ownerByProductId.get(p.id)!.id] } } }));
+  if (authOps.length > 0) await prodCol.bulkWrite(authOps);
+
+  if (orderOps.length + invOps.length + authOps.length > 0) {
+    console.log(`[Migration] Legacy ownership -> uploader attribution: ${orderOps.length} order(s), ${invOps.length} unsold stock row(s), ${authOps.length} CTV authorization(s).`);
+  }
+
+  // Not migrated, just surfaced: anything that can't be bought under the new
+  // price validation would otherwise fail silently at checkout.
+  const badPriced = products.flatMap((p) => (p.variants || []).filter((v) => !isValidPrice(Number(v.price))).map((v) => `${p.name} / ${v.name}`));
+  if (badPriced.length > 0) {
+    console.warn(`[Data check] ${badPriced.length} variant(s) have a non-positive/invalid price and cannot be purchased until fixed: ${badPriced.join('; ')}`);
+  }
+}
+
+// Earlier versions seeded accounts with a fixed, source-visible password.
+// Any privileged account still using it is effectively open to anyone who has
+// read the code — flag them loudly at every startup until it's changed.
+// Runs in the background and only checks admin/CTV accounts (the ones where
+// it matters most, and few enough that the bcrypt compares stay cheap).
+const LEGACY_SEED_PASSWORD = 'Xcheap@2026';
+async function warnAboutLegacyDefaultPasswords(): Promise<void> {
+  const userCol = db.collection<User>('users');
+  const privileged = await userCol.find({ role: { $in: ['admin', 'ctv'] } });
+  const exposed: string[] = [];
+  for (const u of privileged) {
+    if (u.passwordHash && (await verifyPassword(LEGACY_SEED_PASSWORD, u.passwordHash))) {
+      exposed.push(`${u.username} (${u.role})`);
+    }
+  }
+  if (exposed.length > 0) {
+    console.warn(`[SECURITY] ${exposed.length} privileged account(s) still use the old public default password — change it now: ${exposed.join(', ')}`);
+  }
+}
+
 initializeDatabase()
   .then(() => {
+    migrateLegacyOwnershipToUploaders().catch((e) => console.error('[Migration error]', e));
+    warnAboutLegacyDefaultPasswords().catch((e) => console.error('[Security check error]', e));
     cleanupOldSoldInventory().catch((e) => console.error('[Cleanup Error]', e));
     const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // re-check once a day
     setInterval(() => cleanupOldSoldInventory().catch((e) => console.error('[Cleanup Error]', e)), CLEANUP_INTERVAL_MS);
@@ -407,7 +531,6 @@ app.get('/api/user/me', async (req, res) => {
   // Only a user's own /api/user/me response ever carries their real API key
   // back out — every other endpoint returns the key-stripped public shape.
   publicUser.apiKey = user.apiKey;
-
   res.json({ user: publicUser, totalDeposited, totalSpent });
 });
 
@@ -452,7 +575,13 @@ app.post('/api/auth/change-password', requireAuth(), async (req, res) => {
   }
 
   const userCol = db.collection<User>('users');
-  await userCol.updateOne({ id: user.id }, { $set: { passwordHash: await hashPassword(newPassword) } });
+  // Bumping authVersion invalidates every existing session for this account
+  // (a stolen/forgotten login on another device stops working the moment the
+  // password changes). The session making this request is re-stamped with the
+  // new version so THIS device stays logged in.
+  await userCol.updateOne({ id: user.id }, { $set: { passwordHash: await hashPassword(newPassword) }, $inc: { authVersion: 1 } });
+  const refreshed = await userCol.findOne({ id: user.id });
+  if (req.session.userId) req.session.authVersion = refreshed?.authVersion ?? 0;
   res.json({ success: true });
 });
 
@@ -581,6 +710,7 @@ app.post('/api/auth/login', loginRateLimiter, async (req, res) => {
   req.session.regenerate((err) => {
     if (err) return res.status(500).json({ error: 'Lỗi tạo phiên đăng nhập' });
     req.session.userId = user.id;
+    req.session.authVersion = user.authVersion ?? 0;
     req.session.save((saveErr) => {
       if (saveErr) return res.status(500).json({ error: 'Lỗi tạo phiên đăng nhập' });
       res.json({ success: true, user: toPublicUser(user) });
@@ -716,6 +846,34 @@ function generateTxHash(prefix = '0x'): string {
   return prefix + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
 }
 
+// Price sanity for everything an admin types in. A negative price made
+// checkout CREDIT the buyer's wallet instead of charging it, and NaN/Infinity
+// silently poisoned every total computed from it — so anything outside
+// (0, MAX_PRICE] is rejected at write time (and again at checkout, for rows
+// saved before this check existed).
+const MAX_PRICE = 100000;
+const isValidPrice = (n: number): boolean => Number.isFinite(n) && n > 0 && n <= MAX_PRICE;
+
+// For create bodies: price/originalPrice may be left out (blank or 0 means
+// "not provided", default applies) but anything actually provided must be valid.
+function validateOptionalPricing(price: unknown, originalPrice: unknown): string | null {
+  const provided = (v: unknown) => v !== undefined && v !== null && v !== '' && Number(v) !== 0;
+  if (provided(price) && !isValidPrice(Number(price))) return 'Giá bán không hợp lệ (phải lớn hơn 0 và hợp lý).';
+  if (provided(originalPrice) && !isValidPrice(Number(originalPrice))) return 'Giá gốc không hợp lệ.';
+  return null;
+}
+
+function validateVariantsInput(variants: unknown): string | null {
+  if (!Array.isArray(variants)) return 'Danh sách biến thể không hợp lệ.';
+  for (const v of variants) {
+    if (!v || typeof v.name !== 'string' || !v.name.trim()) return 'Mỗi biến thể cần có tên.';
+    if (!isValidPrice(Number(v.price))) return `Giá của biến thể "${v.name}" không hợp lệ (phải lớn hơn 0 và hợp lý).`;
+    const err = validateOptionalPricing(undefined, v.originalPrice);
+    if (err) return err;
+  }
+  return null;
+}
+
 // Discount badges are computed once here, at write time, and stored on the
 // document — every reader (storefront cards, product detail, admin tables)
 // then just displays product.badge / variant.discountBadge directly instead
@@ -753,13 +911,25 @@ async function importInventoryAccounts(
   invCol: MongoCollection<any>,
   productId: string,
   variantId: string,
-  rawAccounts: string
+  rawAccounts: string,
+  uploadedBy: { userId: string; username: string }
 ): Promise<{ importedCount: number; duplicateCount: number; duplicateUsernames: string[] }> {
   const lines = rawAccounts.split('\n').map((l) => l.trim()).filter(Boolean);
-  const extractUsername = (line: string) => line.split('|')[0].trim().toLowerCase();
+  const extractUsername = (line: string) => inventoryUsernameKey(line);
 
-  const allExistingItems = await invCol.find({});
-  const existingUsernames = new Set(allExistingItems.map((item: any) => extractUsername(item.accountData || '')));
+  // Same rule as before — a username that already exists ANYWHERE in the
+  // warehouse (any product/variant, sold rows still within retention
+  // included), or repeats inside this pasted batch, is skipped as a duplicate.
+  // What changed is how "already exists" is found: only the usernames in this
+  // batch are looked up, through the indexed usernameKey, instead of loading
+  // every inventory row on every import.
+  const batchUsernames = [...new Set(lines.map(extractUsername).filter(Boolean))];
+  const existingUsernames = new Set<string>();
+  const LOOKUP_CHUNK = 1000;
+  for (let i = 0; i < batchUsernames.length; i += LOOKUP_CHUNK) {
+    const rows = await invCol.find({ usernameKey: { $in: batchUsernames.slice(i, i + LOOKUP_CHUNK) } });
+    for (const row of rows) existingUsernames.add(row.usernameKey);
+  }
 
   const seenInThisBatch = new Set<string>();
   const uniqueLines: string[] = [];
@@ -775,12 +945,19 @@ async function importInventoryAccounts(
     uniqueLines.push(line);
   }
 
+  const importedAt = Date.now();
+  const batchTag = Math.random().toString(36).slice(2, 7);
   const newItems = uniqueLines.map((line, idx) => ({
-    id: `stk_imported_${Date.now()}_${idx}`,
+    // batchTag keeps ids unique even when two imports land in the same
+    // millisecond (same Date.now() + same idx used to collide).
+    id: `stk_imported_${importedAt}_${batchTag}_${idx}`,
     productId,
     variantId,
     accountData: line,
+    usernameKey: extractUsername(line),
     isSold: false,
+    uploadedByUserId: uploadedBy.userId,
+    uploadedByUsername: uploadedBy.username,
     createdAt: new Date().toISOString(),
   }));
 
@@ -794,6 +971,22 @@ async function importInventoryAccounts(
   }
 
   return { importedCount: newItems.length, duplicateCount: duplicateUsernames.length, duplicateUsernames: duplicateUsernames.slice(0, 30) };
+}
+
+// Groups claimed inventory rows by whoever uploaded them into the
+// Order.uploaderBreakdown snapshot — admin can authorize several CTVs on
+// the same product/variant, so a single purchase's units can come from more
+// than one of them. A row with no uploader recorded (imported before this
+// feature existed) is simply left out rather than guessed at.
+function buildUploaderBreakdown(items: any[]): { userId: string; username: string; quantity: number }[] {
+  const byUploader = new Map<string, { username: string; quantity: number }>();
+  for (const item of items) {
+    if (!item.uploadedByUserId) continue;
+    const existing = byUploader.get(item.uploadedByUserId);
+    if (existing) existing.quantity += 1;
+    else byUploader.set(item.uploadedByUserId, { username: item.uploadedByUsername || '', quantity: 1 });
+  }
+  return Array.from(byUploader.entries()).map(([userId, { username, quantity }]) => ({ userId, username, quantity }));
 }
 
 app.get('/api/products', async (req, res) => {
@@ -810,8 +1003,16 @@ app.get('/api/products', async (req, res) => {
   const canSeeHidden = !!requester && (requester.role === 'admin' || requester.role === 'ctv');
 
   const products = await prodCol.find(canSeeHidden ? {} : { isHidden: { $ne: true } });
-  const unsoldInventory = await invCol.find({ isSold: false });
-  const allReviews = await reviewCol.find();
+  // Counted inside the database, per variant / per product — this public
+  // endpoint runs on every storefront page load, so it must never pull every
+  // unsold account (credentials included) and every review into memory just
+  // to tally them.
+  const stockRows = await invCol.groupBy('variantId', { isSold: false });
+  const stockByVariant = new Map<string, number>(stockRows.map((r) => [r.key, r.count]));
+  const reviewRows = await reviewCol.groupBy('productId', {}, 'rating');
+  const ratingByProduct = new Map<string, { rating: number; reviewCount: number }>(
+    reviewRows.map((r) => [r.key, { rating: r.count > 0 ? Number((r.sum / r.count).toFixed(1)) : 0, reviewCount: r.count }])
+  );
 
   // Enrich products with real-time live MongoDB inventory counts
   const enriched = products.map((p) => {
@@ -821,7 +1022,7 @@ app.get('/api/products', async (req, res) => {
       // falls back to a static declared number, so a variant with no
       // imported accounts correctly shows as out of stock instead of a
       // leftover placeholder count.
-      const count = unsoldInventory.filter((s) => s.variantId === v.id).length;
+      const count = stockByVariant.get(v.id) || 0;
       let cleanBadge = v.discountBadge;
       if (cleanBadge && (cleanBadge.includes('Hết hàng') || cleanBadge.toLowerCase().includes('out of stock'))) {
         cleanBadge = cleanBadge.replace(/Hết hàng|out of stock/gi, '').trim();
@@ -833,14 +1034,22 @@ app.get('/api/products', async (req, res) => {
         discountBadge: cleanBadge || undefined,
       };
     });
+    // authorizedCtvIds (which CTVs may stock this), createdByUserId (the
+    // internal account id of whoever listed it) and seller (whose login name
+    // that is) are internal admin/CTV info — never sent to a regular shopper,
+    // only to the admin/CTV panels that reuse this same endpoint. The
+    // storefront UI doesn't render seller at all.
+    const { authorizedCtvIds, createdByUserId, seller, ...publicFields } = p;
     return {
-      ...p,
+      ...(canSeeHidden ? p : publicFields),
       variants: updatedVariants,
-      ...ratingFromReviews(p.id, allReviews),
+      ...(ratingByProduct.get(p.id) || { rating: 0, reviewCount: 0 }),
     };
   });
 
-  res.json({ products: enriched });
+  // A product whose variants are all hidden has nothing a shopper can buy —
+  // it must not be listed at all (admin/CTV still see it to manage it).
+  res.json({ products: canSeeHidden ? enriched : enriched.filter((p) => p.variants.length > 0) });
 });
 
 // 4. Product Detail (MongoDB: findOne)
@@ -861,11 +1070,15 @@ app.get('/api/products/:id', async (req, res) => {
   if (!canSeeHidden && product.variants) {
     product.variants = product.variants.filter((v) => !v.isHidden);
   }
+  if (!canSeeHidden && (product.variants || []).length === 0) {
+    return res.status(404).json({ error: 'Product not found' });
+  }
 
   if (product.variants) {
-    const unsoldInventory = await invCol.find({ productId: product.id, isSold: false });
+    const stockRows = await invCol.groupBy('variantId', { productId: product.id, isSold: false });
+    const stockByVariant = new Map<string, number>(stockRows.map((r) => [r.key, r.count]));
     product.variants = product.variants.map((v) => {
-      const count = unsoldInventory.filter((s: any) => s.variantId === v.id).length;
+      const count = stockByVariant.get(v.id) || 0;
       let cleanBadge = v.discountBadge;
       if (cleanBadge && (cleanBadge.includes('Hết hàng') || cleanBadge.toLowerCase().includes('out of stock'))) {
         cleanBadge = cleanBadge.replace(/Hết hàng|out of stock/gi, '').trim();
@@ -881,6 +1094,14 @@ app.get('/api/products/:id', async (req, res) => {
 
   const productReviews = await reviewCol.find({ productId: product.id });
   Object.assign(product, ratingFromReviews(product.id, productReviews));
+
+  // Same reasoning as GET /api/products — internal admin/CTV info, never sent
+  // to a regular shopper.
+  if (!canSeeHidden) {
+    delete (product as any).authorizedCtvIds;
+    delete (product as any).createdByUserId;
+    delete (product as any).seller;
+  }
 
   res.json({ product });
 });
@@ -922,7 +1143,10 @@ app.get('/api/products/:id/reviews', async (req, res) => {
       const vipTier = getVipTier(totalDepositedById.get(r.userId) || 0);
       if (vipTier.discountPercent > 0) authorVipTierKey = vipTier.key;
     }
-    return { ...r, author: maskReviewerName(r.author), authorVipTierKey };
+    // The reviewer's internal account id is never sent to other visitors —
+    // only the masked display name is public.
+    const { userId: _reviewerId, ...publicFields } = r;
+    return { ...publicFields, author: maskReviewerName(r.author), authorVipTierKey };
   });
   res.json({ reviews: publicReviews });
 });
@@ -1125,6 +1349,8 @@ app.get('/api/admin/reviews', requireRole('admin', 'ctv'), async (req, res) => {
   const user = (await getSessionUser(req))!;
   const reviewCol = db.collection<Review>('reviews');
   const prodCol = db.collection<Product>('products');
+  const invCol = db.collection<any>('inventory');
+  const orderCol = db.collection<Order>('orders');
 
   const allReviews = await reviewCol.find();
   const allProducts = await prodCol.find();
@@ -1132,7 +1358,20 @@ app.get('/api/admin/reviews', requireRole('admin', 'ctv'), async (req, res) => {
 
   let scopedReviews = allReviews;
   if (user.role === 'ctv') {
-    const myProductIds = new Set(allProducts.filter((p) => ctvOwnsProduct(user, p)).map((p) => p.id));
+    // A product "involves" this CTV if admin has authorized them on it, or
+    // they've ever actually uploaded stock to it (covers a product whose
+    // authorization was later revoked — the CTV should still see reviews
+    // tied to accounts they personally handed over). Combines still-unsold
+    // inventory rows (never pruned) with orders' uploaderBreakdown
+    // (permanent) so a product stays in scope even after its old sold
+    // inventory rows get cleaned up (see cleanupOldSoldInventory).
+    const myProductIds = new Set<string>(allProducts.filter((p) => p.authorizedCtvIds?.includes(user.id)).map((p) => p.id));
+    const myUnsoldRows = await invCol.find({ uploadedByUserId: user.id, isSold: false });
+    for (const row of myUnsoldRows) myProductIds.add(row.productId);
+    const allOrders = await orderCol.find();
+    for (const o of allOrders) {
+      if (o.uploaderBreakdown?.some((e) => e.userId === user.id)) myProductIds.add(o.productId);
+    }
     scopedReviews = allReviews.filter((r) => myProductIds.has(r.productId));
   }
 
@@ -1287,27 +1526,59 @@ async function fulfillPendingPreorders(productId: string, variantId: string): Pr
 
   const product = await prodCol.findOne({ id: productId });
   const variant = product?.variants.find((v) => v.id === variantId);
-  if (!product || !variant) return;
+  if (!product || !variant || !isValidPrice(Number(variant.price))) return;
 
   for (const preorder of pending) {
     const candidateItems = await invCol.find({ variantId, isSold: false }, { limit: preorder.quantity });
     if (candidateItems.length < preorder.quantity) break; // not enough fresh stock yet — wait for the next import
 
-    const claimedItems: any[] = [];
-    for (const item of candidateItems) {
-      const claim = await invCol.updateOne(
-        { id: item.id, isSold: false },
-        { $set: { isSold: true, soldToUserId: preorder.userId, soldAt: new Date().toISOString() } }
-      );
-      if (claim.matchedCount === 1) claimedItems.push(item);
-    }
+    // Single bulkWrite for the whole batch (see the identical fix in
+    // POST /api/orders/checkout) — this whole function runs synchronously
+    // inside the admin/CTV stock-import request, so N sequential updateOne
+    // calls here directly slowed down that request too, not just the buyer.
+    const soldAtNow = new Date().toISOString();
+    const claimResult = await invCol.bulkWrite(
+      candidateItems.map((item) => ({
+        filter: { id: item.id, isSold: false },
+        update: { $set: { isSold: true, soldToUserId: preorder.userId, soldAt: soldAtNow } },
+      }))
+    );
+    const claimedItems =
+      claimResult.matchedCount === candidateItems.length
+        ? candidateItems
+        : await invCol.find({ id: { $in: candidateItems.map((item) => item.id) }, soldToUserId: preorder.userId, soldAt: soldAtNow });
+
     if (claimedItems.length < preorder.quantity) {
-      for (const item of claimedItems) await invCol.updateOne({ id: item.id }, { $set: { isSold: false } });
+      await invCol.bulkWrite(claimedItems.map((item) => ({ filter: { id: item.id }, update: { $set: { isSold: false } } })));
       break;
     }
 
+    const releaseClaimed = () =>
+      invCol.bulkWrite(claimedItems.map((item) => ({ filter: { id: item.id }, update: { $set: { isSold: false } } })));
+
+    // Take exclusive ownership of this pre-order before touching money: two
+    // stock imports finishing at nearly the same time both load the same
+    // pending list, and without this guarded flip each would charge and
+    // deliver the same pre-order again. Only the request whose update
+    // actually matches "still pending" goes on.
+    const ownership = await preorderCol.updateOne(
+      { id: preorder.id, status: 'pending' },
+      { $set: { status: 'fulfilled', fulfilledAt: new Date().toISOString() } }
+    );
+    if (ownership.matchedCount === 0) {
+      await releaseClaimed();
+      continue;
+    }
+
     const buyer = await userCol.findOne({ id: preorder.userId });
-    if (!buyer) continue; // account no longer exists — leave the pre-order as-is, nothing to charge
+    if (!buyer) {
+      // Account no longer exists — nobody to charge or deliver to. Hand the
+      // reserved stock back and close the pre-order instead of leaving those
+      // accounts marked sold with no order behind them.
+      await releaseClaimed();
+      await preorderCol.updateOne({ id: preorder.id }, { $set: { status: 'cancelled' } });
+      continue;
+    }
 
     const unitPrice = await computeUnitPriceForUser(buyer, variant.price);
     const totalPrice = Number((unitPrice * preorder.quantity).toFixed(3));
@@ -1319,7 +1590,7 @@ async function fulfillPendingPreorders(productId: string, variantId: string): Pr
     if (balanceUpdate.matchedCount === 0) {
       // Release the stock back for the next pre-order in line — this buyer's
       // balance is their problem to fix, not a reason to hold up the queue.
-      for (const item of claimedItems) await invCol.updateOne({ id: item.id }, { $set: { isSold: false } });
+      await releaseClaimed();
       await preorderCol.updateOne({ id: preorder.id }, { $set: { status: 'insufficient_balance' } });
       continue;
     }
@@ -1341,12 +1612,10 @@ async function fulfillPendingPreorders(productId: string, variantId: string): Pr
       accounts: deliveredAccounts,
       createdAt: new Date().toISOString(),
       status: 'completed',
+      uploaderBreakdown: buildUploaderBreakdown(claimedItems),
     };
     await orderCol.insertOne(newOrder);
-    await preorderCol.updateOne(
-      { id: preorder.id },
-      { $set: { status: 'fulfilled', fulfilledAt: new Date().toISOString(), orderId } }
-    );
+    await preorderCol.updateOne({ id: preorder.id }, { $set: { orderId } });
   }
 }
 
@@ -1375,6 +1644,26 @@ app.post('/api/orders/checkout', async (req, res) => {
   const variant = (product.variants || []).find((v) => v.id === variantId);
   if (!variant) return res.status(404).json({ error: 'Variant not found' });
 
+  // Defense in depth for rows saved before price validation existed — a
+  // non-positive / non-finite price must never reach the charge math (a
+  // negative total would credit the buyer instead of charging them).
+  if (!isValidPrice(Number(variant.price))) {
+    return res.status(400).json({ error: 'Giá của sản phẩm này đang không hợp lệ — vui lòng liên hệ admin.' });
+  }
+
+  // A product/variant an admin pulled off the storefront (isHidden) must not
+  // stay purchasable by anyone who still knows its id — hiding it is how
+  // selling gets paused. Admin/CTV keep access, same as they still see hidden
+  // items in the product listings.
+  if ((product.isHidden || variant.isHidden) && user.role === 'user') {
+    return res.status(404).json({ error: 'Sản phẩm này hiện không được bán.' });
+  }
+
+  // Lock out coupon guessing before any stock is touched.
+  if (couponCode && isCouponLocked(user.id)) {
+    return res.status(429).json({ error: COUPON_LOCKED_MESSAGE });
+  }
+
   let unitPrice = await computeUnitPriceForUser(user, variant.price);
 
   // Reserve real inventory BEFORE any money changes hands. Each claim is
@@ -1390,19 +1679,31 @@ app.post('/api/orders/checkout', async (req, res) => {
     });
   }
 
-  const claimedItems: any[] = [];
-  for (const item of candidateItems) {
-    const claim = await invCol.updateOne(
-      { id: item.id, isSold: false },
-      { $set: { isSold: true, soldToUserId: user.id, soldAt: new Date().toISOString() } }
-    );
-    if (claim.matchedCount === 1) claimedItems.push(item);
-  }
+  // One bulkWrite for the whole batch instead of one updateOne per item —
+  // buying a large quantity used to mean that many sequential DB round-trips
+  // (seconds to minutes for a few hundred accounts); this is a single
+  // round-trip regardless of quantity. Each op still carries its own
+  // isSold:false guard, so the race-safety against concurrent buyers is
+  // unchanged. bulkWrite only reports an aggregate matchedCount, not which
+  // specific ops matched — but since candidateItems were just read as
+  // isSold:false a moment ago, matchedCount === candidateItems.length in the
+  // overwhelming majority of requests (no concurrent claim happened in that
+  // gap), so the fast path skips the extra verification read entirely; the
+  // rarer case (a race actually occurred) is verified precisely below.
+  const soldAtNow = new Date().toISOString();
+  const claimResult = await invCol.bulkWrite(
+    candidateItems.map((item) => ({
+      filter: { id: item.id, isSold: false },
+      update: { $set: { isSold: true, soldToUserId: user.id, soldAt: soldAtNow } },
+    }))
+  );
+  const claimedItems =
+    claimResult.matchedCount === candidateItems.length
+      ? candidateItems
+      : await invCol.find({ id: { $in: candidateItems.map((item) => item.id) }, soldToUserId: user.id, soldAt: soldAtNow });
 
   const releaseClaimedItems = async () => {
-    for (const item of claimedItems) {
-      await invCol.updateOne({ id: item.id }, { $set: { isSold: false } });
-    }
+    await invCol.bulkWrite(claimedItems.map((item) => ({ filter: { id: item.id }, update: { $set: { isSold: false } } })));
   };
 
   if (claimedItems.length < quantity) {
@@ -1426,30 +1727,35 @@ app.post('/api/orders/checkout', async (req, res) => {
     const cleanCode = String(couponCode).trim().toUpperCase();
     const voucher = await voucherCol.findOne({ code: cleanCode });
 
-    if (!voucher) {
-      return res.status(400).json({ error: 'Mã giảm giá không tồn tại' });
-    }
+    // Every rejection below happens AFTER the inventory was reserved above,
+    // so each one must hand those accounts back — otherwise anyone could
+    // drain the stock just by submitting a bad/expired code.
+    const rejectVoucher = async (error: string) => {
+      recordCouponFailure(user.id);
+      await releaseClaimedItems();
+      return res.status(400).json({ error });
+    };
+
+    if (!voucher) return rejectVoucher('Mã giảm giá không tồn tại');
     if (voucher.expiresAt && new Date(voucher.expiresAt).getTime() < Date.now()) {
-      return res.status(400).json({ error: 'Mã giảm giá đã hết hạn' });
+      return rejectVoucher('Mã giảm giá đã hết hạn');
     }
     if (voucher.applicableProductId && voucher.applicableProductId !== productId) {
-      return res.status(400).json({
-        error: `Mã giảm giá này chỉ áp dụng cho sản phẩm "${voucher.applicableProductName || voucher.applicableProductId}"`,
-      });
+      return rejectVoucher(
+        `Mã giảm giá này chỉ áp dụng cho sản phẩm "${voucher.applicableProductName || voucher.applicableProductId}"`
+      );
     }
     if (voucher.applicableVariantId && voucher.applicableVariantId !== variant.id) {
-      return res.status(400).json({
-        error: `Mã giảm giá này chỉ áp dụng cho biến thể "${voucher.applicableVariantName || voucher.applicableVariantId}"`,
-      });
+      return rejectVoucher(
+        `Mã giảm giá này chỉ áp dụng cho biến thể "${voucher.applicableVariantName || voucher.applicableVariantId}"`
+      );
     }
 
     const redemption = await voucherCol.updateOne(
       { code: cleanCode, usedCount: { $lt: voucher.maxUses } },
       { $inc: { usedCount: 1 } }
     );
-    if (redemption.matchedCount === 0) {
-      return res.status(400).json({ error: 'Mã giảm giá đã hết lượt sử dụng' });
-    }
+    if (redemption.matchedCount === 0) return rejectVoucher('Mã giảm giá đã hết lượt sử dụng');
 
     redeemedVoucher = voucher;
     unitPrice = Number((unitPrice * (1 - voucher.discountPercent / 100)).toFixed(3));
@@ -1510,6 +1816,7 @@ app.post('/api/orders/checkout', async (req, res) => {
     accounts: deliveredAccounts,
     createdAt: new Date().toISOString(),
     status: 'completed',
+    uploaderBreakdown: buildUploaderBreakdown(claimedItems),
   };
 
   await orderCol.insertOne(newOrder);
@@ -1555,6 +1862,9 @@ app.post('/api/products/:id/preorder', async (req, res) => {
   if (!product) return res.status(404).json({ error: 'Không tìm thấy sản phẩm' });
   const variant = (product.variants || []).find((v) => v.id === variantId);
   if (!variant) return res.status(404).json({ error: 'Không tìm thấy phân loại' });
+  if ((product.isHidden || variant.isHidden) && user.role === 'user') {
+    return res.status(404).json({ error: 'Sản phẩm này hiện không được bán.' });
+  }
 
   const cleanQuantity = Math.max(1, Math.floor(Number(quantity)) || 1);
 
@@ -1719,22 +2029,22 @@ app.get('/api/admin/orders', requireRole('admin'), async (req, res) => {
   res.json({ orders });
 });
 
-// CTV order management — only orders for products this CTV actually owns
-// (ctvOwnsProduct, defined further down but hoisted — this route only runs
-// at request time, well after the whole module has finished loading). No
-// "show something anyway" fallback like the chart-stats endpoint has: a
-// CTV who owns nothing sees an empty list here, never another CTV's orders.
+// CTV order management — only orders this CTV actually contributed stock to
+// (has an entry in uploaderBreakdown; buildUploaderBreakdown and
+// ctvShareOfOrder are defined further down but hoisted — this route only
+// runs at request time, well after the whole module has finished loading).
+// A CTV who's uploaded nothing sees an empty list here, never another
+// CTV's orders.
 app.get('/api/ctv/orders', requireRole('admin', 'ctv'), async (req, res) => {
-  const prodCol = db.collection<Product>('products');
   const orderCol = db.collection<Order>('orders');
 
   const ctvUser = (await getSessionUser(req))!;
-  const allProducts = await prodCol.find();
-  const myProductIds = new Set(allProducts.filter((p) => ctvOwnsProduct(ctvUser, p)).map((p) => p.id));
-
   const allOrders = await orderCol.find();
+  // An order shows up here if this CTV uploaded any part of what it
+  // contains — admin can grant several CTVs the same product, so "products
+  // I'm authorized on" no longer decides this on its own.
   const myOrders = allOrders
-    .filter((o) => myProductIds.has(o.productId))
+    .filter((o) => o.uploaderBreakdown?.some((e) => e.userId === ctvUser.id))
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
   res.json({ orders: myOrders });
@@ -1750,23 +2060,41 @@ app.get('/api/ctv/orders', requireRole('admin', 'ctv'), async (req, res) => {
 app.post('/api/orders/:orderCode/refund', requireRole('admin', 'ctv'), async (req, res) => {
   const orderCol = db.collection<Order>('orders');
   const userCol = db.collection<User>('users');
-  const prodCol = db.collection<Product>('products');
 
   const order = await orderCol.findOne({ orderCode: req.params.orderCode });
   if (!order) return res.status(404).json({ error: 'Không tìm thấy đơn hàng' });
   if (order.status === 'refunded') return res.status(400).json({ error: 'Đơn hàng này đã được hoàn tiền trước đó' });
 
   const actor = (await getSessionUser(req))!;
-  if (actor.role === 'ctv') {
-    const product = await prodCol.findOne({ id: order.productId });
-    if (!product || !ctvOwnsProduct(actor, product)) {
-      return res.status(403).json({ error: 'Bạn không có quyền hoàn tiền đơn hàng này' });
-    }
+  // A CTV can refund an order if they uploaded any part of what it
+  // contains — admin can grant several CTVs the same product, so "products
+  // I'm authorized on" no longer decides this. There's no partial refund,
+  // so any contributing CTV can refund the whole order (matches the
+  // existing all-or-nothing refund model).
+  if (actor.role === 'ctv' && !order.uploaderBreakdown?.some((e) => e.userId === actor.id)) {
+    return res.status(403).json({ error: 'Bạn không có quyền hoàn tiền đơn hàng này' });
   }
 
-  await userCol.updateOne({ id: order.userId }, { $inc: { balance: order.totalPrice } });
+  // Flip the status FIRST with a guard on "not already refunded", and only
+  // credit the wallet if that update actually matched — the earlier
+  // read-check-then-credit let parallel refund requests all pass the check
+  // and each credit the buyer, paying the same order out several times.
   const refundedAt = new Date().toISOString();
-  await orderCol.updateOne({ orderCode: order.orderCode }, { $set: { status: 'refunded', refundedAt } });
+  const claim = await orderCol.updateOne(
+    { orderCode: order.orderCode, status: { $ne: 'refunded' } },
+    { $set: { status: 'refunded', refundedAt } }
+  );
+  if (claim.matchedCount === 0) {
+    return res.status(400).json({ error: 'Đơn hàng này đã được hoàn tiền trước đó' });
+  }
+  try {
+    await userCol.updateOne({ id: order.userId }, { $inc: { balance: order.totalPrice } });
+  } catch (err) {
+    // Credit failed after the status flipped — put the order back so the
+    // refund can be retried instead of being marked done with no money moved.
+    await orderCol.updateOne({ orderCode: order.orderCode }, { $set: { status: 'completed', refundedAt: '' } });
+    throw err;
+  }
 
   const updated = await orderCol.findOne({ orderCode: order.orderCode });
   res.json({ success: true, order: updated });
@@ -1800,6 +2128,7 @@ app.get('/api/deposit/wallets', async (req, res) => {
 // 9. Real RPC Check / Poll endpoint
 app.post('/api/deposit/check-rpc', async (req, res) => {
   const { network = 'bsc' } = req.body as { network: CryptoNetwork };
+  if (typeof network !== 'string') return res.status(400).json({ error: 'Invalid network' });
   const userCol = db.collection<User>('users');
   const depCol = db.collection<DepositTransaction>('deposits');
   const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
@@ -1824,6 +2153,11 @@ app.post('/api/deposit/check-rpc', async (req, res) => {
 
   let onChainBalance = 0;
   let rpcStatus = 'online';
+  // True only when the chain was actually queried and answered. A failed or
+  // unsupported lookup leaves onChainBalance at 0 — that must never be
+  // treated as "the wallet is empty" (it would reset the checkpoint below and
+  // re-credit the whole balance on the next successful poll).
+  let rpcOk = false;
   let blockNumber = 42100980 + Math.floor(Math.random() * 100);
 
   try {
@@ -1847,47 +2181,80 @@ app.post('/api/deposit/check-rpc', async (req, res) => {
           new Promise((_, reject) => setTimeout(() => reject(new Error('RPC timeout')), 3500)),
         ])) as bigint;
         onChainBalance = Number(ethers.formatUnits(balanceBigInt, cryptoConfig.decimals));
+        rpcOk = true;
       }
     } catch (rpcErr: any) {
       rpcStatus = 'active';
     }
 
-    // "Already credited" is derived from every deposit already recorded for
-    // this user+network in the database — never from in-memory state, which
-    // would reset to 0 on every server restart (or differ across instances
-    // behind a load balancer) and silently re-credit the user's entire
-    // on-chain balance as if it were a brand new deposit.
+    // Credit = how much the wallet's on-chain balance has GROWN since the last
+    // time it was observed. The last observed balance is stored per
+    // user+network (deposit_checkpoints), not derived from lifetime credited
+    // totals: comparing against lifetime totals meant that once funds were
+    // swept out of a user's deposit wallet, the on-chain balance sat below the
+    // "already credited" total and every later deposit went uncredited until
+    // it climbed back past it. A drop (sweep/withdrawal) now just moves the
+    // checkpoint down without crediting anything.
+    // Persisted in the DB (never in memory), so a restart can't re-credit an
+    // existing balance. With no checkpoint yet (first check, or accounts that
+    // predate this), fall back to the sum of deposits already recorded — the
+    // old behavior — so nothing already credited is credited twice.
+    const cpCol = db.collection<any>('deposit_checkpoints');
+    const checkpoint = await cpCol.findOne({ userId: user.id, network });
     const priorDeposits = await depCol.find({ userId: user.id, network });
-    const alreadyCredited = Number(priorDeposits.reduce((sum, d) => sum + d.amount, 0).toFixed(3));
-    const newDepositDelta = onChainBalance - alreadyCredited;
+    // Rows from the removed "simulated test deposit" tool (id tx_sim_...) were
+    // never real on-chain funds — counting them would inflate the baseline and
+    // swallow that account's first genuine deposit until it exceeded them.
+    const alreadyCredited = Number(
+      priorDeposits.filter((d) => !String(d.id).startsWith('tx_sim_')).reduce((sum, d) => sum + d.amount, 0).toFixed(3)
+    );
+    const baseline: number = checkpoint ? Number(checkpoint.lastBalance) : alreadyCredited;
+    const newDepositDelta = onChainBalance - baseline;
 
     let creditedNow = 0;
     let newBalance = user.balance;
 
-    // A >=0.001 floor (rather than >0) avoids sub-thousandth floating-point
-    // dust re-triggering a $0.000 "deposit" — and a fresh zero-amount
-    // transaction row — on every 15-second auto-poll forever.
-    if (newDepositDelta >= 0.001) {
-      creditedNow = Number(newDepositDelta.toFixed(3));
-      await userCol.updateOne({ id: user.id }, { $inc: { balance: creditedNow } });
-      const updatedUser = await userCol.findOne({ id: user.id });
-      newBalance = updatedUser ? updatedUser.balance : Number((user.balance + creditedNow).toFixed(3));
+    if (rpcOk) {
+      // Move the checkpoint BEFORE crediting: if the process dies between the
+      // two steps the worst case is one under-credited deposit that shows up in
+      // the logs, never the same on-chain funds credited twice.
+      if (checkpoint) {
+        await cpCol.updateOne({ userId: user.id, network }, { $set: { lastBalance: onChainBalance, updatedAt: new Date().toISOString() } });
+      } else {
+        await cpCol.insertOne({ id: `cp_${user.id}_${network}`, userId: user.id, network, lastBalance: onChainBalance, updatedAt: new Date().toISOString() });
+      }
 
-      const newTx: DepositTransaction = {
-        id: 'tx_' + Date.now(),
-        userId: user.id,
-        username: user.username,
-        network,
-        tokenSymbol: cryptoConfig.token,
-        amount: creditedNow,
-        walletAddress: userAddress,
-        txHash: generateTxHash(),
-        blockNumber,
-        timestamp: new Date().toISOString(),
-        status: 'confirmed',
-        detectedVia: cryptoConfig.rpcUrl,
-      };
-      await depCol.insertOne(newTx);
+      // A >=0.001 floor (rather than >0) avoids sub-thousandth floating-point
+      // dust re-triggering a $0.000 "deposit" row on every 15-second poll.
+      if (newDepositDelta >= 0.001) {
+        creditedNow = Number(newDepositDelta.toFixed(3));
+        try {
+          await userCol.updateOne({ id: user.id }, { $inc: { balance: creditedNow } });
+          const updatedUser = await userCol.findOne({ id: user.id });
+          newBalance = updatedUser ? updatedUser.balance : Number((user.balance + creditedNow).toFixed(3));
+
+          // The observation is balance-based, so the specific on-chain tx hash
+          // isn't known here — left empty rather than invented.
+          const newTx: DepositTransaction = {
+            id: 'tx_' + Date.now(),
+            userId: user.id,
+            username: user.username,
+            network,
+            tokenSymbol: cryptoConfig.token,
+            amount: creditedNow,
+            walletAddress: userAddress,
+            txHash: '',
+            blockNumber: 0,
+            timestamp: new Date().toISOString(),
+            status: 'confirmed',
+            detectedVia: cryptoConfig.rpcUrl,
+          };
+          await depCol.insertOne(newTx);
+        } catch (err) {
+          console.error(`[Deposit] Failed to credit ${creditedNow} for user ${user.id} on ${network} after moving checkpoint — needs manual review.`, err);
+          throw err;
+        }
+      }
     }
 
     res.json({
@@ -1905,52 +2272,6 @@ app.post('/api/deposit/check-rpc', async (req, res) => {
   } finally {
     depositCheckInProgress.delete(lockKey);
   }
-});
-
-// 10. Simulate Test Deposit via RPC — admin only
-app.post('/api/deposit/simulate-test', requireRole('admin'), async (req, res) => {
-  const { network = 'bsc', amount = 10 } = req.body as { network: CryptoNetwork; amount: number };
-  const userCol = db.collection<User>('users');
-  const depCol = db.collection<DepositTransaction>('deposits');
-  const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
-  const user = (await getSessionUser(req))!;
-
-  const cryptoConfig = await cryptoOptCol.findOne({ id: network });
-  if (!cryptoConfig) return res.status(400).json({ error: 'Invalid network' });
-
-  const depositAmt = Math.max(1, Number(amount) || 10);
-  const userAddress = (await ensureUserDepositWallets(user))[network];
-
-  await userCol.updateOne({ id: user.id }, { $inc: { balance: depositAmt } });
-  const updatedUser = await userCol.findOne({ id: user.id });
-  const newBalance = updatedUser ? updatedUser.balance : Number((user.balance + depositAmt).toFixed(3));
-
-  const txHash = generateTxHash(network === 'trc' ? 'tron_' : '0x');
-  const block = 42100000 + Math.floor(Math.random() * 50000);
-
-  const newTx: DepositTransaction = {
-    id: 'tx_sim_' + Date.now(),
-    userId: user.id,
-    username: user.username,
-    network,
-    tokenSymbol: cryptoConfig.token,
-    amount: depositAmt,
-    walletAddress: userAddress,
-    txHash,
-    blockNumber: block,
-    timestamp: new Date().toISOString(),
-    status: 'confirmed',
-    detectedVia: `RPC Node (${cryptoConfig.rpcUrl})`,
-  };
-
-  await depCol.insertOne(newTx);
-
-  res.json({
-    success: true,
-    creditedAmount: depositAmt,
-    newBalance,
-    tx: newTx,
-  });
 });
 
 // 10b. Deposit networks (crypto_options) CRUD — lets admin edit display
@@ -2032,12 +2353,30 @@ app.delete('/api/admin/crypto-options/:id', requireRole('admin'), async (req, re
 app.post('/api/admin/stock/bulk-import', requireRole('admin', 'ctv'), async (req, res) => {
   const { productId, variantId, rawAccounts } = req.body;
   const invCol = db.collection<any>('inventory');
+  const prodCol = db.collection<Product>('products');
 
   if (!rawAccounts || typeof rawAccounts !== 'string') {
     return res.status(400).json({ error: 'Vui lòng cung cấp danh sách tài khoản hợp lệ' });
   }
 
-  const result = await importInventoryAccounts(invCol, productId, variantId, rawAccounts);
+  const product = await prodCol.findOne({ id: productId });
+  if (!product) return res.status(404).json({ error: 'Không tìm thấy sản phẩm' });
+
+  // CTV no longer creates products — only admin does, then explicitly
+  // grants specific CTV(s) permission to stock a given product (see POST
+  // /api/admin/products/:id/authorize-ctv). Without this check, picking the
+  // wrong option (or doing it on purpose) would silently dump a CTV's
+  // accounts into a storefront they were never granted access to. Admin can
+  // still stock any product.
+  const uploader = (await getSessionUser(req))!;
+  if (uploader.role === 'ctv' && !product.authorizedCtvIds?.includes(uploader.id)) {
+    return res.status(403).json({ error: 'Bạn chưa được admin cấp quyền bán sản phẩm này.' });
+  }
+
+  const result = await importInventoryAccounts(invCol, productId, variantId, rawAccounts, {
+    userId: uploader.id,
+    username: uploader.username,
+  });
 
   // Stock is never stored on the variant — GET /api/products always counts
   // unsold inventory rows live, so there's nothing else to update here.
@@ -2202,18 +2541,30 @@ app.get('/api/categories', async (req, res) => {
   res.json({ categories });
 });
 
+// Same normalization for create and edit so a slug means one thing everywhere:
+// lowercase, whitespace collapsed to "-". Returns '' for anything unusable.
+function normalizeCategorySlug(raw: unknown): string {
+  return typeof raw === 'string' ? raw.trim().toLowerCase().replace(/\s+/g, '-') : '';
+}
+
 app.post('/api/admin/categories', requireRole('admin'), async (req, res) => {
   const { name, slug, description, icon } = req.body;
-  if (!name || !slug) return res.status(400).json({ error: 'Tên và mã định danh (slug) là bắt buộc' });
+  const cleanName = typeof name === 'string' ? name.trim() : '';
+  const cleanSlug = normalizeCategorySlug(slug);
+  if (!cleanName || !cleanSlug) return res.status(400).json({ error: 'Tên và mã định danh (slug) là bắt buộc' });
 
   const catCol = db.collection<Category>('categories');
-  const cleanSlug = slug.toLowerCase().replace(/\s+/g, '-');
+  // A slug is the join key products filter by — two categories sharing one
+  // (or a new slug equal to an existing category's id) would merge them.
+  const clash = (await catCol.find()).find((c) => c.slug === cleanSlug || c.id === cleanSlug);
+  if (clash) return res.status(400).json({ error: `Slug "${cleanSlug}" đã được dùng bởi danh mục "${clash.name}"` });
+
   const newCat: Category = {
     id: cleanSlug,
-    name,
+    name: cleanName,
     slug: cleanSlug,
-    icon: icon || 'other',
-    description: description || '',
+    icon: typeof icon === 'string' && icon ? icon : 'other',
+    description: typeof description === 'string' ? description : '',
   };
 
   await catCol.insertOne(newCat);
@@ -2222,13 +2573,43 @@ app.post('/api/admin/categories', requireRole('admin'), async (req, res) => {
 
 app.put('/api/admin/categories/:id', requireRole('admin'), async (req, res) => {
   const { id } = req.params;
-  const { name, slug, description, icon } = req.body;
   const catCol = db.collection<Category>('categories');
+  const prodCol = db.collection<Product>('products');
+  const existing = await catCol.findOne({ id });
+  if (!existing) return res.status(404).json({ error: 'Không tìm thấy danh mục' });
 
-  await catCol.updateOne(
-    { id },
-    { $set: { name, slug, description, icon } }
-  );
+  // Only fields actually sent are changed — omitting one must never blank it
+  // (a $set of `undefined` used to overwrite the stored value with nothing).
+  const { name, slug, description, icon } = req.body;
+  const updates: Partial<Category> = {};
+  if (name !== undefined) {
+    const cleanName = typeof name === 'string' ? name.trim() : '';
+    if (!cleanName) return res.status(400).json({ error: 'Tên danh mục không được để trống' });
+    updates.name = cleanName;
+  }
+  if (slug !== undefined) {
+    const cleanSlug = normalizeCategorySlug(slug);
+    if (!cleanSlug) return res.status(400).json({ error: 'Slug không hợp lệ' });
+    const clash = (await catCol.find()).find((c) => c.id !== existing.id && (c.slug === cleanSlug || c.id === cleanSlug));
+    if (clash) return res.status(400).json({ error: `Slug "${cleanSlug}" đã được dùng bởi danh mục "${clash.name}"` });
+    updates.slug = cleanSlug;
+  }
+  if (typeof description === 'string') updates.description = description;
+  if (typeof icon === 'string' && icon) updates.icon = icon;
+
+  await catCol.updateOne({ id }, { $set: updates });
+
+  // Products point at their category by slug (filter/counts) and carry its
+  // display name — renaming/re-slugging the category has to carry them along,
+  // or the storefront filter silently stops matching those products.
+  const nextSlug = updates.slug ?? existing.slug;
+  const nextName = updates.name ?? existing.name;
+  if (nextSlug !== existing.slug || nextName !== existing.name) {
+    const affected = await prodCol.find({ categorySlug: existing.slug });
+    await prodCol.bulkWrite(
+      affected.map((p) => ({ filter: { id: p.id }, update: { $set: { categorySlug: nextSlug, category: nextName } } }))
+    );
+  }
 
   const updated = await catCol.findOne({ id });
   res.json({ success: true, category: updated });
@@ -2237,6 +2618,19 @@ app.put('/api/admin/categories/:id', requireRole('admin'), async (req, res) => {
 app.delete('/api/admin/categories/:id', requireRole('admin'), async (req, res) => {
   const { id } = req.params;
   const catCol = db.collection<Category>('categories');
+  const prodCol = db.collection<Product>('products');
+  const existing = await catCol.findOne({ id });
+  if (!existing) return res.status(404).json({ error: 'Không tìm thấy danh mục' });
+
+  // Deleting a category that still has products would leave them in a
+  // category that no longer exists (reachable only through "all"). Make the
+  // admin move or remove them first instead of orphaning them silently.
+  const inUse = await prodCol.countDocuments({ categorySlug: existing.slug });
+  if (inUse > 0) {
+    return res.status(400).json({
+      error: `Danh mục "${existing.name}" đang có ${inUse} sản phẩm — hãy chuyển hoặc xóa các sản phẩm đó trước khi xóa danh mục.`,
+    });
+  }
   await catCol.deleteOne({ id });
   res.json({ success: true });
 });
@@ -2251,11 +2645,13 @@ app.post('/api/admin/products', requireRole('admin'), async (req, res) => {
   const adminUser = (await getSessionUser(req))!;
   const prodCol = db.collection<Product>('products');
   const newId = 'prod-' + Math.random().toString(36).substring(2, 8);
+  const pricingError = validateOptionalPricing(price, originalPrice) || (variants.length > 0 || !Array.isArray(variants) ? validateVariantsInput(variants) : null);
+  if (pricingError) return res.status(400).json({ error: pricingError });
   const resolvedPrice = Number(price) || 0.5;
   const resolvedOriginalPrice = originalPrice ? Number(originalPrice) : undefined;
   const resolvedVariants =
     variants.length > 0
-      ? variants.map((v: any) => ({ ...v, discountBadge: computeDiscountBadge(Number(v.price), v.originalPrice ? Number(v.originalPrice) : undefined) }))
+      ? variants.map((v: any) => ({ ...v, id: v.id || 'var-' + Math.random().toString(36).substring(2, 6), discountBadge: computeDiscountBadge(Number(v.price), v.originalPrice ? Number(v.originalPrice) : undefined) }))
       : [
           {
             id: 'var-' + Math.random().toString(36).substring(2, 6),
@@ -2312,6 +2708,17 @@ app.put('/api/admin/products/:id', requireRole('admin'), async (req, res) => {
   const existing = await prodCol.findOne({ id });
   if (!existing) return res.status(404).json({ error: 'Không tìm thấy sản phẩm' });
 
+  if ('price' in updateFields && !isValidPrice(Number(updateFields.price))) {
+    return res.status(400).json({ error: 'Giá bán không hợp lệ (phải lớn hơn 0 và hợp lý).' });
+  }
+  if (updateFields.originalPrice && !isValidPrice(Number(updateFields.originalPrice))) {
+    return res.status(400).json({ error: 'Giá gốc không hợp lệ.' });
+  }
+  if ('variants' in updateFields) {
+    const variantsError = validateVariantsInput(updateFields.variants);
+    if (variantsError) return res.status(400).json({ error: variantsError });
+  }
+
   const merged = { ...existing, ...updateFields };
   const recomputedBadge = computeBestBadge(merged);
 
@@ -2338,8 +2745,53 @@ app.delete('/api/admin/products/:id', requireRole('admin'), async (req, res) => 
 
   await prodCol.deleteOne({ id });
   await invCol.deleteMany({ productId: id });
+  await cancelOpenPreorders({ productId: id });
   res.json({ success: true });
 });
+
+// Admin grants (or revokes) a specific CTV's permission to upload stock
+// into this product — the only way a CTV gets access to a storefront at
+// all now (see the ownership check in POST /api/admin/stock/bulk-import).
+// Several CTVs can be granted the same product; that's expected, not an
+// edge case — income still comes out correctly split per uploaded row
+// (see uploaderBreakdown / ctvShareOfOrder) regardless of how many CTVs
+// share it.
+app.post('/api/admin/products/:id/authorize-ctv', requireRole('admin'), async (req, res) => {
+  const { ctvUserId, authorized } = req.body;
+  if (typeof ctvUserId !== 'string' || !ctvUserId) {
+    return res.status(400).json({ error: 'Thiếu ctvUserId' });
+  }
+  if (typeof authorized !== 'boolean') {
+    return res.status(400).json({ error: 'Thiếu trường authorized (boolean)' });
+  }
+
+  const prodCol = db.collection<Product>('products');
+  const userCol = db.collection<User>('users');
+  const product = await prodCol.findOne({ id: req.params.id });
+  if (!product) return res.status(404).json({ error: 'Không tìm thấy sản phẩm' });
+
+  const ctv = await userCol.findOne({ id: ctvUserId });
+  if (!ctv || ctv.role !== 'ctv') return res.status(400).json({ error: 'Tài khoản này không phải CTV' });
+
+  const current = new Set(product.authorizedCtvIds || []);
+  if (authorized) current.add(ctvUserId);
+  else current.delete(ctvUserId);
+
+  await prodCol.updateOne({ id: req.params.id }, { $set: { authorizedCtvIds: Array.from(current) } });
+  const updated = await prodCol.findOne({ id: req.params.id });
+  res.json({ success: true, product: updated });
+});
+
+// A pre-order waiting on a variant/product that no longer exists can never be
+// fulfilled — left alone it would sit "pending" forever on the buyer's account
+// page and in admin's list. Close those out as cancelled (no money was ever
+// held for a pre-order, so nothing to refund).
+async function cancelOpenPreorders(filter: { productId?: string; variantId?: string }): Promise<number> {
+  const preorderCol = db.collection<PreOrder>('preorders');
+  const open = await preorderCol.find({ ...filter, status: { $in: ['pending', 'insufficient_balance'] } } as any);
+  await preorderCol.bulkWrite(open.map((p) => ({ filter: { id: p.id }, update: { $set: { status: 'cancelled' as const } } })));
+  return open.length;
+}
 
 // 15b. Variants CRUD — variants live embedded on their parent product
 // document but are managed as their own resource here (add/edit/delete),
@@ -2349,6 +2801,10 @@ app.post('/api/admin/products/:id/variants', requireRole('admin'), async (req, r
   if (!name || !price) {
     return res.status(400).json({ error: 'Tên và giá biến thể là bắt buộc' });
   }
+  const variantPricingError = !isValidPrice(Number(price))
+    ? 'Giá biến thể không hợp lệ (phải lớn hơn 0 và hợp lý).'
+    : validateOptionalPricing(undefined, originalPrice);
+  if (variantPricingError) return res.status(400).json({ error: variantPricingError });
 
   const prodCol = db.collection<Product>('products');
   const product = await prodCol.findOne({ id: req.params.id });
@@ -2382,6 +2838,13 @@ app.put('/api/admin/products/:id/variants/:variantId', requireRole('admin'), asy
   const idx = variants.findIndex((v) => v.id === req.params.variantId);
   if (idx === -1) return res.status(404).json({ error: 'Không tìm thấy biến thể' });
 
+  if (price !== undefined && !isValidPrice(Number(price))) {
+    return res.status(400).json({ error: 'Giá biến thể không hợp lệ (phải lớn hơn 0 và hợp lý).' });
+  }
+  if (originalPrice !== undefined) {
+    const originalError = validateOptionalPricing(undefined, originalPrice);
+    if (originalError) return res.status(400).json({ error: originalError });
+  }
   const nextPrice = price !== undefined ? Number(price) : variants[idx].price;
   const nextOriginalPrice = originalPrice !== undefined ? (originalPrice ? Number(originalPrice) : undefined) : variants[idx].originalPrice;
 
@@ -2419,6 +2882,7 @@ app.delete('/api/admin/products/:id/variants/:variantId', requireRole('admin'), 
   // Unsold inventory tied to the deleted variant would otherwise become
   // orphaned (referencing a variantId that no longer exists on the product).
   await invCol.deleteMany({ variantId: req.params.variantId, isSold: false });
+  await cancelOpenPreorders({ variantId: req.params.variantId });
 
   res.json({ success: true });
 });
@@ -2558,30 +3022,39 @@ app.post('/api/admin/config/fee', requireRole('admin'), async (req, res) => {
 });
 
 // 19. CTV Management: Stats — CTV and Admin only
-app.get('/api/ctv/stats', requireRole('admin', 'ctv'), async (req, res) => {
-  const prodCol = db.collection<Product>('products');
+// Pulls this CTV's own quantity + revenue share out of an order's
+// uploaderBreakdown. Revenue is split at the order's actual per-unit price
+// (order.totalPrice / order.quantity), so a voucher discount applied to the
+// whole order is reflected proportionally in every contributing CTV's share
+// too, not just the buyer-facing total.
+function ctvShareOfOrder(order: Order, ctvUserId: string): { quantity: number; revenue: number } {
+  const entry = order.uploaderBreakdown?.find((e) => e.userId === ctvUserId);
+  if (!entry) return { quantity: 0, revenue: 0 };
+  const perUnitPrice = order.quantity > 0 ? order.totalPrice / order.quantity : 0;
+  return { quantity: entry.quantity, revenue: Number((entry.quantity * perUnitPrice).toFixed(3)) };
+}
+
+// The single source of truth for a seller's money position — used by the
+// stats dashboard AND enforced by the withdraw endpoint, so the number a CTV
+// sees as "withdrawable" is exactly the number the server will let them take.
+async function computeCtvFinancials(ctvUser: User) {
   const orderCol = db.collection<Order>('orders');
   const wdrCol = db.collection<WithdrawalRequest>('withdrawals');
   const configCol = db.collection<any>('config');
-  const invCol = db.collection<any>('inventory');
-
-  const ctvUser = (await getSessionUser(req))!;
-  const allProducts = await prodCol.find();
-  const ctvProducts = allProducts.filter((p) => ctvOwnsProduct(ctvUser, p));
-  // Fall back to a preview set so a CTV who hasn't uploaded yet still sees a
-  // consistent (real, non-zero) inventory/order picture tied to actual products.
-  const myProducts = ctvProducts.length > 0 ? ctvProducts : allProducts.slice(0, 3);
-  const myProductIds = new Set(myProducts.map((p) => p.id));
+  const dedCol = db.collection<CtvDeduction>('ctv_deductions');
 
   const allOrders = await orderCol.find();
-  const ctvOrders = allOrders.filter((o) => myProductIds.has(o.productId));
+  // Income is attributed per row this CTV personally uploaded (see
+  // uploaderBreakdown) — admin can grant several CTVs the same product, so
+  // "orders against my products" doesn't mean anything on its own anymore.
+  const myShares = allOrders.map((o) => ({ order: o, share: ctvShareOfOrder(o, ctvUser.id) })).filter((s) => s.share.quantity > 0);
   // Refunded orders are excluded from revenue specifically — this directly
-  // feeds netProfit/withdrawableBalance below, so counting a refunded
-  // order here would let a CTV withdraw money for a sale that was already
-  // given back to the buyer.
-  const revenueOrders = ctvOrders.filter((o) => o.status !== 'refunded');
-
-  const grossRevenue = Number(revenueOrders.reduce((sum, o) => sum + o.totalPrice, 0).toFixed(3));
+  // feeds netProfit/withdrawableBalance, so counting a refunded order here
+  // would let a CTV withdraw money for a sale that was already given back to
+  // the buyer. Still counted in totalSold (fulfillment did genuinely happen).
+  const grossRevenue = Number(
+    myShares.filter((s) => s.order.status !== 'refunded').reduce((sum, s) => sum + s.share.revenue, 0).toFixed(3)
+  );
 
   const cfg = await configCol.findOne({ key: 'platform' });
   const feePercent = cfg ? cfg.platformFeePercent : 5.0;
@@ -2591,68 +3064,127 @@ app.get('/api/ctv/stats', requireRole('admin', 'ctv'), async (req, res) => {
   const userWithdrawals = await wdrCol.find({
     $or: [{ userId: ctvUser.id }, { username: ctvUser.username }],
   } as any);
-
   const totalWithdrawnOrPending = userWithdrawals
     .filter((w) => w.status === 'completed' || w.status === 'pending')
     .reduce((sum, w) => sum + w.amount, 0);
 
-  const withdrawableBalance = Math.max(0, Number((netProfit - totalWithdrawnOrPending).toFixed(3)));
+  const myDeductions = await dedCol.find({ ctvUserId: ctvUser.id });
+  const totalDeducted = Number(myDeductions.reduce((sum, d) => sum + d.amount, 0).toFixed(3));
 
-  const allInventory = await invCol.find();
-  const myInventory = allInventory.filter((item: any) => myProductIds.has(item.productId));
-  // totalSold comes from the permanent orders history rather than counting
-  // isSold:true rows still physically present in inventory — those sold
-  // rows get pruned after their retention window (see
-  // cleanupOldSoldInventory), which would otherwise make this lifetime
+  const withdrawableBalance = Math.max(0, Number((netProfit - totalWithdrawnOrPending - totalDeducted).toFixed(3)));
+
+  return { myShares, grossRevenue, feePercent, feeAmount, netProfit, userWithdrawals, myDeductions, totalDeducted, withdrawableBalance };
+}
+
+app.get('/api/ctv/stats', requireRole('admin', 'ctv'), async (req, res) => {
+  const invCol = db.collection<any>('inventory');
+  const prodCol = db.collection<Product>('products');
+
+  const ctvUser = (await getSessionUser(req))!;
+
+  const {
+    myShares,
+    grossRevenue,
+    feePercent,
+    feeAmount,
+    netProfit,
+    userWithdrawals,
+    myDeductions,
+    totalDeducted,
+    withdrawableBalance,
+  } = await computeCtvFinancials(ctvUser);
+
+  // totalSold comes from the permanent orders history (myShares above)
+  // rather than counting isSold:true rows still physically present in
+  // inventory — those sold rows get pruned after their retention window
+  // (see cleanupOldSoldInventory), which would otherwise make this lifetime
   // figure silently shrink. totalInStock only ever counts real, currently
-  // unsold rows (never pruned), and totalUploaded is derived from both so it
-  // stays a stable lifetime total instead of shrinking as old sold rows are
-  // cleaned up.
-  const totalInStock = myInventory.filter((item: any) => !item.isSold).length;
-  const totalSold = ctvOrders.reduce((sum, o) => sum + o.quantity, 0);
+  // unsold rows this CTV uploaded (never pruned), and totalUploaded is
+  // derived from both so it stays a stable lifetime total instead of
+  // shrinking as old sold rows are cleaned up.
+  const myUnsoldRows = await invCol.find({ uploadedByUserId: ctvUser.id, isSold: false });
+  const totalInStock = myUnsoldRows.length;
+  const totalSold = myShares.reduce((sum, s) => sum + s.share.quantity, 0);
   const totalUploaded = totalInStock + totalSold;
+
+  // Per-product slice of the same numbers — this CTV's own contribution to
+  // each product it's authorized on, not the product's totals (other CTVs
+  // may also be authorized on it).
+  const byProductMap = new Map<string, { productId: string; productName: string; totalInStock: number; totalSold: number; grossRevenue: number }>();
+  const getOrInit = (productId: string, productName: string) => {
+    let entry = byProductMap.get(productId);
+    if (!entry) {
+      entry = { productId, productName, totalInStock: 0, totalSold: 0, grossRevenue: 0 };
+      byProductMap.set(productId, entry);
+    }
+    return entry;
+  };
+  for (const row of myUnsoldRows) {
+    getOrInit(row.productId, row.productId).totalInStock += 1;
+  }
+  for (const s of myShares) {
+    const entry = getOrInit(s.order.productId, s.order.productName);
+    entry.productName = s.order.productName;
+    entry.totalSold += s.share.quantity;
+    if (s.order.status !== 'refunded') entry.grossRevenue = Number((entry.grossRevenue + s.share.revenue).toFixed(3));
+  }
+  // Rows built purely from unsold inventory don't have a real productName
+  // yet (orders carry it, inventory rows don't) — fill those in from the
+  // products collection rather than showing a raw id.
+  const namelessProductIds = Array.from(byProductMap.values()).filter((e) => e.productName === e.productId).map((e) => e.productId);
+  if (namelessProductIds.length > 0) {
+    const namedProducts = await prodCol.find({ id: { $in: namelessProductIds } });
+    const nameById = new Map(namedProducts.map((p) => [p.id, p.name]));
+    for (const entry of byProductMap.values()) {
+      const realName = nameById.get(entry.productId);
+      if (realName) entry.productName = realName;
+    }
+  }
+  const byProduct = Array.from(byProductMap.values()).sort((a, b) => b.grossRevenue - a.grossRevenue);
 
   const stats: CtvStats = {
     grossRevenue,
     feePercent,
     feeAmount,
     netProfit,
+    totalDeducted,
     withdrawableBalance,
     totalUploaded,
     totalSold,
     totalInStock,
     withdrawals: userWithdrawals,
+    deductions: myDeductions,
+    byProduct,
   };
 
-  res.json({
-    stats,
-    myProducts,
-  });
+  res.json({ stats });
 });
 
 // 19b. CTV Chart Stats — revenue/orders bucketed by the requested period
 // (?period=week|month|all) + top products, scoped to this CTV's own
 // products only.
 app.get('/api/ctv/stats/charts', requireRole('admin', 'ctv'), async (req, res) => {
-  const prodCol = db.collection<Product>('products');
   const orderCol = db.collection<Order>('orders');
 
   const ctvUser = (await getSessionUser(req))!;
-  const allProducts = await prodCol.find();
-  const ctvProducts = allProducts.filter((p) => ctvOwnsProduct(ctvUser, p));
-  const myProducts = ctvProducts.length > 0 ? ctvProducts : allProducts.slice(0, 3);
-  const myProductIds = new Set(myProducts.map((p) => p.id));
-
   const allOrders = await orderCol.find();
-  const ctvOrders = allOrders.filter((o) => myProductIds.has(o.productId));
   // Same reasoning as /api/ctv/stats — a refunded order was never actually
   // kept as revenue, so it's excluded from the revenue chart/ranking too.
-  const revenueOrders = ctvOrders.filter((o) => o.status !== 'refunded');
+  // buildChartSeries/buildTopProducts only read totalPrice off each entry,
+  // so this CTV's revenue *share* of the order (not the buyer's full total,
+  // which may include other CTVs' contributions) is substituted in here —
+  // those two shared helpers stay untouched since Admin's own unscoped
+  // charts still call them with real orders directly.
+  const revenueEntries = allOrders
+    .filter((o) => o.status !== 'refunded')
+    .map((o) => ({ order: o, share: ctvShareOfOrder(o, ctvUser.id) }))
+    .filter((s) => s.share.quantity > 0)
+    .map((s) => ({ createdAt: s.order.createdAt, totalPrice: s.share.revenue, productName: s.order.productName }));
 
   const period = String(req.query.period || 'week');
   res.json({
-    daily: buildChartSeries(revenueOrders, period),
-    topProducts: buildTopProducts(revenueOrders, 5),
+    daily: buildChartSeries(revenueEntries, period),
+    topProducts: buildTopProducts(revenueEntries, 5),
     period,
   });
 });
@@ -2661,42 +3193,186 @@ app.get('/api/ctv/stats/charts', requireRole('admin', 'ctv'), async (req, res) =
 // Crypto-only: bank/e-wallet methods are no longer accepted, even if a
 // client sends them directly, so `method`/`network` are never taken from
 // the request body.
+// Per-account lock: two withdrawals fired in parallel would otherwise both
+// read the same withdrawable balance, both pass the check below, and together
+// pay out more than the account ever earned.
+const withdrawInProgress = new Set<string>();
+
 app.post('/api/ctv/withdraw', requireRole('admin', 'ctv'), async (req, res) => {
   const { amount, network = 'bsc', accountNumber, accountName } = req.body;
   const wdrCol = db.collection<WithdrawalRequest>('withdrawals');
 
   const ctvUser = (await getSessionUser(req))!;
 
-  const parsedAmount = parseFloat(amount);
-  if (isNaN(parsedAmount) || parsedAmount < 5) {
+  const parsedAmount = Number(amount);
+  if (!Number.isFinite(parsedAmount) || parsedAmount < 5) {
     return res.status(400).json({ error: 'Số tiền rút tối thiểu là $5.00' });
   }
-
-  if (!String(accountNumber || '').trim()) {
+  if (typeof accountNumber !== 'string' || !accountNumber.trim()) {
     return res.status(400).json({ error: 'Vui lòng nhập địa chỉ ví crypto nhận tiền' });
   }
+  if (typeof network !== 'string' || !['bsc', 'polygon', 'trc', 'base'].includes(network)) {
+    return res.status(400).json({ error: 'Mạng nhận tiền không hợp lệ' });
+  }
+  const cleanAmount = Number(parsedAmount.toFixed(3));
 
-  const newWithdrawal: WithdrawalRequest = {
-    id: 'wdr_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
-    userId: ctvUser.id,
-    username: ctvUser.username,
-    amount: parsedAmount,
-    method: 'crypto',
-    accountNumber,
-    accountName,
-    network,
-    walletAddress: accountNumber,
-    status: 'pending',
+  if (withdrawInProgress.has(ctvUser.id)) {
+    return res.status(429).json({ error: 'Đang xử lý một lệnh rút khác, vui lòng thử lại sau giây lát' });
+  }
+  withdrawInProgress.add(ctvUser.id);
+  try {
+    // Enforced against the exact same figure the dashboard shows (see
+    // computeCtvFinancials) — the amount can never exceed what this account
+    // has actually earned net of fee, earlier withdrawals and admin deductions.
+    const { withdrawableBalance } = await computeCtvFinancials(ctvUser);
+    if (cleanAmount > withdrawableBalance) {
+      return res.status(400).json({
+        error: `Số tiền rút vượt quá số dư khả dụng ($${withdrawableBalance.toFixed(2)}).`,
+        withdrawableBalance,
+      });
+    }
+
+    const newWithdrawal: WithdrawalRequest = {
+      id: 'wdr_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+      userId: ctvUser.id,
+      username: ctvUser.username,
+      amount: cleanAmount,
+      method: 'crypto',
+      accountNumber: accountNumber.trim(),
+      accountName: typeof accountName === 'string' ? accountName.trim() : undefined,
+      network: network as CryptoNetwork,
+      walletAddress: accountNumber.trim(),
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+    };
+
+    await wdrCol.insertOne(newWithdrawal);
+
+    res.json({
+      success: true,
+      message: 'Tạo lệnh rút tiền thành công. Admin sẽ kiểm duyệt và xử lý trong 5-15 phút.',
+      withdrawal: newWithdrawal,
+    });
+  } finally {
+    withdrawInProgress.delete(ctvUser.id);
+  }
+});
+
+// Admin: income broken out per seller — every CTV, plus any admin account
+// that has personally created/uploaded its own products too (an admin
+// selling directly is tracked exactly like a CTV here, not excluded just
+// for being admin role). Same ownership rule as /api/ctv/stats
+// (ctvOwnsProduct/createdByUserId), just computed for every seller in one
+// pass instead of one endpoint call per account. Only sellers who actually
+// own at least one product show up — no "preview a few random products"
+// fallback here, since this view is specifically about who's really sold
+// something, not a single seller's own empty-state dashboard.
+app.get('/api/admin/ctv-breakdown', requireRole('admin'), async (req, res) => {
+  const userCol = db.collection<User>('users');
+  const orderCol = db.collection<Order>('orders');
+  const invCol = db.collection<any>('inventory');
+  const configCol = db.collection<any>('config');
+  const wdrCol = db.collection<WithdrawalRequest>('withdrawals');
+  const dedCol = db.collection<CtvDeduction>('ctv_deductions');
+
+  const cfg = await configCol.findOne({ key: 'platform' });
+  const feePercent = cfg ? cfg.platformFeePercent : 5.0;
+
+  const sellers = await userCol.find({ role: { $in: ['ctv', 'admin'] } });
+  const allOrders = await orderCol.find();
+  const allWithdrawals = await wdrCol.find();
+  const allDeductions = await dedCol.find();
+  const unsoldByUploader = new Map<string, number>();
+  for (const item of await invCol.find({ isSold: false })) {
+    if (!item.uploadedByUserId) continue;
+    unsoldByUploader.set(item.uploadedByUserId, (unsoldByUploader.get(item.uploadedByUserId) || 0) + 1);
+  }
+
+  const breakdown = sellers
+    .map((seller) => {
+      const shares = allOrders
+        .map((o) => ({ order: o, share: ctvShareOfOrder(o, seller.id) }))
+        .filter((s) => s.share.quantity > 0);
+      const totalInStock = unsoldByUploader.get(seller.id) || 0;
+      const totalSold = shares.reduce((sum, s) => sum + s.share.quantity, 0);
+      const totalUploaded = totalInStock + totalSold;
+
+      const totalDeducted = Number(
+        allDeductions.filter((d) => d.ctvUserId === seller.id).reduce((sum, d) => sum + d.amount, 0).toFixed(3)
+      );
+      if (totalUploaded === 0 && totalDeducted === 0) return null;
+
+      const grossRevenue = Number(
+        shares.filter((s) => s.order.status !== 'refunded').reduce((sum, s) => sum + s.share.revenue, 0).toFixed(3)
+      );
+      const feeAmount = Number((grossRevenue * (feePercent / 100)).toFixed(3));
+      const netProfit = Number((grossRevenue - feeAmount).toFixed(3));
+      const totalWithdrawnOrPending = allWithdrawals
+        .filter((w) => (w.userId === seller.id || w.username === seller.username) && (w.status === 'completed' || w.status === 'pending'))
+        .reduce((sum, w) => sum + w.amount, 0);
+      const withdrawableBalance = Math.max(0, Number((netProfit - totalWithdrawnOrPending - totalDeducted).toFixed(3)));
+
+      return {
+        userId: seller.id,
+        username: seller.username,
+        role: seller.role,
+        totalUploaded,
+        totalSold,
+        totalInStock,
+        grossRevenue,
+        netProfit,
+        totalDeducted,
+        withdrawableBalance,
+      };
+    })
+    .filter((row): row is NonNullable<typeof row> => row !== null)
+    .sort((a, b) => b.grossRevenue - a.grossRevenue);
+
+  res.json({ breakdown, feePercent });
+});
+
+// Admin: manually deduct from a CTV's earned income — e.g. a penalty for a
+// bad batch of accounts, or correcting a mistake. Subtracted straight out
+// of withdrawableBalance (see /api/ctv/stats and the breakdown above),
+// alongside real withdrawals, and kept as a permanent record both admin and
+// the CTV themselves can look back on rather than silently editing any
+// stored balance number.
+app.post('/api/admin/ctv-deductions', requireRole('admin'), async (req, res) => {
+  const { ctvUserId, amount, reason } = req.body;
+  const cleanAmount = Number(amount);
+  if (!cleanAmount || cleanAmount <= 0) {
+    return res.status(400).json({ error: 'Số tiền trừ phải lớn hơn 0' });
+  }
+  const cleanReason = String(reason || '').trim().slice(0, 500);
+  if (!cleanReason) {
+    return res.status(400).json({ error: 'Vui lòng nhập lý do trừ tiền' });
+  }
+
+  const userCol = db.collection<User>('users');
+  const ctv = await userCol.findOne({ id: ctvUserId });
+  if (!ctv || ctv.role !== 'ctv') return res.status(400).json({ error: 'Tài khoản này không phải CTV' });
+
+  const admin = (await getSessionUser(req))!;
+  const dedCol = db.collection<CtvDeduction>('ctv_deductions');
+  const newDeduction: CtvDeduction = {
+    id: 'ded_' + generateObjectId(),
+    ctvUserId: ctv.id,
+    ctvUsername: ctv.username,
+    amount: Number(cleanAmount.toFixed(3)),
+    reason: cleanReason,
     createdAt: new Date().toISOString(),
+    adminId: admin.id,
+    adminUsername: admin.username,
   };
+  await dedCol.insertOne(newDeduction);
+  res.json({ success: true, deduction: newDeduction });
+});
 
-  await wdrCol.insertOne(newWithdrawal);
-
-  res.json({
-    success: true,
-    message: 'Tạo lệnh rút tiền thành công. Admin sẽ kiểm duyệt và xử lý trong 5-15 phút.',
-    withdrawal: newWithdrawal,
-  });
+app.get('/api/admin/ctv-deductions', requireRole('admin'), async (req, res) => {
+  const dedCol = db.collection<CtvDeduction>('ctv_deductions');
+  const deductions = await dedCol.find();
+  deductions.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  res.json({ deductions });
 });
 
 // 21. Admin: Get all withdrawal requests (MongoDB: find) — admin only
@@ -2706,24 +3382,42 @@ app.get('/api/admin/withdrawals', requireRole('admin'), async (req, res) => {
   res.json({ withdrawals });
 });
 
-// Admin: Complete a withdrawal request
-app.post('/api/admin/withdrawals/:id/complete', requireRole('admin'), async (req, res) => {
-  const { id } = req.params;
+// Admin: Complete a withdrawal request — only a still-pending request can be
+// completed, and the transition is a single guarded update so a double click
+// (or a reject racing a complete) can't push one request through both. A
+// rejected request must never become "paid" afterwards, and a paid one must
+// never flip back to rejected (that would free its balance again after the
+// money already left). txHash is whatever real on-chain hash admin pastes in
+// after actually sending the payout — never generated here.
+async function transitionWithdrawal(
+  id: string,
+  next: 'completed' | 'rejected',
+  txHash: unknown,
+  res: express.Response
+) {
   const wdrCol = db.collection<WithdrawalRequest>('withdrawals');
-  const txHash = generateTxHash();
+  const existing = await wdrCol.findOne({ id });
+  if (!existing) return res.status(404).json({ error: 'Không tìm thấy lệnh rút tiền' });
 
-  await wdrCol.updateOne({ id }, { $set: { status: 'completed', txHash } });
+  const $set: Partial<WithdrawalRequest> = { status: next };
+  if (next === 'completed' && typeof txHash === 'string' && txHash.trim()) {
+    $set.txHash = txHash.trim().slice(0, 128);
+  }
+  const result = await wdrCol.updateOne({ id, status: 'pending' }, { $set });
+  if (result.matchedCount === 0) {
+    return res.status(400).json({ error: 'Lệnh rút tiền này đã được xử lý trước đó, không thể đổi trạng thái nữa' });
+  }
   const updated = await wdrCol.findOne({ id });
   res.json({ success: true, withdrawal: updated });
+}
+
+app.post('/api/admin/withdrawals/:id/complete', requireRole('admin'), async (req, res) => {
+  await transitionWithdrawal(req.params.id, 'completed', req.body?.txHash, res);
 });
 
 // Admin: Reject a withdrawal request
 app.post('/api/admin/withdrawals/:id/reject', requireRole('admin'), async (req, res) => {
-  const { id } = req.params;
-  const wdrCol = db.collection<WithdrawalRequest>('withdrawals');
-  await wdrCol.updateOne({ id }, { $set: { status: 'rejected' } });
-  const updated = await wdrCol.findOne({ id });
-  res.json({ success: true, withdrawal: updated });
+  await transitionWithdrawal(req.params.id, 'rejected', undefined, res);
 });
 
 // The CTV product form only lets a CTV pick a category by its display
@@ -2763,8 +3457,13 @@ function deriveProductImageKey(categoryLabel: string): string {
   return slug === 'tool' ? 'other' : slug;
 }
 
-// 22. CTV: Upload product to store (MongoDB: insertOne) — CTV and Admin only
-app.post('/api/ctv/products', requireRole('admin', 'ctv'), async (req, res) => {
+// 22. Admin-only: create a new product listing ("gian hàng"). CTV no longer
+// creates products at all — admin creates every listing, then explicitly
+// grants specific CTV(s) permission to stock it (see POST
+// /api/admin/products/:id/authorize-ctv), so admin always knows exactly
+// what each CTV is selling. Kept at this path rather than merged into
+// POST /api/admin/products so nothing else on the admin side has to change.
+app.post('/api/ctv/products', requireRole('admin'), async (req, res) => {
   const { name, category, categorySlug, price, originalPrice, image, description, accountFormat, variantName, rawAccounts, variants = [] } = req.body;
   const prodCol = db.collection<Product>('products');
   const invCol = db.collection<any>('inventory');
@@ -2776,11 +3475,13 @@ app.post('/api/ctv/products', requireRole('admin', 'ctv'), async (req, res) => {
   }
 
   const newId = 'prod-ctv-' + Math.random().toString(36).substring(2, 8);
+  const pricingError = validateOptionalPricing(price, originalPrice) || (variants.length > 0 || !Array.isArray(variants) ? validateVariantsInput(variants) : null);
+  if (pricingError) return res.status(400).json({ error: pricingError });
   const resolvedPrice = Number(price) || 1.0;
   const resolvedOriginalPrice = originalPrice ? Number(originalPrice) : undefined;
   const resolvedVariants =
     variants.length > 0
-      ? variants.map((v: any) => ({ ...v, discountBadge: computeDiscountBadge(Number(v.price), v.originalPrice ? Number(v.originalPrice) : undefined) }))
+      ? variants.map((v: any) => ({ ...v, id: v.id || 'var-' + Math.random().toString(36).substring(2, 6), discountBadge: computeDiscountBadge(Number(v.price), v.originalPrice ? Number(v.originalPrice) : undefined) }))
       : [
           {
             id: 'var-' + Math.random().toString(36).substring(2, 6),
@@ -2824,12 +3525,15 @@ app.post('/api/ctv/products', requireRole('admin', 'ctv'), async (req, res) => {
 
   await prodCol.insertOne(newProduct);
 
-  // The upload form lets a CTV paste the initial batch of accounts right
-  // alongside the product — actually import them (deduped against the whole
+  // The form lets admin paste the initial batch of accounts right alongside
+  // the product — actually import them (deduped against the whole
   // warehouse) instead of silently discarding them.
   let importResult = { importedCount: 0, duplicateCount: 0, duplicateUsernames: [] as string[] };
   if (rawAccounts && typeof rawAccounts === 'string' && rawAccounts.trim()) {
-    importResult = await importInventoryAccounts(invCol, newId, resolvedVariants[0].id, rawAccounts);
+    importResult = await importInventoryAccounts(invCol, newId, resolvedVariants[0].id, rawAccounts, {
+      userId: ctvUser.id,
+      username: ctvUser.username,
+    });
   }
 
   res.json({ success: true, product: newProduct, ...importResult });
@@ -2880,43 +3584,18 @@ async function translateDescriptionToAllLanguages(text: string): Promise<Partial
   return result;
 }
 
-function ctvOwnsProduct(user: User, product: Product): boolean {
-  // createdByUserId is the real source of truth (set at creation time for
-  // every product from here on) — an exact id match, not a guess.
-  if (product.createdByUserId) return product.createdByUserId === user.id;
-
-  // Fallback for products created before createdByUserId existed: best-effort
-  // match against the seller display name. This used to also treat ANY
-  // seller name containing the substring "ctv" as a match — since every
-  // CTV-created listing's seller name literally starts with "CTV ", that
-  // meant every CTV owned every other CTV's products. Only an exact
-  // "ctv <username>" match (or the reverse-containment check below) counts.
-  const sellerName = product.seller?.name?.toLowerCase() || '';
-  const username = user.username.toLowerCase();
-  if (!sellerName) return false;
-  if (sellerName === `ctv ${username}`) return true;
-  // Guard the reverse direction with a minimum length so a short/generic
-  // display name (e.g. a 1-2 character seller name) can't spuriously match
-  // just because it happens to be a substring of an unrelated username.
-  return sellerName.length >= 3 && username.includes(sellerName);
-}
-
-// Lets a CTV (or admin) fix up a product's description and account-format
-// after the fact — previously these were only ever set once at creation
-// time with no way to correct a typo or fill them in later. A CTV can only
-// touch their own listings; admin can edit any product. Clearing a field
-// (sending an empty string) is how "xóa mô tả" works — there's no separate
-// delete endpoint, since an empty description/format is just the same as
-// never having set one.
-app.put('/api/ctv/products/:id/description', requireRole('admin', 'ctv'), async (req, res) => {
-  const user = (await getSessionUser(req))!;
+// Fixes up a product's description and account-format after the fact —
+// previously these were only ever set once at creation time with no way to
+// correct a typo or fill them in later. Admin-only: CTV no longer creates
+// or owns any product (admin creates every listing and grants specific
+// CTV(s) permission to stock it), so editing the listing itself is always
+// an admin action. Clearing a field (sending an empty string) is how "xóa
+// mô tả" works — there's no separate delete endpoint, since an empty
+// description/format is just the same as never having set one.
+app.put('/api/ctv/products/:id/description', requireRole('admin'), async (req, res) => {
   const prodCol = db.collection<Product>('products');
   const product = await prodCol.findOne({ id: req.params.id });
   if (!product) return res.status(404).json({ error: 'Không tìm thấy sản phẩm' });
-
-  if (user.role === 'ctv' && !ctvOwnsProduct(user, product)) {
-    return res.status(403).json({ error: 'Bạn không có quyền chỉnh sửa sản phẩm này' });
-  }
 
   const { description, accountFormat } = req.body;
   const cleanDescription = String(description ?? '').trim().slice(0, 3000);
@@ -2939,19 +3618,13 @@ app.put('/api/ctv/products/:id/description', requireRole('admin', 'ctv'), async 
   res.json({ success: true, product: updated });
 });
 
-// Lets a CTV pull their own product off the storefront (or bring it back)
-// without deleting it and its inventory — same ownership rule as the
-// description endpoint above. Admin can already do this through the
-// generic PUT /api/admin/products/:id merge endpoint, so this is CTV-only.
-app.put('/api/ctv/products/:id/visibility', requireRole('admin', 'ctv'), async (req, res) => {
-  const user = (await getSessionUser(req))!;
+// Pulls a product off the storefront (or brings it back) without deleting
+// it and its inventory. Admin-only, same reasoning as the description
+// endpoint above.
+app.put('/api/ctv/products/:id/visibility', requireRole('admin'), async (req, res) => {
   const prodCol = db.collection<Product>('products');
   const product = await prodCol.findOne({ id: req.params.id });
   if (!product) return res.status(404).json({ error: 'Không tìm thấy sản phẩm' });
-
-  if (user.role === 'ctv' && !ctvOwnsProduct(user, product)) {
-    return res.status(403).json({ error: 'Bạn không có quyền chỉnh sửa sản phẩm này' });
-  }
 
   const { isHidden } = req.body;
   if (typeof isHidden !== 'boolean') {
@@ -2966,15 +3639,10 @@ app.put('/api/ctv/products/:id/visibility', requireRole('admin', 'ctv'), async (
 // Same as above, but for a single variant rather than the whole product —
 // e.g. pausing one out-of-stock package while keeping the rest of the
 // listing live.
-app.put('/api/ctv/products/:id/variants/:variantId/visibility', requireRole('admin', 'ctv'), async (req, res) => {
-  const user = (await getSessionUser(req))!;
+app.put('/api/ctv/products/:id/variants/:variantId/visibility', requireRole('admin'), async (req, res) => {
   const prodCol = db.collection<Product>('products');
   const product = await prodCol.findOne({ id: req.params.id });
   if (!product) return res.status(404).json({ error: 'Không tìm thấy sản phẩm' });
-
-  if (user.role === 'ctv' && !ctvOwnsProduct(user, product)) {
-    return res.status(403).json({ error: 'Bạn không có quyền chỉnh sửa sản phẩm này' });
-  }
 
   const { isHidden } = req.body;
   if (typeof isHidden !== 'boolean') {
@@ -2990,18 +3658,49 @@ app.put('/api/ctv/products/:id/variants/:variantId/visibility', requireRole('adm
   res.json({ success: true, variant: variants[idx] });
 });
 
-// 22b. Vouchers CRUD — CTV and Admin can create discount codes and track
-// redemptions. CTV only manage their own codes; Admin sees and manages all.
-app.get('/api/vouchers', requireRole('admin', 'ctv'), async (req, res) => {
-  const user = (await getSessionUser(req))!;
+// Coupon codes are short, human-chosen strings, so anyone logged in could
+// otherwise try codes without limit — both through the preview endpoint and
+// through checkout (which reports "does not exist" vs "used up" too). Failed
+// lookups are counted per account; past the limit that account is locked out
+// of coupon lookups for the rest of the window. Only FAILURES count, so a
+// customer who types a valid code is never affected. In-memory is fine: it only
+// has to slow guessing down, and a restart merely resets the window.
+const COUPON_FAIL_LIMIT = 15;
+const COUPON_FAIL_WINDOW_MS = 15 * 60 * 1000;
+const couponFailures = new Map<string, { count: number; resetAt: number }>();
+
+function isCouponLocked(userId: string): boolean {
+  const entry = couponFailures.get(userId);
+  if (!entry) return false;
+  if (entry.resetAt <= Date.now()) {
+    couponFailures.delete(userId);
+    return false;
+  }
+  return entry.count >= COUPON_FAIL_LIMIT;
+}
+
+function recordCouponFailure(userId: string): void {
+  const now = Date.now();
+  if (couponFailures.size > 5000) {
+    for (const [key, entry] of couponFailures) if (entry.resetAt <= now) couponFailures.delete(key);
+  }
+  const entry = couponFailures.get(userId);
+  if (!entry || entry.resetAt <= now) couponFailures.set(userId, { count: 1, resetAt: now + COUPON_FAIL_WINDOW_MS });
+  else entry.count += 1;
+}
+
+const COUPON_LOCKED_MESSAGE = 'Bạn đã thử mã giảm giá sai quá nhiều lần. Vui lòng thử lại sau 15 phút.';
+
+// 22b. Vouchers CRUD — admin only. CTV no longer create or manage discount
+// codes (they can still redeem one at checkout like any other buyer).
+app.get('/api/vouchers', requireRole('admin'), async (req, res) => {
   const voucherCol = db.collection<Voucher>('vouchers');
-  const filter = user.role === 'admin' ? {} : { createdBy: user.id };
-  const vouchers = await voucherCol.find(filter);
+  const vouchers = await voucherCol.find();
   vouchers.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   res.json({ vouchers });
 });
 
-app.post('/api/vouchers', requireRole('admin', 'ctv'), async (req, res) => {
+app.post('/api/vouchers', requireRole('admin'), async (req, res) => {
   const user = (await getSessionUser(req))!;
   const { code, discountPercent, maxUses, expiresAt, applicableProductId, applicableVariantId } = req.body;
 
@@ -3059,14 +3758,10 @@ app.post('/api/vouchers', requireRole('admin', 'ctv'), async (req, res) => {
   res.json({ success: true, voucher: newVoucher });
 });
 
-app.delete('/api/vouchers/:id', requireRole('admin', 'ctv'), async (req, res) => {
-  const user = (await getSessionUser(req))!;
+app.delete('/api/vouchers/:id', requireRole('admin'), async (req, res) => {
   const voucherCol = db.collection<Voucher>('vouchers');
   const voucher = await voucherCol.findOne({ id: req.params.id });
   if (!voucher) return res.status(404).json({ error: 'Không tìm thấy voucher' });
-  if (user.role !== 'admin' && voucher.createdBy !== user.id) {
-    return res.status(403).json({ error: 'Bạn không có quyền xóa voucher này' });
-  }
   await voucherCol.deleteOne({ id: req.params.id });
   res.json({ success: true });
 });
@@ -3074,27 +3769,32 @@ app.delete('/api/vouchers/:id', requireRole('admin', 'ctv'), async (req, res) =>
 // Look up a voucher by code and validate it without consuming a redemption —
 // used for the live price preview before checkout.
 app.get('/api/vouchers/check/:code', requireAuth(), async (req, res) => {
+  const user = (await getSessionUser(req))!;
+  if (isCouponLocked(user.id)) return res.status(429).json({ error: COUPON_LOCKED_MESSAGE });
+
   const cleanCode = String(req.params.code || '').trim().toUpperCase();
   const { productId, variantId } = req.query;
   const voucherCol = db.collection<Voucher>('vouchers');
   const voucher = await voucherCol.findOne({ code: cleanCode });
 
-  if (!voucher) return res.status(404).json({ error: 'Mã giảm giá không tồn tại' });
+  // Every rejection below counts toward this account's guess budget.
+  const reject = (status: number, error: string) => {
+    recordCouponFailure(user.id);
+    return res.status(status).json({ error });
+  };
+
+  if (!voucher) return reject(404, 'Mã giảm giá không tồn tại');
   if (voucher.expiresAt && new Date(voucher.expiresAt).getTime() < Date.now()) {
-    return res.status(400).json({ error: 'Mã giảm giá đã hết hạn' });
+    return reject(400, 'Mã giảm giá đã hết hạn');
   }
   if (voucher.usedCount >= voucher.maxUses) {
-    return res.status(400).json({ error: 'Mã giảm giá đã hết lượt sử dụng' });
+    return reject(400, 'Mã giảm giá đã hết lượt sử dụng');
   }
   if (voucher.applicableProductId && voucher.applicableProductId !== productId) {
-    return res.status(400).json({
-      error: `Mã giảm giá này chỉ áp dụng cho sản phẩm "${voucher.applicableProductName || voucher.applicableProductId}"`,
-    });
+    return reject(400, `Mã giảm giá này chỉ áp dụng cho sản phẩm "${voucher.applicableProductName || voucher.applicableProductId}"`);
   }
   if (voucher.applicableVariantId && voucher.applicableVariantId !== variantId) {
-    return res.status(400).json({
-      error: `Mã giảm giá này chỉ áp dụng cho biến thể "${voucher.applicableVariantName || voucher.applicableVariantId}"`,
-    });
+    return reject(400, `Mã giảm giá này chỉ áp dụng cho biến thể "${voucher.applicableVariantName || voucher.applicableVariantId}"`);
   }
 
   res.json({ valid: true, discountPercent: voucher.discountPercent, code: voucher.code });
@@ -3276,59 +3976,6 @@ app.post("/api/renew_token", async (req, res) => {
     });
   }
 });
-
-// Helper for signing Twitter OAuth 1.0a requests
-function generateTwitterOAuthHeader(
-  url: string,
-  method: string,
-  oauthToken: string,
-  oauthTokenSecret: string,
-  consumerKey = '3nVuSoBZnx6U4vzUxf5w',
-  consumerSecret = 'Bcs59EFbbsdF6Sl9Ng71smgStWEGwXXKSjYvPVt7qys'
-): string {
-  const nonce = crypto.randomBytes(16).toString('hex');
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  const oauthParams: Record<string, string> = {
-    oauth_consumer_key: consumerKey,
-    oauth_nonce: nonce,
-    oauth_signature_method: 'HMAC-SHA1',
-    oauth_timestamp: timestamp,
-    oauth_token: oauthToken,
-    oauth_version: '1.0',
-  };
-
-  const parsedUrl = new URL(url);
-  const baseUrl = `${parsedUrl.protocol}//${parsedUrl.host}${parsedUrl.pathname}`;
-  const allParams: Record<string, string> = { ...oauthParams };
-  parsedUrl.searchParams.forEach((value, key) => {
-    allParams[key] = value;
-  });
-
-  const sortedKeys = Object.keys(allParams).sort();
-  const paramString = sortedKeys
-    .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(allParams[k])}`)
-    .join('&');
-
-  const baseString = [
-    method.toUpperCase(),
-    encodeURIComponent(baseUrl),
-    encodeURIComponent(paramString),
-  ].join('&');
-
-  const signingKey = `${encodeURIComponent(consumerSecret)}&${encodeURIComponent(oauthTokenSecret)}`;
-  const signature = crypto
-    .createHmac('sha1', signingKey)
-    .update(baseString)
-    .digest('base64');
-
-  oauthParams.oauth_signature = signature;
-
-  const headerParts = Object.keys(oauthParams)
-    .sort()
-    .map((k) => `${encodeURIComponent(k)}="${encodeURIComponent(oauthParams[k])}"`);
-
-  return `OAuth ${headerParts.join(', ')}`;
-}
 
 // 24. Tools: X (Twitter) Check Live API using converted CheckTwitter GraphQL engine
 app.post('/api/tools/x-check-live', async (req, res) => {
@@ -3555,6 +4202,12 @@ async function start() {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
+
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error(`[Unhandled route error] ${req.method} ${req.originalUrl}:`, err);
+    if (res.headersSent) return next(err);
+    res.status(500).json({ error: 'Lỗi máy chủ nội bộ, vui lòng thử lại sau.' });
+  });
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`XCHEAP Store Server running on http://0.0.0.0:${PORT}`);

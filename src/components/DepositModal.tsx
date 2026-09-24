@@ -30,11 +30,13 @@ export const DepositModal: React.FC<DepositModalProps> = ({
   const [rpcCheckResult, setRpcCheckResult] = useState<string | null>(null);
   const [countdown, setCountdown] = useState(15);
   const [depositHistory, setDepositHistory] = useState<DepositTransaction[]>([]);
-  const [simulatingAmount, setSimulatingAmount] = useState<number>(10);
-  const [isSimulating, setIsSimulating] = useState(false);
 
   const selectedCrypto = cryptoOptions.find((c) => c.id === selectedNetwork) || cryptoOptions[0];
-  const userAddress = user.depositWallets[selectedNetwork] || '0x71C...';
+  // Addresses come from /api/deposit/wallets (always the vault's current
+  // record) — the copy cached on the user object can be missing or outdated,
+  // and a made-up placeholder must never be shown as somewhere to send money.
+  const [walletAddresses, setWalletAddresses] = useState<Record<string, string>>({});
+  const userAddress = walletAddresses[selectedNetwork] || user.depositWallets?.[selectedNetwork] || '';
 
   // Crisp, easily recognizable Crypto Network Logos
   const renderNetworkLogo = (netId: string, size: 'sm' | 'md' | 'lg' = 'md') => {
@@ -126,6 +128,10 @@ export const DepositModal: React.FC<DepositModalProps> = ({
 
   useEffect(() => {
     if (!isOpen) return;
+    if (!userAddress) {
+      setQrDataUrl('');
+      return;
+    }
 
     QRCode.toDataURL(userAddress, {
       width: 200,
@@ -145,6 +151,11 @@ export const DepositModal: React.FC<DepositModalProps> = ({
       if (res.ok) {
         const data = await res.json();
         setDepositHistory(data.transactions || []);
+        const addresses: Record<string, string> = {};
+        for (const w of data.wallets || []) {
+          if (w?.id && w.userDepositAddress) addresses[w.id] = w.userDepositAddress;
+        }
+        setWalletAddresses(addresses);
       }
     } catch (e) {
       console.error(e);
@@ -208,32 +219,8 @@ export const DepositModal: React.FC<DepositModalProps> = ({
     return () => clearInterval(timer);
   }, [isOpen, selectedNetwork]);
 
-  const handleSimulateDeposit = async () => {
-    setIsSimulating(true);
-    try {
-      const res = await fetch('/api/deposit/simulate-test', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          network: selectedNetwork,
-          amount: simulatingAmount,
-        }),
-      });
-
-      const data = await res.json();
-      if (data.success) {
-        setRpcCheckResult(t.depositSimCreditedTemplate.replace('{amount}', formatMoney(data.creditedAmount)));
-        onBalanceUpdated(data.newBalance);
-        fetchDeposits();
-      }
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setIsSimulating(false);
-    }
-  };
-
   const copyToClipboard = () => {
+    if (!userAddress) return;
     navigator.clipboard.writeText(userAddress);
     setIsCopied(true);
     setTimeout(() => setIsCopied(false), 2500);
@@ -356,7 +343,7 @@ export const DepositModal: React.FC<DepositModalProps> = ({
                 </div>
                 <div className="bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] p-2.5 rounded-lg flex items-center justify-between gap-2">
                   <span className="font-mono text-emerald-700 dark:text-emerald-300 text-xs break-all select-all font-semibold">
-                    {userAddress}
+                    {userAddress || '...'}
                   </span>
                   <button
                     onClick={copyToClipboard}
@@ -418,48 +405,6 @@ export const DepositModal: React.FC<DepositModalProps> = ({
             </div>
           )}
 
-          {/* Simulated Test Deposit Tool — admin-only, kept clearly labeled as
-              a test tool since it credits balance without a real on-chain
-              transaction; never hide that fact from whoever can see it. */}
-          {user.role === 'admin' && (
-            <div className="p-3.5 bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-amber-500/30 rounded-xl space-y-2">
-              <div className="flex items-center justify-between">
-                <span className="font-bold text-slate-900 dark:text-slate-100 text-xs flex items-center gap-1.5">
-                  <AlertCircle className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
-                  {t.testDepositSimulation}
-                </span>
-                <span className="text-[9px] font-bold uppercase tracking-wider text-amber-600 dark:text-amber-400 bg-amber-500/10 border border-amber-500/30 px-1.5 py-0.5 rounded">
-                  Admin only
-                </span>
-              </div>
-              <p className="text-[11px] text-slate-600 dark:text-slate-400">{t.testDepositDesc}</p>
-
-              <div className="flex items-center gap-2 pt-1">
-                {[5, 10, 25, 50].map((amt) => (
-                  <button
-                    key={amt}
-                    onClick={() => setSimulatingAmount(amt)}
-                    className={`px-2.5 py-1 rounded text-xs font-mono font-bold transition ${
-                      simulatingAmount === amt
-                        ? 'bg-emerald-500 text-slate-950 font-bold'
-                        : 'bg-[#eceeed] dark:bg-[#23252a] text-emerald-700 dark:text-emerald-300 hover:bg-[#e3e7e6] hover:dark:bg-[#2f3239] border border-[#dde2e0] dark:border-[#373b43]'
-                    }`}
-                  >
-                    +${amt}
-                  </button>
-                ))}
-
-                <button
-                  onClick={handleSimulateDeposit}
-                  disabled={isSimulating}
-                  className="ml-auto bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-slate-950 font-bold px-3 py-1.5 rounded-lg text-xs transition shadow-md shadow-emerald-500/20"
-                >
-                  <span>{isSimulating ? t.depositLoadingSim : t.depositSimulateBtn}</span>
-                </button>
-              </div>
-            </div>
-          )}
-
           {/* Deposit History */}
           <div>
             <h3 className="font-bold text-slate-800 dark:text-slate-200 mb-2">{t.depositHistory}</h3>
@@ -477,9 +422,11 @@ export const DepositModal: React.FC<DepositModalProps> = ({
                     <div className="min-w-0">
                       <span className="font-bold text-emerald-600 dark:text-emerald-400 font-mono">+${formatMoney(tx.amount)}</span>
                       <span className="text-slate-600 dark:text-slate-400 ml-1.5 uppercase font-semibold">({tx.network})</span>
-                      <div className="text-[10px] text-slate-600 dark:text-slate-400 font-mono break-all">
-                        {tx.txHash}
-                      </div>
+                      {tx.txHash && (
+                        <div className="text-[10px] text-slate-600 dark:text-slate-400 font-mono break-all">
+                          {tx.txHash}
+                        </div>
+                      )}
                     </div>
                     <div className="text-right flex-shrink-0">
                       <span className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase bg-emerald-50 dark:bg-emerald-950/70 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30">

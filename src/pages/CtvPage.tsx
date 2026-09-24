@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Product, User, Language, CtvStats, WithdrawalRequest, Voucher, Review, Order } from '../types';
+import { Product, User, Language, CtvStats, WithdrawalRequest, Review, Order } from '../types';
 import { translations } from '../locales/translations';
 import { formatMoney } from '../utils/pricing';
 import { SimpleBarChart, BarChartDatum } from '../components/charts/SimpleBarChart';
@@ -24,13 +24,8 @@ import {
   RefreshCw,
   ShoppingBag,
   ExternalLink,
-  ChevronRight,
-  Ticket,
   Trash2,
   Star,
-  Eye,
-  EyeOff,
-  Boxes,
   Search,
 } from 'lucide-react';
 
@@ -59,7 +54,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
   onSelectProduct,
 }) => {
   const t = translations[language];
-  const [activeTab, setActiveTab] = useState<'overview' | 'upload' | 'withdraw' | 'my-products' | 'orders' | 'vouchers' | 'reviews'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'upload' | 'withdraw' | 'my-products' | 'orders' | 'reviews'>('overview');
 
   // Stats & Fee config
   const [stats, setStats] = useState<CtvStats | null>(null);
@@ -71,8 +66,6 @@ export const CtvPage: React.FC<CtvPageProps> = ({
   const [chartTopProducts, setChartTopProducts] = useState<{ name: string; revenue: number; orders: number }[]>([]);
   const [chartPeriod, setChartPeriod] = useState<'week' | 'month' | 'all'>('week');
 
-  // Voucher state
-  const [vouchers, setVouchers] = useState<Voucher[]>([]);
   const [myProductReviews, setMyProductReviews] = useState<(Review & { productName: string })[]>([]);
   const [reviewEditableMaxRating, setReviewEditableMaxRating] = useState(3);
 
@@ -87,34 +80,6 @@ export const CtvPage: React.FC<CtvPageProps> = ({
   useEffect(() => {
     setOrdersPage(1);
   }, [orderSearch, orderStatusFilter]);
-
-  // Edit description/account-format on an existing product — previously
-  // these were only ever set once at creation with no way to fix or add
-  // them afterward.
-  const [editingDescProductId, setEditingDescProductId] = useState<string | null>(null);
-  const [editDescText, setEditDescText] = useState('');
-  const [editAccountFormatText, setEditAccountFormatText] = useState('');
-  const [isSavingDescription, setIsSavingDescription] = useState(false);
-  // Read-only variant list + per-variant visibility toggle — CTV has no
-  // add/edit/delete for variants (only Admin does), just show/hide.
-  const [variantsModalProduct, setVariantsModalProduct] = useState<Product | null>(null);
-  const [newVoucherCode, setNewVoucherCode] = useState('');
-  const [newVoucherDiscount, setNewVoucherDiscount] = useState<number>(10);
-  const [newVoucherMaxUses, setNewVoucherMaxUses] = useState<number>(50);
-  const [newVoucherExpiry, setNewVoucherExpiry] = useState('');
-  const [newVoucherProductId, setNewVoucherProductId] = useState('');
-  const [newVoucherVariantId, setNewVoucherVariantId] = useState('');
-  const [isCreatingVoucher, setIsCreatingVoucher] = useState(false);
-
-  // Upload Product form state
-  const [newProdName, setNewProdName] = useState('');
-  const [newProdCategory, setNewProdCategory] = useState('Twitter / X');
-  const [newProdDescription, setNewProdDescription] = useState('');
-  const [newProdAccountFormat, setNewProdAccountFormat] = useState('');
-  const [newVariantName, setNewVariantName] = useState('Tài khoản chuẩn 2FA + Mail gốc');
-  const [newProdPrice, setNewProdPrice] = useState<number>(1.2);
-  const [rawAccountsUpload, setRawAccountsUpload] = useState('');
-  const [isSubmittingProduct, setIsSubmittingProduct] = useState(false);
 
   // Existing product stock refill
   const [refillProductId, setRefillProductId] = useState(products[0]?.id || '');
@@ -208,22 +173,9 @@ export const CtvPage: React.FC<CtvPageProps> = ({
 
   useEffect(() => {
     loadCtvData();
-    loadVouchers();
     loadMyReviews();
     loadMyOrders();
   }, []);
-
-  const loadVouchers = async () => {
-    try {
-      const res = await fetch('/api/vouchers');
-      if (res.ok) {
-        const data = await res.json();
-        setVouchers(data.vouchers || []);
-      }
-    } catch (err) {
-      console.error('Failed to load vouchers', err);
-    }
-  };
 
   // Reviews on this CTV's own products — server scopes /api/admin/reviews
   // to only the caller's products when the role is 'ctv', same ownership
@@ -256,211 +208,29 @@ export const CtvPage: React.FC<CtvPageProps> = ({
     }
   };
 
-  // "Gian Hàng Của Tôi" should only ever list this CTV's own products —
-  // `products` (the full prop) is every product in the store. Admin
-  // previewing the CTV portal keeps seeing everything, matching how the
-  // rest of this page already treats admin as an unrestricted view. Checked
-  // in both substring directions — a product created as "CTV ronan_ctv"
-  // contains the full username, but a friendlier display name set later
-  // (e.g. just "Ronan") is instead a substring OF the username, so only
-  // checking sellerName.includes(username) would miss it (same fix as the
-  // server's ctvOwnsProduct helper).
-  const ownsProduct = (p: Product): boolean => {
-    // createdByUserId is the real source of truth (see ctvOwnsProduct in
-    // server.ts) — an exact id match, not a guess from the display name.
-    if (p.createdByUserId) return p.createdByUserId === user.id;
-    // Legacy fallback for products created before createdByUserId existed.
-    // Must stay narrow: matching on any seller name that merely *contains*
-    // "ctv" used to make every CTV's dashboard show every other CTV's
-    // products as "mine" too, since every CTV listing's seller name starts
-    // with "CTV ".
-    const sellerName = p.seller?.name?.toLowerCase() || '';
-    const username = user.username.toLowerCase();
-    if (!sellerName) return false;
-    if (sellerName === `ctv ${username}`) return true;
-    return sellerName.length >= 3 && username.includes(sellerName);
-  };
-  const myProducts = user.role === 'admin' ? products : products.filter(ownsProduct);
+  // "Gian Hàng Được Cấp Quyền" only ever lists products admin has
+  // explicitly authorized this CTV to stock (authorizedCtvIds) — CTV no
+  // longer creates or owns any product. Admin previewing the CTV portal
+  // keeps seeing everything, matching how the rest of this page already
+  // treats admin as an unrestricted view. CTV also has no edit access on
+  // any product anymore (no hide/show, no description) — admin manages the
+  // listing itself; a CTV just gets to stock the ones they're granted.
+  const myProducts = user.role === 'admin' ? products : products.filter((p) => p.authorizedCtvIds?.includes(user.id));
 
-  const openEditDescription = (p: Product) => {
-    setEditingDescProductId(p.id);
-    setEditDescText(p.descriptionHtml || '');
-    setEditAccountFormatText(p.accountFormat || '');
-  };
-
-  const handleSaveDescription = async () => {
-    if (!editingDescProductId) return;
-    setIsSavingDescription(true);
-    try {
-      const res = await fetch(`/api/ctv/products/${editingDescProductId}/description`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ description: editDescText, accountFormat: editAccountFormatText }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        showToast('success', '✅ Đã cập nhật mô tả sản phẩm');
-        setEditingDescProductId(null);
-        onRefreshProducts();
-      } else {
-        showToast('error', data.error || 'Lỗi cập nhật mô tả');
-      }
-    } catch (err) {
-      showToast('error', 'Lỗi kết nối máy chủ');
-    } finally {
-      setIsSavingDescription(false);
+  // Keep the refill-stock selection valid whenever the pickable product
+  // list changes (e.g. right after admin grants a new authorization) —
+  // defaults to the first product this account can actually stock into,
+  // never a stale id left over from a product it's no longer granted (the
+  // server rejects that with a 403 anyway — see POST
+  // /api/admin/stock/bulk-import).
+  useEffect(() => {
+    if (myProducts.length === 0) return;
+    if (!myProducts.some((p) => p.id === refillProductId)) {
+      setRefillProductId(myProducts[0].id);
+      setRefillVariantId(myProducts[0].variants[0]?.id || '');
     }
-  };
-
-  // Pull a product off the storefront (or bring it back) without deleting
-  // it and its inventory.
-  const handleToggleProductVisibility = async (p: Product) => {
-    const nextHidden = !p.isHidden;
-    try {
-      const res = await fetch(`/api/ctv/products/${p.id}/visibility`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ isHidden: nextHidden }),
-      });
-      if (res.ok) {
-        showToast('success', nextHidden ? `Đã ẩn sản phẩm "${p.name}"` : `Đã hiện lại sản phẩm "${p.name}"`);
-        onRefreshProducts();
-      } else {
-        const data = await res.json().catch(() => ({}));
-        showToast('error', data.error || 'Lỗi cập nhật trạng thái hiển thị');
-      }
-    } catch (err) {
-      showToast('error', 'Lỗi kết nối máy chủ');
-    }
-  };
-
-  // Same idea for a single variant — e.g. pausing one out-of-stock package
-  // while keeping the rest of the listing live. variantsModalProduct is
-  // refreshed from the server response so the open modal reflects the new
-  // state immediately rather than waiting for the next full product refresh.
-  const handleToggleVariantVisibility = async (productId: string, variantId: string, currentlyHidden: boolean | undefined) => {
-    const nextHidden = !currentlyHidden;
-    try {
-      const res = await fetch(`/api/ctv/products/${productId}/variants/${variantId}/visibility`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ isHidden: nextHidden }),
-      });
-      if (res.ok) {
-        onRefreshProducts();
-        setVariantsModalProduct((prev) =>
-          prev && prev.id === productId
-            ? { ...prev, variants: prev.variants.map((v) => (v.id === variantId ? { ...v, isHidden: nextHidden } : v)) }
-            : prev
-        );
-      } else {
-        const data = await res.json().catch(() => ({}));
-        showToast('error', data.error || 'Lỗi cập nhật trạng thái hiển thị biến thể');
-      }
-    } catch (err) {
-      showToast('error', 'Lỗi kết nối máy chủ');
-    }
-  };
-
-  const handleCreateVoucher = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newVoucherCode.trim()) {
-      showToast('error', 'Vui lòng nhập mã voucher');
-      return;
-    }
-    setIsCreatingVoucher(true);
-    try {
-      const res = await fetch('/api/vouchers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          code: newVoucherCode.trim(),
-          discountPercent: newVoucherDiscount,
-          maxUses: newVoucherMaxUses,
-          expiresAt: newVoucherExpiry || undefined,
-          applicableProductId: newVoucherProductId || undefined,
-          applicableVariantId: newVoucherProductId ? newVoucherVariantId || undefined : undefined,
-        }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        showToast('success', `Đã tạo mã "${data.voucher.code}" thành công!`);
-        setNewVoucherCode('');
-        setNewVoucherDiscount(10);
-        setNewVoucherMaxUses(50);
-        setNewVoucherExpiry('');
-        setNewVoucherProductId('');
-        setNewVoucherVariantId('');
-        loadVouchers();
-      } else {
-        showToast('error', data.error || 'Lỗi tạo voucher');
-      }
-    } catch (err) {
-      showToast('error', 'Lỗi kết nối máy chủ');
-    } finally {
-      setIsCreatingVoucher(false);
-    }
-  };
-
-  const handleDeleteVoucher = async (id: string, code: string) => {
-    if (!confirm(`Bạn có chắc muốn xóa mã "${code}"?`)) return;
-    try {
-      const res = await fetch(`/api/vouchers/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        showToast('success', `Đã xóa mã "${code}"`);
-        loadVouchers();
-      } else {
-        const data = await res.json().catch(() => ({}));
-        showToast('error', data.error || 'Lỗi xóa voucher');
-      }
-    } catch (err) {
-      showToast('error', 'Lỗi kết nối máy chủ');
-    }
-  };
-
-  // Handle Upload Product
-  const handleUploadProduct = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newProdName.trim() || newProdPrice <= 0 || !rawAccountsUpload.trim()) {
-      showToast('error', 'Vui lòng nhập đầy đủ tên sản phẩm, giá bán và danh sách tài khoản kho.');
-      return;
-    }
-
-    setIsSubmittingProduct(true);
-    try {
-      const res = await fetch('/api/ctv/products', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: newProdName.trim(),
-          category: newProdCategory,
-          description: newProdDescription.trim(),
-          accountFormat: newProdAccountFormat.trim(),
-          variantName: newVariantName.trim(),
-          price: newProdPrice,
-          rawAccounts: rawAccountsUpload.trim(),
-        }),
-      });
-
-      const data = await res.json();
-      if (res.ok) {
-        const dupText = data.duplicateCount > 0 ? `, bỏ qua ${data.duplicateCount} tài khoản trùng username đã có trong kho` : '';
-        showToast('success', `Đã đăng bán sản phẩm mới thành công với ${data.importedCount} tài khoản${dupText}!`);
-        setNewProdName('');
-        setNewProdDescription('');
-        setNewProdAccountFormat('');
-        setRawAccountsUpload('');
-        onRefreshProducts();
-        loadCtvData();
-      } else {
-        showToast('error', data.error || 'Lỗi khi đăng sản phẩm');
-      }
-    } catch (err) {
-      showToast('error', 'Lỗi kết nối máy chủ');
-    } finally {
-      setIsSubmittingProduct(false);
-    }
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [myProducts]);
 
   // Reads a .txt file the CTV selects and merges its lines into the given
   // textarea state, rather than replacing whatever was already pasted in.
@@ -564,7 +334,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
     }
   };
 
-  const currentRefillProduct = products.find((p) => p.id === refillProductId) || products[0];
+  const currentRefillProduct = myProducts.find((p) => p.id === refillProductId) || myProducts[0];
 
   return (
     <div className="min-h-screen bg-[#f4f6f5] dark:bg-[#17181c] text-slate-900 dark:text-slate-100 pb-16 font-sans">
@@ -649,7 +419,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
                 Chào mừng Cộng Tác Viên <span className="text-amber-600 dark:text-amber-400">{user.username}</span>
               </h2>
               <p className="text-xs text-slate-700 dark:text-slate-300 max-w-3xl leading-relaxed">
-                Tài khoản của bạn đã được Admin phân bổ quyền CTV chính thức. Nhiệm vụ chính của CTV là <strong>đăng hàng lên bán</strong>, quản lý kho tài khoản và <strong>yêu cầu rút tiền</strong> về tài khoản ngân hàng hoặc ví điện tử bất kỳ lúc nào.
+                Tài khoản của bạn đã được Admin phân bổ quyền CTV chính thức. Nhiệm vụ chính của CTV là <strong>nạp hàng vào các gian hàng được cấp quyền</strong>, quản lý kho tài khoản và <strong>yêu cầu rút tiền</strong> về tài khoản ngân hàng hoặc ví điện tử bất kỳ lúc nào.
               </p>
             </div>
 
@@ -659,7 +429,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
                 className="flex items-center gap-1.5 bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-[#dde1e0] hover:dark:bg-[#373b44] text-amber-600 dark:text-amber-400 text-xs font-semibold px-3 py-1.5 rounded-lg border border-amber-500/30 transition"
               >
                 <PackagePlus className="w-4 h-4" />
-                <span>Đăng Hàng Lên Bán</span>
+                <span>Nạp Hàng</span>
               </button>
               <button
                 onClick={() => setActiveTab('withdraw')}
@@ -675,7 +445,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
         {/* Tab Navigation — compact grid, icon on top, matching AdminPage's
             tab bar exactly (same layout mechanics, amber instead of purple
             for the active state to keep the CTV portal's accent color). */}
-        <div className="grid grid-cols-4 sm:grid-cols-4 lg:grid-cols-7 gap-1.5 border-b border-[#e0e4e2] dark:border-[#33363e] pb-3 mb-6">
+        <div className="grid grid-cols-3 sm:grid-cols-3 lg:grid-cols-6 gap-1.5 border-b border-[#e0e4e2] dark:border-[#33363e] pb-3 mb-6">
           <button
             onClick={() => setActiveTab('overview')}
             title="Thống Kê Doanh Thu & Lợi Nhuận"
@@ -691,7 +461,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
 
           <button
             onClick={() => setActiveTab('upload')}
-            title="Đăng Sản Phẩm & Nạp Kho Hàng"
+            title="Nạp Kho Hàng Vào Gian Hàng Được Cấp Quyền"
             className={`px-2 py-2 text-[11px] font-bold rounded-lg transition flex flex-col items-center gap-1 text-center ${
               activeTab === 'upload'
                 ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 ring-1 ring-amber-500'
@@ -699,7 +469,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
             }`}
           >
             <PackagePlus className="w-4 h-4" />
-            <span className="truncate w-full">Đăng Bán</span>
+            <span className="truncate w-full">Nạp Hàng</span>
           </button>
 
           <button
@@ -739,19 +509,6 @@ export const CtvPage: React.FC<CtvPageProps> = ({
           >
             <FileText className="w-4 h-4" />
             <span className="truncate w-full">Đơn Hàng ({myOrders.length})</span>
-          </button>
-
-          <button
-            onClick={() => setActiveTab('vouchers')}
-            title="Mã Giảm Giá"
-            className={`px-2 py-2 text-[11px] font-bold rounded-lg transition flex flex-col items-center gap-1 text-center ${
-              activeTab === 'vouchers'
-                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-600 dark:text-amber-400 ring-1 ring-amber-500'
-                : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200 hover:bg-[#ecefee] hover:dark:bg-[#222429]'
-            }`}
-          >
-            <Ticket className="w-4 h-4" />
-            <span className="truncate w-full">Mã Giảm Giá ({vouchers.length})</span>
           </button>
 
           <button
@@ -832,8 +589,40 @@ export const CtvPage: React.FC<CtvPageProps> = ({
                       .reduce((sum, w) => sum + w.amount, 0) ?? 0
                   )}
                 </div>
+                {(stats?.totalDeducted ?? 0) > 0 && (
+                  <div className="text-[11px] text-rose-600 dark:text-rose-400 mt-0.5 font-semibold">
+                    Admin đã trừ: -${formatMoney(stats?.totalDeducted ?? 0)}
+                  </div>
+                )}
               </div>
             </div>
+
+            {/* Deduction history — admin can manually deduct from earned
+                income (e.g. a penalty for a bad batch of accounts); shown
+                here so it's never a silent balance change. */}
+            {stats && stats.deductions.length > 0 && (
+              <div className="bg-[#eceeed] dark:bg-[#23252a] border border-rose-500/30 rounded-2xl p-4 shadow space-y-3">
+                <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-600 dark:text-rose-400" />
+                  <span>Lịch Sử Bị Trừ Tiền ({stats.deductions.length})</span>
+                </h3>
+                <div className="space-y-2">
+                  {stats.deductions.map((d) => (
+                    <div key={d.id} className="flex items-center justify-between gap-3 p-2.5 bg-[#f3f5f4] dark:bg-[#181a1e] border border-[#e2e6e5] dark:border-[#30333b] rounded-lg text-xs">
+                      <div className="min-w-0">
+                        <div className="text-slate-700 dark:text-slate-300">{d.reason}</div>
+                        <div className="text-[10px] text-slate-500 dark:text-slate-500">
+                          {new Date(d.createdAt).toLocaleString()} · bởi {d.adminUsername}
+                        </div>
+                      </div>
+                      <div className="font-mono font-bold text-rose-600 dark:text-rose-400 flex-shrink-0">
+                        -${formatMoney(d.amount)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Chart Stats */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -941,16 +730,16 @@ export const CtvPage: React.FC<CtvPageProps> = ({
               <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dfe3e1] dark:border-[#353840] rounded-2xl p-5 space-y-3">
                 <div className="flex items-center gap-2 text-sm font-bold text-amber-600 dark:text-amber-400">
                   <PackagePlus className="w-4 h-4" />
-                  <span>Quy trình Đăng Bán Dành Cho CTV</span>
+                  <span>Quy Trình Nạp Hàng Dành Cho CTV</span>
                 </div>
                 <p className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed">
-                  CTV chỉ cần chuẩn bị định dạng tài khoản chuẩn (UID|Pass|2FA|Mail) rồi đăng lên hệ thống. Đơn hàng khi có khách mua sẽ được robot tự động kiểm tra token, trừ kho và cộng doanh thu sau khi trừ fee sàn ({platformFeePercent}%) vào ví của bạn.
+                  Admin tạo gian hàng và cấp quyền cho bạn. Bạn chỉ cần chuẩn bị định dạng tài khoản chuẩn (UID|Pass|2FA|Mail) rồi nạp vào gian hàng được cấp quyền. Đơn hàng khi có khách mua sẽ được robot tự động kiểm tra token, trừ kho và cộng doanh thu sau khi trừ fee sàn ({platformFeePercent}%) vào ví của bạn.
                 </p>
                 <button
                   onClick={() => setActiveTab('upload')}
                   className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs px-4 py-2 rounded-lg transition"
                 >
-                  Đăng Sản Phẩm Mới Ngay
+                  Nạp Hàng Ngay
                 </button>
               </div>
 
@@ -975,162 +764,20 @@ export const CtvPage: React.FC<CtvPageProps> = ({
 
         {/* TAB 2: UPLOAD PRODUCT & REFILL STOCK */}
         {activeTab === 'upload' && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            {/* Form 1: Tạo sản phẩm mới đăng lên sàn (7 cols) */}
-            <div className="lg:col-span-7 bg-[#eceeed] dark:bg-[#23252a] border border-[#dfe3e1] dark:border-[#353840] rounded-2xl p-5 shadow space-y-4">
-              <div className="border-b border-[#e0e4e2] dark:border-[#33363e] pb-3">
-                <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-                  <PackagePlus className="w-4 h-4 text-amber-600 dark:text-amber-400" />
-                  <span>Đăng Sản Phẩm Mới Lên Gian Hàng</span>
-                </h3>
-                <p className="text-xs text-slate-600 dark:text-slate-400">
-                  Sản phẩm của CTV sẽ xuất hiện ngay lập tức trên trang chủ và mục tương ứng.
-                </p>
-              </div>
-
-              <form onSubmit={handleUploadProduct} className="space-y-4 text-xs">
-                <div>
-                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">
-                    Tên sản phẩm đăng bán:
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="Ví dụ: Acc X (Twitter) 2021 - 2023 Full Cookie + 2FA"
-                    value={newProdName}
-                    onChange={(e) => setNewProdName(e.target.value)}
-                    className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:outline-none focus:border-amber-400"
-                  />
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">
-                      Danh mục:
-                    </label>
-                    <select
-                      value={newProdCategory}
-                      onChange={(e) => setNewProdCategory(e.target.value)}
-                      className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:outline-none focus:border-amber-400"
-                    >
-                      <option value="Twitter / X">Twitter / X</option>
-                      <option value="Facebook">Facebook</option>
-                      <option value="Hotmail / Outlook">Hotmail / Outlook</option>
-                      <option value="Gmail">Gmail</option>
-                      <option value="TikTok">TikTok</option>
-                      <option value="Telegram">Telegram</option>
-                      <option value="Discord">Discord</option>
-                      <option value="Tool / Proxy">Tool / Proxy</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">
-                      Giá niêm yết bán lẻ ($):
-                    </label>
-                    <div className="relative">
-                      <input
-                        type="number"
-                        step="0.001"
-                        min="0.001"
-                        required
-                        value={newProdPrice}
-                        onChange={(e) => setNewProdPrice(parseFloat(e.target.value) || 0)}
-                        className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-lg px-3 py-2 text-emerald-700 dark:text-emerald-300 font-mono font-bold focus:outline-none focus:border-amber-400"
-                      />
-                      <span className="absolute right-3 top-2 text-slate-600 dark:text-slate-400 font-mono text-xs">
-                        (Thực nhận: ${formatMoney(newProdPrice * (1 - platformFeePercent / 100))})
-                      </span>
-                    </div>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">
-                    Tên phân loại / Biến thể:
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="Ví dụ: Loại cổ 2022 - 2FA Live 100%"
-                    value={newVariantName}
-                    onChange={(e) => setNewVariantName(e.target.value)}
-                    className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:outline-none focus:border-amber-400"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">
-                    Mô tả sản phẩm & chính sách bảo hành:
-                  </label>
-                  <textarea
-                    rows={2}
-                    placeholder="Ví dụ: Acc ngâm kỹ, IP sạch, bảo hành sai pass 1 đổi 1 trong 24h đầu."
-                    value={newProdDescription}
-                    onChange={(e) => setNewProdDescription(e.target.value)}
-                    className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-lg p-2.5 text-slate-800 dark:text-slate-200 focus:outline-none focus:border-amber-400"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">
-                    Định dạng tài khoản (hiện cho khách xem trước khi mua):
-                  </label>
-                  <input
-                    type="text"
-                    placeholder="Ví dụ: UID | Password | 2FA | Email | Email Pass | Cookie"
-                    value={newProdAccountFormat}
-                    onChange={(e) => setNewProdAccountFormat(e.target.value)}
-                    className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono text-[11px] focus:outline-none focus:border-amber-400"
-                  />
-                </div>
-
-                <div>
-                  <div className="flex items-center justify-between mb-1 gap-2 flex-wrap">
-                    <label className="block text-slate-700 dark:text-slate-300 font-semibold">
-                      Dán danh sách tài khoản nhập kho (Mỗi dòng 1 acc):
-                    </label>
-                    <div className="flex items-center gap-2">
-                      <label className="flex items-center gap-1.5 text-[11px] font-semibold text-amber-700 dark:text-amber-400 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 px-2.5 py-1 rounded-lg cursor-pointer transition">
-                        <Upload className="w-3.5 h-3.5" />
-                        <span>Tải file .txt</span>
-                        <input type="file" accept=".txt" onChange={handleAccountsFileSelect(setRawAccountsUpload)} className="hidden" />
-                      </label>
-                      <span className="text-emerald-600 dark:text-emerald-400 text-[11px] font-mono">
-                        Số lượng: {rawAccountsUpload.trim() ? rawAccountsUpload.trim().split('\n').filter(Boolean).length : 0}
-                      </span>
-                    </div>
-                  </div>
-                  <textarea
-                    rows={5}
-                    required
-                    placeholder={`1000849182391|Password#123|JBSWY3DPEHPK3PXP|user1@hotmail.com|MailPass1|ct0=xxx\n1000849182392|Password#456|JBSWY3DPEHPK3PXP|user2@hotmail.com|MailPass2|ct0=yyy`}
-                    value={rawAccountsUpload}
-                    onChange={(e) => setRawAccountsUpload(e.target.value)}
-                    className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-[#dee2e0] dark:border-[#363a43] rounded-lg p-2.5 font-mono text-[11px] text-slate-800 dark:text-slate-200 focus:outline-none focus:border-amber-400"
-                  />
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={isSubmittingProduct}
-                  className="w-full bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold py-2.5 rounded-xl transition shadow-[0_0_12px_rgba(245,158,11,0.3)] disabled:opacity-50 flex items-center justify-center gap-2"
-                >
-                  <PlusCircle className="w-4 h-4" />
-                  <span>{isSubmittingProduct ? 'Đang tải lên hệ thống...' : 'Đăng Bán Sản Phẩm Lên Sàn'}</span>
-                </button>
-              </form>
-            </div>
-
-            {/* Form 2: Nạp thêm tài khoản vào sản phẩm đã có (5 cols) */}
-            <div className="lg:col-span-5 bg-[#eceeed] dark:bg-[#23252a] border border-[#dfe3e1] dark:border-[#353840] rounded-2xl p-5 shadow space-y-4">
+          <div className="max-w-xl mx-auto">
+            {/* CTV no longer creates products — only admin does, then
+                explicitly grants specific CTV(s) permission on it (see POST
+                /api/admin/products/:id/authorize-ctv). This is the only
+                upload path: pick a product you've been granted and add
+                accounts to it. */}
+            <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dfe3e1] dark:border-[#353840] rounded-2xl p-5 shadow space-y-4">
               <div className="border-b border-[#e0e4e2] dark:border-[#33363e] pb-3">
                 <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
                   <Database className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-                  <span>Nạp Thêm Tài Khoản Vào Kho Hiện Có</span>
+                  <span>Nạp Tài Khoản Vào Gian Hàng Được Cấp Quyền</span>
                 </h3>
                 <p className="text-xs text-slate-600 dark:text-slate-400">
-                  Bổ sung số lượng tồn kho cho các mã sản phẩm đang bán chạy.
+                  Chỉ hiện gian hàng admin đã cấp quyền cho bạn — thu nhập được tính riêng theo đúng số tài khoản bạn nạp.
                 </p>
               </div>
 
@@ -1143,17 +790,26 @@ export const CtvPage: React.FC<CtvPageProps> = ({
                     value={refillProductId}
                     onChange={(e) => {
                       setRefillProductId(e.target.value);
-                      const prod = products.find((p) => p.id === e.target.value);
+                      const prod = myProducts.find((p) => p.id === e.target.value);
                       if (prod && prod.variants[0]) setRefillVariantId(prod.variants[0].id);
                     }}
                     className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200"
                   >
-                    {products.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name}
-                      </option>
-                    ))}
+                    {myProducts.length === 0 ? (
+                      <option value="">Bạn chưa được cấp quyền gian hàng nào</option>
+                    ) : (
+                      myProducts.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.name}
+                        </option>
+                      ))
+                    )}
                   </select>
+                  {user.role === 'ctv' && (
+                    <p className="text-[10px] text-slate-500 dark:text-slate-500 mt-1">
+                      Chỉ hiện gian hàng admin đã cấp quyền cho bạn.
+                    </p>
+                  )}
                 </div>
 
                 <div>
@@ -1201,7 +857,7 @@ export const CtvPage: React.FC<CtvPageProps> = ({
 
                 <button
                   type="submit"
-                  disabled={isSubmittingRefill}
+                  disabled={isSubmittingRefill || myProducts.length === 0}
                   className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold py-2.5 rounded-xl transition shadow-[0_0_12px_rgba(6,182,212,0.3)] disabled:opacity-50 flex items-center justify-center gap-2"
                 >
                   <Database className="w-4 h-4" />
@@ -1392,114 +1048,61 @@ export const CtvPage: React.FC<CtvPageProps> = ({
           </div>
         )}
 
-        {/* TAB 4: MY PRODUCTS */}
+        {/* TAB 4: MY PRODUCTS — read-only now. Products are storefronts
+            admin creates and manages (hide/show, edit description);
+            several CTVs can be granted the same one, so this shows only
+            this CTV's own slice of each product's numbers (see
+            stats.byProduct), not management controls that would affect
+            other CTVs stocking it too. */}
         {activeTab === 'my-products' && (
           <div className="space-y-4">
             <div className="flex items-center justify-between">
               <div>
-                <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">Danh Sách Sản Phẩm CTV Đang Bán</h3>
-                <p className="text-xs text-slate-600 dark:text-slate-400">Kiểm tra số lượng tồn kho, giá bán và bấm để xem nhanh giao diện sản phẩm</p>
+                <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">Gian Hàng Tôi Đã Đóng Góp</h3>
+                <p className="text-xs text-slate-600 dark:text-slate-400">Tồn kho, đã bán và doanh thu của riêng bạn trên từng gian hàng được cấp quyền</p>
               </div>
 
               <button
                 onClick={() => setActiveTab('upload')}
                 className="bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-xs px-3.5 py-2 rounded-lg transition flex items-center gap-1.5 shadow"
               >
-                <PlusCircle className="w-4 h-4" />
-                <span>Thêm Sản Phẩm Mới</span>
+                <Database className="w-4 h-4" />
+                <span>Nạp Thêm Hàng</span>
               </button>
             </div>
 
-            <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
-              <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs min-w-[640px]">
-                <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
-                  <tr>
-                    <th className="p-3">Sản phẩm</th>
-                    <th className="p-3">Danh mục</th>
-                    <th className="p-3">Giá niêm yết</th>
-                    <th className="p-3">Fee sàn ({platformFeePercent}%)</th>
-                    <th className="p-3 text-emerald-600 dark:text-emerald-400 font-bold">Thực nhận / đơn</th>
-                    <th className="p-3">Tồn kho</th>
-                    <th className="p-3 text-right">Thao tác</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[#e4e8e7]">
-                  {myProducts.map((p) => {
-                    const totalStock = p.variants.reduce((sum, v) => sum + v.stockCount, 0);
-                    const netEarn = p.price * (1 - platformFeePercent / 100);
-
-                    return (
-                      <tr key={p.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34] transition">
-                        <td className="p-3">
-                          <div className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
-                            {p.name}
-                            {p.isHidden && (
-                              <span className="text-[10px] bg-slate-500/20 text-slate-600 dark:text-slate-400 border border-slate-500/30 px-1.5 py-0.5 rounded font-normal">
-                                Đã ẩn
-                              </span>
-                            )}
-                          </div>
-                          <div className="text-[10px] text-slate-600 dark:text-slate-400">{p.variants.length} biến thể</div>
-                        </td>
-                        <td className="p-3">
-                          <span className="bg-[#e5e8e7] dark:bg-[#2d3036] text-emerald-600 dark:text-emerald-400 px-2 py-0.5 rounded text-[11px]">
-                            {p.category}
-                          </span>
-                        </td>
-                        <td className="p-3 font-mono text-slate-700 dark:text-slate-300 font-semibold">
-                          ${formatMoney(p.price)}
-                        </td>
-                        <td className="p-3 font-mono text-amber-600 dark:text-amber-400">
-                          ${formatMoney(p.price * platformFeePercent / 100)}
-                        </td>
+            {!stats || stats.byProduct.length === 0 ? (
+              <div className="text-center text-xs text-slate-500 dark:text-slate-500 py-10 bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl">
+                Bạn chưa nạp hàng vào gian hàng nào — bấm "Nạp Thêm Hàng" để bắt đầu.
+              </div>
+            ) : (
+              <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
+                <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs min-w-[520px]">
+                  <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
+                    <tr>
+                      <th className="p-3">Gian hàng</th>
+                      <th className="p-3">Tồn kho của tôi</th>
+                      <th className="p-3">Đã bán của tôi</th>
+                      <th className="p-3 text-emerald-600 dark:text-emerald-400 font-bold">Doanh thu của tôi</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#e4e8e7]">
+                    {stats.byProduct.map((row) => (
+                      <tr key={row.productId} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34] transition">
+                        <td className="p-3 font-bold text-slate-800 dark:text-slate-200">{row.productName}</td>
+                        <td className="p-3 font-mono text-slate-700 dark:text-slate-300">{row.totalInStock.toLocaleString()}</td>
+                        <td className="p-3 font-mono text-slate-700 dark:text-slate-300">{row.totalSold.toLocaleString()}</td>
                         <td className="p-3 font-mono font-bold text-emerald-600 dark:text-emerald-400">
-                          +${formatMoney(netEarn)}
-                        </td>
-                        <td className="p-3 font-mono text-emerald-600 dark:text-emerald-400 font-semibold">
-                          {totalStock.toLocaleString()}
-                        </td>
-                        <td className="p-3 text-right space-x-1.5 whitespace-nowrap">
-                          <button
-                            onClick={() => handleToggleProductVisibility(p)}
-                            title={p.isHidden ? 'Hiện lại sản phẩm' : 'Ẩn sản phẩm khỏi cửa hàng'}
-                            className={`p-1.5 rounded-lg transition inline-flex ${
-                              p.isHidden
-                                ? 'bg-[#e5e8e7] dark:bg-[#2d3036] text-slate-500 dark:text-slate-500 hover:bg-emerald-500 hover:text-slate-950'
-                                : 'bg-[#e5e8e7] dark:bg-[#2d3036] text-slate-600 dark:text-slate-400 hover:bg-slate-500 hover:text-slate-950'
-                            }`}
-                          >
-                            {p.isHidden ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                          </button>
-                          <button
-                            onClick={() => setVariantsModalProduct(p)}
-                            title="Ẩn/hiện biến thể"
-                            className="bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-amber-500 hover:text-slate-950 text-slate-600 dark:text-slate-400 font-bold p-1.5 rounded-lg text-xs transition inline-flex"
-                          >
-                            <Boxes className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            onClick={() => openEditDescription(p)}
-                            title="Sửa mô tả & định dạng tài khoản"
-                            className="bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-amber-500 hover:text-slate-950 text-amber-600 dark:text-amber-400 font-bold px-2.5 py-1.5 rounded-lg text-xs transition"
-                          >
-                            Sửa mô tả
-                          </button>
-                          <button
-                            onClick={() => onSelectProduct(p)}
-                            className="bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-emerald-500 hover:text-slate-950 text-emerald-600 dark:text-emerald-400 font-bold px-3 py-1.5 rounded-lg text-xs transition inline-flex items-center gap-1"
-                          >
-                            <span>Xem trang bán</span>
-                            <ChevronRight className="w-3.5 h-3.5" />
-                          </button>
+                          ${formatMoney(row.grossRevenue)}
                         </td>
                       </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+                    ))}
+                  </tbody>
+                </table>
+                </div>
               </div>
-            </div>
+            )}
           </div>
         )}
 
@@ -1649,181 +1252,6 @@ export const CtvPage: React.FC<CtvPageProps> = ({
           </div>
         )}
 
-        {/* TAB 5: VOUCHERS */}
-        {activeTab === 'vouchers' && (
-          <div className="space-y-4">
-            <div>
-              <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">Mã Giảm Giá Của Tôi</h3>
-              <p className="text-xs text-slate-600 dark:text-slate-400">Tạo mã voucher riêng, giới hạn số lượt sử dụng — khách nhập mã ở trang sản phẩm để được giảm giá tự động.</p>
-            </div>
-
-            {/* Create voucher form */}
-            <form onSubmit={handleCreateVoucher} className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl p-4 grid grid-cols-1 sm:grid-cols-4 gap-3 text-xs">
-              <div>
-                <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Mã voucher:</label>
-                <input
-                  type="text"
-                  value={newVoucherCode}
-                  onChange={(e) => setNewVoucherCode(e.target.value.toUpperCase())}
-                  placeholder="VD: RONAN10"
-                  className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-amber-500 focus:outline-none"
-                  required
-                />
-              </div>
-              <div>
-                <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Giảm giá (%):</label>
-                <input
-                  type="number"
-                  min={1}
-                  max={90}
-                  value={newVoucherDiscount}
-                  onChange={(e) => setNewVoucherDiscount(Number(e.target.value))}
-                  className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-amber-500 focus:outline-none"
-                  required
-                />
-              </div>
-              <div>
-                <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Số lượt sử dụng tối đa:</label>
-                <input
-                  type="number"
-                  min={1}
-                  value={newVoucherMaxUses}
-                  onChange={(e) => setNewVoucherMaxUses(Number(e.target.value))}
-                  className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-amber-500 focus:outline-none"
-                  required
-                />
-              </div>
-              <div>
-                <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Hết hạn (tùy chọn):</label>
-                <input
-                  type="date"
-                  value={newVoucherExpiry}
-                  onChange={(e) => setNewVoucherExpiry(e.target.value)}
-                  className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono focus:border-amber-500 focus:outline-none"
-                />
-              </div>
-              <div>
-                <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Áp dụng cho sản phẩm:</label>
-                <select
-                  value={newVoucherProductId}
-                  onChange={(e) => {
-                    setNewVoucherProductId(e.target.value);
-                    setNewVoucherVariantId('');
-                  }}
-                  className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:border-amber-500 focus:outline-none"
-                >
-                  <option value="">Tất cả sản phẩm</option>
-                  {products.map((p) => (
-                    <option key={p.id} value={p.id}>{p.name}</option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Áp dụng cho biến thể:</label>
-                <select
-                  value={newVoucherVariantId}
-                  onChange={(e) => setNewVoucherVariantId(e.target.value)}
-                  disabled={!newVoucherProductId}
-                  className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 focus:border-amber-500 focus:outline-none disabled:opacity-40"
-                >
-                  <option value="">Tất cả biến thể</option>
-                  {newVoucherProductId &&
-                    products
-                      .find((p) => p.id === newVoucherProductId)
-                      ?.variants.map((v) => (
-                        <option key={v.id} value={v.id}>{v.name}</option>
-                      ))}
-                </select>
-              </div>
-              <div className="sm:col-span-4 flex justify-end">
-                <button
-                  type="submit"
-                  disabled={isCreatingVoucher}
-                  className="bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold text-xs px-4 py-2 rounded-lg transition flex items-center gap-1.5 shadow"
-                >
-                  <PlusCircle className="w-4 h-4" />
-                  <span>{isCreatingVoucher ? 'Đang tạo...' : 'Tạo Mã Giảm Giá'}</span>
-                </button>
-              </div>
-            </form>
-
-            {/* Vouchers table */}
-            <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden shadow">
-              <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs min-w-[640px]">
-                <thead className="bg-[#eff2f1] dark:bg-[#1d1f24] text-slate-600 dark:text-slate-400 border-b border-[#dde2e0] dark:border-[#373b43]">
-                  <tr>
-                    <th className="p-3">Mã</th>
-                    <th className="p-3">Áp dụng</th>
-                    <th className="p-3">Giảm giá</th>
-                    <th className="p-3">Số lượng sử dụng</th>
-                    <th className="p-3">Hết hạn</th>
-                    <th className="p-3">Trạng thái</th>
-                    <th className="p-3 text-right">Thao tác</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[#e4e8e7]">
-                  {vouchers.length === 0 ? (
-                    <tr>
-                      <td colSpan={7} className="p-6 text-center text-slate-500 dark:text-slate-500">
-                        Chưa có mã giảm giá nào. Tạo mã đầu tiên ở form bên trên.
-                      </td>
-                    </tr>
-                  ) : (
-                    vouchers.map((v) => {
-                      const isExpired = v.expiresAt ? new Date(v.expiresAt).getTime() < Date.now() : false;
-                      const isExhausted = v.usedCount >= v.maxUses;
-                      const isLive = !isExpired && !isExhausted;
-                      return (
-                        <tr key={v.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34] transition">
-                          <td className="p-3 font-mono font-bold text-slate-900 dark:text-slate-100">{v.code}</td>
-                          <td className="p-3 text-slate-600 dark:text-slate-400">
-                            {v.applicableVariantId ? (
-                              <span className="text-amber-700 dark:text-amber-400" title={v.applicableProductName}>{v.applicableVariantName}</span>
-                            ) : v.applicableProductId ? (
-                              <span className="text-amber-700 dark:text-amber-400">{v.applicableProductName}</span>
-                            ) : (
-                              <span className="text-slate-500 dark:text-slate-500">Tất cả sản phẩm</span>
-                            )}
-                          </td>
-                          <td className="p-3 font-mono text-emerald-600 dark:text-emerald-400 font-bold">-{v.discountPercent}%</td>
-                          <td className="p-3 font-mono text-slate-700 dark:text-slate-300">
-                            {v.usedCount} / {v.maxUses}
-                          </td>
-                          <td className="p-3 text-slate-600 dark:text-slate-400">
-                            {v.expiresAt ? new Date(v.expiresAt).toLocaleDateString('vi-VN') : 'Không giới hạn'}
-                          </td>
-                          <td className="p-3">
-                            <span
-                              className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                                isLive
-                                  ? 'bg-emerald-500/20 text-emerald-700 dark:text-emerald-300 border border-emerald-500/40'
-                                  : 'bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/40'
-                              }`}
-                            >
-                              {isLive ? 'Đang hoạt động' : isExpired ? 'Hết hạn' : 'Hết lượt'}
-                            </span>
-                          </td>
-                          <td className="p-3 text-right">
-                            <button
-                              onClick={() => handleDeleteVoucher(v.id, v.code)}
-                              className="p-1 text-red-600 dark:text-red-400 hover:text-red-700 hover:dark:text-red-300 hover:bg-red-50 hover:dark:bg-red-950/70 rounded transition"
-                              title="Xóa mã"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-              </div>
-            </div>
-          </div>
-        )}
-
         {/* TAB: REVIEWS — read-only visibility into reviews on this CTV's
             own products, so they know which buyers to reach out to about a
             low-rated ("xấu") review; the buyer can revise it themselves
@@ -1882,121 +1310,6 @@ export const CtvPage: React.FC<CtvPageProps> = ({
         )}
       </div>
 
-      {/* Modal: edit a product's description & account-format — the only
-          fields a CTV can touch on an existing listing after creation. */}
-      {editingDescProductId && (
-        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-[#eceeed] dark:bg-[#23252a] border border-amber-500/50 rounded-2xl max-w-lg w-full p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center justify-between pb-2 border-b border-[#e0e4e2] dark:border-[#33363e]">
-              <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">Sửa Mô Tả Sản Phẩm</h3>
-              <button
-                onClick={() => setEditingDescProductId(null)}
-                className="text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100"
-              >
-                ✕
-              </button>
-            </div>
-
-            <div className="space-y-3 text-xs">
-              <div>
-                <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">
-                  Mô tả sản phẩm & chính sách bảo hành:
-                </label>
-                <textarea
-                  rows={4}
-                  placeholder="Ví dụ: Acc ngâm kỹ, IP sạch, bảo hành sai pass 1 đổi 1 trong 24h đầu."
-                  value={editDescText}
-                  onChange={(e) => setEditDescText(e.target.value)}
-                  className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-lg p-2.5 text-slate-800 dark:text-slate-200 focus:outline-none focus:border-amber-400"
-                />
-                <p className="text-[10px] text-slate-500 dark:text-slate-500 mt-1">Để trống rồi lưu = xóa mô tả hiện tại.</p>
-              </div>
-
-              <div>
-                <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">
-                  Định dạng tài khoản (hiện cho khách xem trước khi mua):
-                </label>
-                <input
-                  type="text"
-                  placeholder="Ví dụ: UID | Password | 2FA | Email | Email Pass | Cookie"
-                  value={editAccountFormatText}
-                  onChange={(e) => setEditAccountFormatText(e.target.value)}
-                  className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200 font-mono text-[11px] focus:outline-none focus:border-amber-400"
-                />
-              </div>
-            </div>
-
-            <div className="flex justify-end gap-2 pt-1">
-              <button
-                onClick={() => setEditingDescProductId(null)}
-                className="px-4 py-2 bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-[#dde1e0] hover:dark:bg-[#373b44] text-slate-700 dark:text-slate-300 rounded-lg text-xs font-semibold"
-              >
-                Hủy
-              </button>
-              <button
-                onClick={handleSaveDescription}
-                disabled={isSavingDescription}
-                className="px-4 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-xs transition disabled:opacity-50"
-              >
-                {isSavingDescription ? 'Đang lưu...' : 'Lưu Thay Đổi'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Modal: show/hide each variant of a product — CTV can't add, edit,
-          or delete a variant's price/name (Admin-only), just pull one off
-          the storefront without touching its inventory. */}
-      {variantsModalProduct && (
-        <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-[#eceeed] dark:bg-[#23252a] border border-amber-500/50 rounded-2xl max-w-lg w-full p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center justify-between pb-2 border-b border-[#e0e4e2] dark:border-[#33363e]">
-              <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                Biến Thể Của "{variantsModalProduct.name}"
-              </h3>
-              <button
-                onClick={() => setVariantsModalProduct(null)}
-                className="text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100"
-              >
-                ✕
-              </button>
-            </div>
-
-            <div className="space-y-2 text-xs">
-              {variantsModalProduct.variants.map((v) => (
-                <div
-                  key={v.id}
-                  className="flex items-center justify-between gap-3 p-3 bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee2e0] dark:border-[#363a43] rounded-xl"
-                >
-                  <div className="min-w-0">
-                    <div className="font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-1.5 truncate">
-                      {v.name}
-                      {v.isHidden && (
-                        <span className="text-[10px] bg-slate-500/20 text-slate-600 dark:text-slate-400 border border-slate-500/30 px-1.5 py-0.5 rounded font-normal flex-shrink-0">
-                          Đã ẩn
-                        </span>
-                      )}
-                    </div>
-                    <div className="text-[11px] font-mono text-amber-600 dark:text-amber-400">${formatMoney(v.price)}</div>
-                  </div>
-                  <button
-                    onClick={() => handleToggleVariantVisibility(variantsModalProduct.id, v.id, v.isHidden)}
-                    title={v.isHidden ? 'Hiện lại biến thể' : 'Ẩn biến thể khỏi cửa hàng'}
-                    className={`flex-shrink-0 p-1.5 rounded-lg transition ${
-                      v.isHidden
-                        ? 'bg-[#e5e8e7] dark:bg-[#2d3036] text-slate-500 dark:text-slate-500 hover:bg-emerald-500 hover:text-slate-950'
-                        : 'bg-[#e5e8e7] dark:bg-[#2d3036] text-slate-600 dark:text-slate-400 hover:bg-slate-500 hover:text-slate-950'
-                    }`}
-                  >
-                    {v.isHidden ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                  </button>
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 };
