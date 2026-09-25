@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import { Product, ProductVariant, Language, User, Review, PreOrder, ReviewSuggestion } from '../types';
 import { VIP_TIERS } from '../data/vipTiers';
 import { translations } from '../locales/translations';
@@ -56,6 +56,22 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
   const [selectedVariant, setSelectedVariant] = useState<ProductVariant>(
     product.variants.find((v) => v.inStock) || product.variants[0]
   );
+  // Long variant names are clamped to 2 lines in the picker so the list stays
+  // compact. When the SELECTED variant's name is actually cut off, its full
+  // text is shown in a caption under the list (measured, so short names never
+  // get a redundant caption; re-measured on resize since wrapping changes).
+  const selectedNameRef = useRef<HTMLDivElement | null>(null);
+  const [isSelectedNameClamped, setIsSelectedNameClamped] = useState(false);
+  useLayoutEffect(() => {
+    const measure = () => {
+      const el = selectedNameRef.current;
+      setIsSelectedNameClamped(!!el && el.scrollHeight > el.clientHeight + 1);
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [selectedVariant?.id, liveVariants, language]);
+
   const [quantity, setQuantity] = useState(1);
   const [couponCode, setCouponCode] = useState('');
   const [appliedVoucher, setAppliedVoucher] = useState<{ code: string; discountPercent: number } | null>(null);
@@ -746,7 +762,11 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
                         </div>
 
                         <div className="flex-1 min-w-0">
-                          <div className={`text-xs font-semibold truncate ${isSelected ? 'text-slate-900 dark:text-slate-100 font-bold' : 'text-slate-800 dark:text-slate-200'}`}>
+                          <div
+                            ref={isSelected ? selectedNameRef : undefined}
+                            title={variant.name}
+                            className={`text-xs font-semibold leading-snug line-clamp-2 break-words ${isSelected ? 'text-slate-900 dark:text-slate-100 font-bold' : 'text-slate-800 dark:text-slate-200'}`}
+                          >
                             {variant.name}
                           </div>
                           <div className="text-[10px] mt-0.5 font-mono">
@@ -785,6 +805,13 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
                   );
                 })}
               </div>
+
+              {isSelectedNameClamped && (
+                <div className="mt-2 text-[11px] leading-snug text-slate-600 dark:text-slate-400 bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e2e6e5] dark:border-[#30333b] rounded-lg px-2.5 py-1.5 break-words">
+                  <span className="font-semibold text-slate-700 dark:text-slate-300">{t.pdSelectedVariantLabel}</span>{' '}
+                  {selectedVariant.name}
+                </div>
+              )}
             </div>
 
             {/* Quantity: Chỉ cho nhập số lượng, số lượng nổi bật dễ nhìn */}
