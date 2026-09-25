@@ -12,6 +12,7 @@ import { ethers } from 'ethers';
 import helmet from 'helmet';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { twitterChecker } from './server/twitterChecker';
+import { getChainHead, scanIncomingTransfers, transactionExists, blockAtOrBefore, IncomingTransfer, QUICK_RETRY_DELAYS_MS } from './server/chainTransfers';
 
 const app = express();
 const PORT = 3434;
@@ -461,6 +462,115 @@ async function migrateLegacyOwnershipToUploaders(): Promise<void> {
   }
 }
 
+// Older deposit rows carry a tx hash (and block number) that the previous
+// code simply generated at random — they don't exist on any chain. This
+// background pass fixes them up, once per row, best effort:
+//  - a stored hash is looked up on its chain; if it really exists it's kept;
+//  - a hash that provably doesn't exist is removed (never shown as real);
+//  - the real transaction is then searched for in the token's Transfer events
+//    into that row's wallet, around the time the row was recorded, matching the
+//    credited amount (each real hash used at most once);
+//  - rows from the removed "simulated deposit" tool never touched a chain, so
+//    they just lose their invented hash.
+// If an RPC can't answer, the row is left as-is and retried on the next start.
+async function recoverDepositTxHashes(): Promise<void> {
+  const depCol = db.collection<DepositTransaction>('deposits');
+  const cryptoCol = db.collection<CryptoOption>('crypto_options');
+  const evm = ['bsc', 'polygon', 'base'];
+
+  const all = await depCol.find();
+
+  // Admin balance adjustments were stored with a random "admin_..." string in
+  // the hash field. They never touch a chain — blank it.
+  const adminFakes = all.filter((d) => d.network === ('admin' as any) && d.txHash);
+  if (adminFakes.length > 0) {
+    await depCol.bulkWrite(adminFakes.map((d) => ({ filter: { id: d.id }, update: { $set: { txHash: '', blockNumber: 0 } } })));
+    console.log(`[Deposits] Removed the invented hash from ${adminFakes.length} admin balance-adjustment row(s).`);
+  }
+
+  const pending = all
+    .filter((d) => evm.includes(d.network) && d.txHashChecked !== true)
+    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  if (pending.length === 0) return;
+
+  const claimed = new Set(all.filter((d) => d.txHash && d.txHashChecked === true).map((d) => d.txHash.toLowerCase()));
+  let recovered = 0;
+  let cleared = 0;
+  let unresolved = 0;
+  // A row the chain couldn't answer for (RPC down / range unreadable) is retried
+  // on the next start, but only a few times — after that it's closed out with
+  // whatever is known (no hash) instead of re-scanning on every restart forever.
+  const MAX_ATTEMPTS = 3;
+  const noteUnresolved = async (row: DepositTransaction, extra: Partial<DepositTransaction> = {}) => {
+    const attempts = (row.txHashAttempts || 0) + 1;
+    await depCol.updateOne({ id: row.id }, { $set: { ...extra, txHashAttempts: attempts, ...(attempts >= MAX_ATTEMPTS ? { txHashChecked: true } : {}) } });
+    unresolved++;
+  };
+
+  for (const row of pending) {
+    try {
+      if (String(row.id).startsWith('tx_sim_')) {
+        await depCol.updateOne({ id: row.id }, { $set: { txHash: '', blockNumber: 0, txHashChecked: true } });
+        cleared++;
+        continue;
+      }
+      const cfg = await cryptoCol.findOne({ id: row.network });
+      if (!cfg) continue;
+
+      let hashIsFake = false;
+      if (row.txHash) {
+        const exists = await transactionExists(cfg, row.txHash);
+        if (exists === 'yes') {
+          await depCol.updateOne({ id: row.id }, { $set: { txHashChecked: true } });
+          claimed.add(row.txHash.toLowerCase());
+          continue;
+        }
+        if (exists === 'unknown') {
+          await noteUnresolved(row);
+          continue;
+        }
+        hashIsFake = true;
+      }
+
+      const endBlock = await blockAtOrBefore(cfg, Math.floor(new Date(row.timestamp).getTime() / 1000) + 120);
+      let hit: IncomingTransfer | undefined;
+      let scanComplete = false;
+      if (endBlock !== null && row.walletAddress) {
+        const isMatch = (t: IncomingTransfer) => Math.abs(t.amount - row.amount) <= 0.0015 && !claimed.has(t.txHash.toLowerCase());
+        const scan = await scanIncomingTransfers(cfg, row.walletAddress, {
+          fromBlock: Math.max(1, endBlock - 60000),
+          toBlock: endBlock,
+          maxChunks: 30,
+          deadlineMs: 30000,
+          stopWhen: (found) => found.some(isMatch),
+        });
+        hit = scan.transfers.find(isMatch);
+        scanComplete = scan.complete;
+      }
+
+      if (hit) {
+        await depCol.updateOne({ id: row.id }, { $set: { txHash: hit.txHash, blockNumber: hit.blockNumber, txHashChecked: true } });
+        claimed.add(hit.txHash.toLowerCase());
+        recovered++;
+      } else if (hashIsFake) {
+        // Provably not a real tx: stop showing it. Only mark the row done when
+        // the search was conclusive, so an RPC hiccup gets retried next start.
+        cleared++;
+        if (scanComplete) await depCol.updateOne({ id: row.id }, { $set: { txHash: '', blockNumber: 0, txHashChecked: true } });
+        else await noteUnresolved(row, { txHash: '', blockNumber: 0 });
+      } else if (scanComplete) {
+        await depCol.updateOne({ id: row.id }, { $set: { txHashChecked: true } });
+      } else {
+        await noteUnresolved(row);
+      }
+    } catch (err) {
+      unresolved++;
+      console.warn(`[Deposits] Could not verify tx hash of deposit ${row.id}:`, err);
+    }
+  }
+  console.log(`[Deposits] Tx hash check: ${recovered} real hash(es) recovered, ${cleared} invented hash(es) removed, ${unresolved} left for the next start.`);
+}
+
 // Earlier versions seeded accounts with a fixed, source-visible password.
 // Any privileged account still using it is effectively open to anyone who has
 // read the code — flag them loudly at every startup until it's changed.
@@ -484,6 +594,7 @@ async function warnAboutLegacyDefaultPasswords(): Promise<void> {
 initializeDatabase()
   .then(() => {
     migrateLegacyOwnershipToUploaders().catch((e) => console.error('[Migration error]', e));
+    recoverDepositTxHashes().catch((e) => console.error('[Deposits] Tx hash check error:', e));
     warnAboutLegacyDefaultPasswords().catch((e) => console.error('[Security check error]', e));
     cleanupOldSoldInventory().catch((e) => console.error('[Cleanup Error]', e));
     const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // re-check once a day
@@ -834,16 +945,6 @@ function ratingFromReviews(productId: string, allReviews: Review[]): { rating: n
   const reviewCount = productReviews.length;
   const rating = reviewCount > 0 ? Number((productReviews.reduce((sum, r) => sum + r.rating, 0) / reviewCount).toFixed(1)) : 0;
   return { rating, reviewCount };
-}
-
-// A full-length 64-hex-char tx hash, matching the shape of a real on-chain
-// transaction hash. `Math.random().toString(16)` alone can't do this — a
-// JS double only carries ~13-14 hex digits of precision, so
-// `Math.random().toString(16).substring(2, 66)` (the old code, used in a few
-// places) silently produced a ~13-character string instead of 64, both in
-// what got stored and what was shown to the user.
-function generateTxHash(prefix = '0x'): string {
-  return prefix + Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
 }
 
 // Price sanity for everything an admin types in. A negative price made
@@ -2125,6 +2226,57 @@ app.get('/api/deposit/wallets', async (req, res) => {
   });
 });
 
+// Works out which real on-chain transfer(s) a just-credited amount came from.
+// Scans the token's Transfer events into the user's wallet, newest first, back
+// to the previous checkpoint. Only answers when the match is unambiguous:
+//  - the newest transfers add up to exactly the credited amount -> one row per
+//    transfer (amounts adjusted by rounding so the rows still sum to the credit,
+//    which VIP tiers are computed from), or
+//  - a single transfer covers it (it was larger only because some funds were
+//    also swept out in the same window) -> one row for the credited amount.
+// Anything else (RPC couldn't read the range, several transfers overshooting the
+// amount) returns null and the row keeps no hash — never a guess.
+async function findDepositTransactions(
+  cfg: CryptoOption,
+  address: string,
+  credited: number,
+  head: number,
+  lastCheckedBlock: number | null
+): Promise<{ txHash: string; blockNumber: number; amount: number }[] | null> {
+  const MAX_LOOKBACK_BLOCKS = 60000;
+  const fromBlock = Math.max(lastCheckedBlock !== null ? lastCheckedBlock + 1 : 0, head - MAX_LOOKBACK_BLOCKS, 0);
+  const tolerance = 0.0015;
+  const total = (list: IncomingTransfer[]) => list.reduce((sum, t) => sum + t.amount, 0);
+
+  const scan = await scanIncomingTransfers(cfg, address, {
+    fromBlock,
+    toBlock: head,
+    maxChunks: 30,
+    deadlineMs: 10000,
+    retryDelays: [0, 500],
+    stopWhen: (found) => total(found) >= credited - tolerance,
+  });
+
+  const picked: IncomingTransfer[] = [];
+  for (const t of scan.transfers) {
+    picked.push(t);
+    if (total(picked) >= credited - tolerance) break;
+  }
+  if (picked.length === 0) return null;
+  const sum = total(picked);
+
+  if (Math.abs(sum - credited) <= tolerance) {
+    const rows = picked.map((t) => ({ txHash: t.txHash, blockNumber: t.blockNumber, amount: Number(t.amount.toFixed(3)) }));
+    const others = rows.slice(0, -1).reduce((s, r) => s + r.amount, 0);
+    rows[rows.length - 1].amount = Number((credited - others).toFixed(3));
+    return rows.every((r) => r.amount > 0) ? rows : null;
+  }
+  if (picked.length === 1 && sum > credited) {
+    return [{ txHash: picked[0].txHash, blockNumber: picked[0].blockNumber, amount: credited }];
+  }
+  return null;
+}
+
 // 9. Real RPC Check / Poll endpoint
 app.post('/api/deposit/check-rpc', async (req, res) => {
   const { network = 'bsc' } = req.body as { network: CryptoNetwork };
@@ -2158,7 +2310,10 @@ app.post('/api/deposit/check-rpc', async (req, res) => {
   // treated as "the wallet is empty" (it would reset the checkpoint below and
   // re-credit the whole balance on the next successful poll).
   let rpcOk = false;
-  let blockNumber = 42100980 + Math.floor(Math.random() * 100);
+  // Real chain head as of this check (null when it couldn't be read). Read
+  // BEFORE the balance so any transfer landing after it is guaranteed to be
+  // covered by the next lookup's block range.
+  let chainHead: number | null = null;
 
   try {
     try {
@@ -2176,6 +2331,7 @@ app.post('/api/deposit/check-rpc', async (req, res) => {
           ['function balanceOf(address account) view returns (uint256)'],
           provider
         );
+        chainHead = await getChainHead(cryptoConfig, QUICK_RETRY_DELAYS_MS);
         const balanceBigInt = (await Promise.race([
           tokenContract.balanceOf(userAddress),
           new Promise((_, reject) => setTimeout(() => reject(new Error('RPC timeout')), 3500)),
@@ -2218,10 +2374,13 @@ app.post('/api/deposit/check-rpc', async (req, res) => {
       // Move the checkpoint BEFORE crediting: if the process dies between the
       // two steps the worst case is one under-credited deposit that shows up in
       // the logs, never the same on-chain funds credited twice.
+      const previousBlock = checkpoint && typeof checkpoint.lastBlock === 'number' ? checkpoint.lastBlock : null;
+      const checkpointFields: Record<string, any> = { lastBalance: onChainBalance, updatedAt: new Date().toISOString() };
+      if (chainHead !== null) checkpointFields.lastBlock = chainHead;
       if (checkpoint) {
-        await cpCol.updateOne({ userId: user.id, network }, { $set: { lastBalance: onChainBalance, updatedAt: new Date().toISOString() } });
+        await cpCol.updateOne({ userId: user.id, network }, { $set: checkpointFields });
       } else {
-        await cpCol.insertOne({ id: `cp_${user.id}_${network}`, userId: user.id, network, lastBalance: onChainBalance, updatedAt: new Date().toISOString() });
+        await cpCol.insertOne({ id: `cp_${user.id}_${network}`, userId: user.id, network, ...checkpointFields });
       }
 
       // A >=0.001 floor (rather than >0) avoids sub-thousandth floating-point
@@ -2233,23 +2392,61 @@ app.post('/api/deposit/check-rpc', async (req, res) => {
           const updatedUser = await userCol.findOne({ id: user.id });
           newBalance = updatedUser ? updatedUser.balance : Number((user.balance + creditedNow).toFixed(3));
 
-          // The observation is balance-based, so the specific on-chain tx hash
-          // isn't known here — left empty rather than invented.
-          const newTx: DepositTransaction = {
-            id: 'tx_' + Date.now(),
+          // The balance credit above is the source of truth for the amount. The
+          // row is written straight away with no hash, so a slow chain lookup
+          // can never delay or lose the credit; the real transaction hash(es)
+          // are then filled in from the token's Transfer events below.
+          const rowBase = {
             userId: user.id,
             username: user.username,
             network,
             tokenSymbol: cryptoConfig.token,
-            amount: creditedNow,
             walletAddress: userAddress,
-            txHash: '',
-            blockNumber: 0,
-            timestamp: new Date().toISOString(),
-            status: 'confirmed',
+            status: 'confirmed' as const,
             detectedVia: cryptoConfig.rpcUrl,
           };
-          await depCol.insertOne(newTx);
+          const stamp = Date.now();
+          const provisional: DepositTransaction = {
+            id: 'tx_' + stamp,
+            ...rowBase,
+            amount: creditedNow,
+            txHash: '',
+            blockNumber: chainHead ?? 0,
+            timestamp: new Date().toISOString(),
+          };
+          await depCol.insertOne(provisional);
+
+          if (chainHead !== null) {
+            const head = chainHead;
+            const resolveHashes = async () => {
+              try {
+                const attributed = await findDepositTransactions(cryptoConfig, userAddress, creditedNow, head, previousBlock);
+                if (!attributed) return;
+                await depCol.updateOne(
+                  { id: provisional.id },
+                  { $set: { amount: attributed[0].amount, txHash: attributed[0].txHash, blockNumber: attributed[0].blockNumber } }
+                );
+                for (let i = 1; i < attributed.length; i++) {
+                  await depCol.insertOne({
+                    id: `tx_${stamp}_${i}`,
+                    ...rowBase,
+                    amount: attributed[i].amount,
+                    txHash: attributed[i].txHash,
+                    blockNumber: attributed[i].blockNumber,
+                    timestamp: provisional.timestamp,
+                  });
+                }
+              } catch (lookupErr) {
+                // Best effort: the deposit is already credited and recorded — a
+                // failed hash lookup just leaves its hash empty.
+                console.warn(`[Deposit] Could not resolve tx hash for ${creditedNow} ${network} deposit of user ${user.id}:`, lookupErr);
+              }
+            };
+            // Wait for the lookup only briefly so the deposit check stays
+            // responsive; if it's slow it keeps running in the background and
+            // fills the hash in on the row when it finishes.
+            await Promise.race([resolveHashes(), new Promise((resolve) => setTimeout(resolve, 8000))]);
+          }
         } catch (err) {
           console.error(`[Deposit] Failed to credit ${creditedNow} for user ${user.id} on ${network} after moving checkpoint — needs manual review.`, err);
           throw err;
@@ -2263,7 +2460,7 @@ app.post('/api/deposit/check-rpc', async (req, res) => {
       userAddress,
       rpcNode: cryptoConfig.rpcUrl,
       rpcStatus,
-      blockNumber,
+      blockNumber: chainHead ?? 0,
       onChainBalance,
       alreadyCredited,
       creditedNow,
@@ -2496,7 +2693,7 @@ app.post('/api/admin/users/update', requireRole('admin'), async (req, res) => {
       tokenSymbol: 'USD',
       amount: balanceAdjust,
       walletAddress: 'admin-manual-adjustment',
-      txHash: generateTxHash('admin_'),
+      txHash: '',
       blockNumber: 0,
       timestamp: new Date().toISOString(),
       status: 'confirmed',

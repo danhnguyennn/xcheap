@@ -422,11 +422,29 @@ export const DepositModal: React.FC<DepositModalProps> = ({
                     <div className="min-w-0">
                       <span className="font-bold text-emerald-600 dark:text-emerald-400 font-mono">+${formatMoney(tx.amount)}</span>
                       <span className="text-slate-600 dark:text-slate-400 ml-1.5 uppercase font-semibold">({tx.network})</span>
-                      {tx.txHash && (
-                        <div className="text-[10px] text-slate-600 dark:text-slate-400 font-mono break-all">
-                          {tx.txHash}
+                      {tx.network === ('admin' as string) && (
+                        <div className="text-[10px] text-slate-600 dark:text-slate-400">
+                          {language === 'vn' ? 'Admin điều chỉnh số dư' : 'Admin balance adjustment'}
                         </div>
                       )}
+                      {tx.txHash && (() => {
+                        // Real on-chain hash — opens that transaction on the network's
+                        // block explorer so the user can verify it themselves.
+                        const explorerBase = cryptoOptions.find((c) => c.id === tx.network)?.explorerTxUrl;
+                        return explorerBase ? (
+                          <a
+                            href={`${explorerBase}${tx.txHash}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            title={tx.txHash}
+                            className="block text-[10px] text-emerald-700 dark:text-emerald-300 hover:underline font-mono break-all"
+                          >
+                            {tx.txHash}
+                          </a>
+                        ) : (
+                          <div className="text-[10px] text-slate-600 dark:text-slate-400 font-mono break-all">{tx.txHash}</div>
+                        );
+                      })()}
                     </div>
                     <div className="text-right flex-shrink-0">
                       <span className="px-1.5 py-0.5 rounded text-[9px] font-bold uppercase bg-emerald-50 dark:bg-emerald-950/70 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30">
