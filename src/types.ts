@@ -241,11 +241,6 @@ export interface DepositTransaction {
   timestamp: string;
   status: 'confirmed' | 'pending';
   detectedVia: string;
-  // Set once the stored txHash/blockNumber of an older row has been checked
-  // against the chain (see recoverDepositTxHashes) so it isn't re-checked.
-  txHashChecked?: boolean;
-  // How many start-ups tried and failed to resolve it (gives up after a few).
-  txHashAttempts?: number;
 }
 
 export interface Review {

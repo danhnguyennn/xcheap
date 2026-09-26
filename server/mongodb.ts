@@ -1,5 +1,3 @@
-import fs from 'fs';
-import path from 'path';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import { MongoClient, Db, Collection, Filter, Document } from 'mongodb';
@@ -95,11 +93,15 @@ export class MongoCollection<T extends MongoDoc> {
   // MongoDB: find()
   public async find(
     query: Record<string, any> = {},
-    options?: { sort?: Record<string, 1 | -1>; limit?: number; skip?: number }
+    options?: { sort?: Record<string, 1 | -1>; limit?: number; skip?: number; projection?: Record<string, 0 | 1> }
   ): Promise<T[]> {
     if (this.col) {
       try {
         let cursor = this.col.find(query as Filter<Document>);
+        // Lets callers leave out heavy fields they don't need (e.g. an order's
+        // delivered "accounts" array) so a dashboard scan doesn't pull every
+        // sold credential out of the database.
+        if (options?.projection) cursor = cursor.project(options.projection);
         if (options?.sort) cursor = cursor.sort(options.sort);
         if (options?.skip) cursor = cursor.skip(options.skip);
         if (options?.limit) cursor = cursor.limit(options.limit);
@@ -119,7 +121,39 @@ export class MongoCollection<T extends MongoDoc> {
     if (options?.limit) {
       results = results.slice(0, options.limit);
     }
-    return JSON.parse(JSON.stringify(results));
+    const cloned = JSON.parse(JSON.stringify(results));
+    if (options?.projection) {
+      const entries = Object.entries(options.projection);
+      const exclude = entries.every(([, v]) => v === 0);
+      for (const doc of cloned) {
+        for (const key of Object.keys(doc)) {
+          if (key === '_id' || key === 'id') continue;
+          const listed = entries.some(([k, v]) => k === key && v === (exclude ? 0 : 1));
+          if (exclude ? listed : !listed) delete doc[key];
+        }
+      }
+    }
+    return cloned;
+  }
+
+  // One (or a few) random documents matching the filter, picked inside the
+  // database. Used where the old approach was to load EVERY matching row into
+  // memory only to pick one of them.
+  public async sample(query: Record<string, any>, size = 1): Promise<T[]> {
+    if (this.col) {
+      try {
+        const rows = await this.col.aggregate([{ $match: query as Filter<Document> }, { $sample: { size } }]).toArray();
+        return rows as unknown as T[];
+      } catch (err) {
+        console.warn(`[MongoDB] sample on collection ${this.name} failed, falling back to in-memory:`, err);
+      }
+    }
+    const pool = this.memoryDocs.filter((doc) => matchesFilter(doc, query));
+    const picked: T[] = [];
+    while (picked.length < size && pool.length > 0) {
+      picked.push(pool.splice(Math.floor(Math.random() * pool.length), 1)[0]);
+    }
+    return JSON.parse(JSON.stringify(picked));
   }
 
   // MongoDB: findOne()
@@ -343,7 +377,6 @@ export class MongoDBEngine {
   private client: MongoClient | null = null;
   private database: Db | null = null;
   private collections: Map<string, MongoCollection<any>> = new Map();
-  private legacyJsonDir: string;
   public isConnected: boolean = false;
   // server.ts calls init() from two independent startup paths (seeding in
   // initializeDatabase(), then again before app.listen() in start()) — both
@@ -353,10 +386,9 @@ export class MongoDBEngine {
   // the first just await the same connection instead of reconnecting.
   private initPromise: Promise<void> | null = null;
 
-  constructor(uri: string, dbName: string, legacyJsonDir: string) {
+  constructor(uri: string, dbName: string) {
     this.uri = uri;
     this.dbName = dbName;
-    this.legacyJsonDir = legacyJsonDir;
   }
 
   public collection<T extends MongoDoc>(name: string): MongoCollection<T> {
@@ -389,8 +421,7 @@ export class MongoDBEngine {
           col.setRealCollection(this.database.collection(name));
         }
 
-        await this.migrateLegacyJsonIfPresent();
-        await this.ensureInventoryIndexesAndKeys();
+        await this.ensureIndexes();
       } catch (err) {
         console.warn(`[MongoDB] Connection to ${this.uri} failed or timed out. Operating in high-performance in-memory database mode.`);
         this.isConnected = false;
@@ -403,55 +434,42 @@ export class MongoDBEngine {
     await this.seedDefaultStoreDataIfEmpty();
   }
 
-  // Indexes for the hot inventory lookups (bulk-import duplicate check,
-  // per-variant stock counts), plus a one-time backfill of usernameKey on rows
-  // that were imported before that field existed — so the duplicate check
-  // still sees every account already in the warehouse, old rows included.
-  private async ensureInventoryIndexesAndKeys(): Promise<void> {
+  // Indexes for the hot lookups (bulk-import duplicate check, per-variant stock
+  // counts, id/username/apiKey/orderCode lookups). createIndex is a no-op when
+  // the index already exists, so this is cheap on every start.
+  private async ensureIndexes(): Promise<void> {
     if (!this.database) return;
     try {
       const inv = this.database.collection('inventory');
       await inv.createIndex({ usernameKey: 1 });
       await inv.createIndex({ variantId: 1, isSold: 1 });
 
-      const missing = await inv.find({ usernameKey: { $exists: false } }, { projection: { _id: 1, accountData: 1 } }).toArray();
-      if (missing.length > 0) {
-        const BATCH = 1000;
-        for (let i = 0; i < missing.length; i += BATCH) {
-          await inv.bulkWrite(
-            missing.slice(i, i + BATCH).map((row: any) => ({
-              updateOne: { filter: { _id: row._id }, update: { $set: { usernameKey: inventoryUsernameKey(row.accountData) } } },
-            })),
-            { ordered: false }
-          );
+      // Every collection is looked up by a business key (id, username, apiKey,
+      // orderCode...), not by Mongo's own _id — with no index each of those is a
+      // full scan. Checkout claims N inventory rows by id in one bulk write, so
+      // without inventory.id that was N scans of the whole collection (buying
+      // 5,000 accounts out of 50,000 took ~5s; quadratic in the quantity).
+      // Non-unique on purpose: an old duplicate must never block startup.
+      const wanted: Record<string, Record<string, 1 | -1>[]> = {
+        inventory: [{ id: 1 }, { productId: 1, isSold: 1 }, { uploadedByUserId: 1, isSold: 1 }],
+        users: [{ id: 1 }, { username: 1 }, { email: 1 }, { apiKey: 1 }],
+        orders: [{ id: 1 }, { orderCode: 1 }, { userId: 1, createdAt: -1 }, { productId: 1 }],
+        products: [{ id: 1 }],
+        deposits: [{ userId: 1, network: 1 }],
+        withdrawals: [{ userId: 1 }, { id: 1 }],
+        preorders: [{ id: 1 }, { userId: 1 }, { variantId: 1, status: 1 }],
+        reviews: [{ productId: 1 }, { userId: 1, productId: 1 }],
+        vouchers: [{ code: 1 }],
+      };
+      for (const [collectionName, specs] of Object.entries(wanted)) {
+        for (const spec of specs) {
+          await this.database.collection(collectionName).createIndex(spec).catch((e: any) => {
+            console.warn(`[MongoDB] Could not create index ${JSON.stringify(spec)} on ${collectionName}:`, e?.message);
+          });
         }
-        console.log(`[MongoDB] Backfilled usernameKey on ${missing.length} inventory row(s).`);
       }
     } catch (err) {
-      console.warn('[MongoDB] Could not ensure inventory indexes/keys:', err);
-    }
-  }
-
-  private async migrateLegacyJsonIfPresent(): Promise<void> {
-    if (!this.database || !fs.existsSync(this.legacyJsonDir)) return;
-
-    for (const name of STANDARD_COLLECTIONS) {
-      const filePath = path.join(this.legacyJsonDir, `${name}.json`);
-      if (!fs.existsSync(filePath)) continue;
-
-      const existingCount = await this.database.collection(name).countDocuments();
-      if (existingCount > 0) continue;
-
-      try {
-        const raw = fs.readFileSync(filePath, 'utf-8');
-        const docs = JSON.parse(raw);
-        if (Array.isArray(docs) && docs.length > 0) {
-          await this.database.collection(name).insertMany(docs);
-          console.log(`[MongoDB] Migrated ${docs.length} legacy document(s) into "${name}" from data/mongodb/${name}.json`);
-        }
-      } catch (err) {
-        console.error(`[MongoDB] Failed to migrate legacy collection "${name}":`, err);
-      }
+      console.warn('[MongoDB] Could not ensure indexes:', err);
     }
   }
 
@@ -754,6 +772,5 @@ export class MongoDBEngine {
 
 const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
 const MONGODB_DB_NAME = process.env.MONGODB_DB_NAME || 'xscr_store_db';
-const LEGACY_JSON_DIR = path.join(process.cwd(), 'data', 'mongodb');
 
-export const db = new MongoDBEngine(MONGODB_URI, MONGODB_DB_NAME, LEGACY_JSON_DIR);
+export const db = new MongoDBEngine(MONGODB_URI, MONGODB_DB_NAME);

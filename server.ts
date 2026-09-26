@@ -12,7 +12,7 @@ import { ethers } from 'ethers';
 import helmet from 'helmet';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { twitterChecker } from './server/twitterChecker';
-import { getChainHead, scanIncomingTransfers, transactionExists, blockAtOrBefore, IncomingTransfer, QUICK_RETRY_DELAYS_MS } from './server/chainTransfers';
+import { getChainHead, scanIncomingTransfers, IncomingTransfer, QUICK_RETRY_DELAYS_MS } from './server/chainTransfers';
 
 const app = express();
 const PORT = 3434;
@@ -199,10 +199,6 @@ function takeSampleView(key: string): { allowed: boolean; remaining: number; ret
   return { allowed: true, remaining: 0, retryAfterMs: 0 };
 }
 
-// Local dev-only default password backfilled onto any pre-existing account
-// that predates login support, so it doesn't become permanently locked out.
-const DEFAULT_DEMO_PASSWORD = 'Xcheap@2026';
-
 // Starting pool of review-suggestion phrases, translated up front into every
 // language the site supports — admin can add/edit/delete afterward (see
 // /api/admin/review-comment-suggestions), each with its own 4 translations.
@@ -289,22 +285,6 @@ async function initializeDatabase() {
     for (const text of DEFAULT_REVIEW_SUGGESTIONS) {
       await suggestionCol.insertOne({ id: 'sug_' + generateObjectId(), text, createdAt: new Date().toISOString() });
     }
-  } else {
-    // One-time backfill: suggestions created before per-language text existed
-    // are stored as a plain string. Known defaults get their real
-    // translation; anything an admin wrote by hand (no way to know the
-    // translation automatically) falls back to showing that same string in
-    // every language until it's next edited through the admin UI.
-    const legacyStringSuggestions = existingSuggestions.filter((s) => typeof s.text === 'string');
-    if (legacyStringSuggestions.length > 0) {
-      for (const s of legacyStringSuggestions) {
-        const legacyText = s.text as unknown as string;
-        const knownTranslation = DEFAULT_REVIEW_SUGGESTIONS.find((d) => d.vn === legacyText);
-        const text = knownTranslation || { vn: legacyText, en: legacyText, zh: legacyText, th: legacyText };
-        await suggestionCol.updateOne({ id: s.id }, { $set: { text } });
-      }
-      console.log(`[MongoDB] Backfilled per-language text for ${legacyStringSuggestions.length} review suggestion(s).`);
-    }
   }
 
   // Seed the deposit network list from the original hardcoded config once —
@@ -320,46 +300,6 @@ async function initializeDatabase() {
     for (const opt of cryptoOptions) {
       await cryptoOptCol.insertOne({ ...opt, id: opt.id as any });
     }
-  }
-
-  // One-time backfill: any account created before login/password support
-  // existed gets a default password instead of becoming unloginable.
-  const userCol = db.collection<User>('users');
-  const existingUsers = await userCol.find();
-  const usersMissingPassword = existingUsers.filter((u) => !u.passwordHash);
-  if (usersMissingPassword.length > 0) {
-    const defaultHash = await hashPassword(DEFAULT_DEMO_PASSWORD);
-    for (const u of usersMissingPassword) {
-      await userCol.updateOne({ id: u.id }, { $set: { passwordHash: defaultHash } });
-    }
-    // Never log the actual password value — even a one-time startup log is
-    // still a real leak if server logs are shipped anywhere (log
-    // aggregator, CI output, a support ticket screenshot...).
-    console.log(`[Auth] Backfilled default password for ${usersMissingPassword.length} legacy account(s).`);
-  }
-
-  // One-time backfill: any account created before the API key feature
-  // existed gets one generated now, so every account can use the API.
-  const usersMissingApiKey = existingUsers.filter((u) => !u.apiKey);
-  if (usersMissingApiKey.length > 0) {
-    for (const u of usersMissingApiKey) {
-      await userCol.updateOne({ id: u.id }, { $set: { apiKey: generateApiKey() } });
-    }
-    console.log(`[Auth] Backfilled API key for ${usersMissingApiKey.length} account(s).`);
-  }
-
-  // One-time backfill: CTV/admin accounts created before the automatic
-  // purchase discount was removed still carry their old discountPercent
-  // (e.g. 12/20) in the database. computeUnitPriceForUser() already ignores
-  // this field for these roles, so it never affected what they're actually
-  // charged — but it's zeroed out here too so nothing that reads the raw
-  // field (now or in the future) can show a stale discount for them again.
-  const staleDiscountAccounts = existingUsers.filter((u) => u.role !== 'user' && u.discountPercent);
-  if (staleDiscountAccounts.length > 0) {
-    for (const u of staleDiscountAccounts) {
-      await userCol.updateOne({ id: u.id }, { $set: { discountPercent: 0 } });
-    }
-    console.log(`[Auth] Cleared stale discountPercent on ${staleDiscountAccounts.length} CTV/admin account(s).`);
   }
 }
 
@@ -380,195 +320,6 @@ async function cleanupOldSoldInventory(): Promise<void> {
   if (result.deletedCount > 0) {
     console.log(`[Cleanup] Removed ${result.deletedCount} sold inventory row(s) older than 3 months.`);
   }
-}
-
-// One-time-safe migration for data created BEFORE income moved from "which
-// products a CTV owns" to "which rows a CTV actually uploaded" (see
-// Order.uploaderBreakdown / ctvShareOfOrder). The old rule credited a seller
-// with every order on a product they created (createdByUserId). Orders and
-// stock that already exist have no uploader recorded, so without this every
-// seller's historical income would read $0 the moment the new code starts —
-// and they'd be unable to withdraw earnings from past sales. This re-applies
-// the OLD ownership rule to legacy data only, so the numbers come out the
-// same as before the change:
-//   1. an order with no uploaderBreakdown at all is credited, in full, to the
-//      owner of its product;
-//   2. unsold stock with no uploader is stamped with its product's owner (so
-//      future sales of that stock credit them too);
-//   3. a CTV who created a product is granted authorization on it (they used
-//      to be able to restock their own products; now that takes an explicit
-//      grant).
-// Idempotent: it only touches records still missing the data, so running it on
-// every startup is harmless once everything is migrated.
-async function migrateLegacyOwnershipToUploaders(): Promise<void> {
-  const userCol = db.collection<User>('users');
-  const prodCol = db.collection<Product>('products');
-  const orderCol = db.collection<Order>('orders');
-  const invCol = db.collection<any>('inventory');
-
-  const sellers = await userCol.find({ role: { $in: ['ctv', 'admin'] } });
-  const products = await prodCol.find();
-  if (sellers.length === 0 || products.length === 0) return;
-
-  const ownerOf = (product: Product): User | undefined => {
-    if (product.createdByUserId) return sellers.find((u) => u.id === product.createdByUserId);
-    // Products older than createdByUserId: exact display-name match only,
-    // same conservative rule the old ownership check used.
-    const sellerName = product.seller?.name?.toLowerCase() || '';
-    if (!sellerName) return undefined;
-    return sellers.find((u) => sellerName === u.username.toLowerCase() || sellerName === `ctv ${u.username.toLowerCase()}`);
-  };
-  const ownerByProductId = new Map<string, User>();
-  for (const p of products) {
-    const owner = ownerOf(p);
-    if (owner) ownerByProductId.set(p.id, owner);
-  }
-
-  const orders = await orderCol.find();
-  const orderOps = orders
-    .filter((o) => o.uploaderBreakdown === undefined && ownerByProductId.has(o.productId))
-    .map((o) => {
-      const owner = ownerByProductId.get(o.productId)!;
-      return { filter: { id: o.id }, update: { $set: { uploaderBreakdown: [{ userId: owner.id, username: owner.username, quantity: o.quantity }] } } };
-    });
-  if (orderOps.length > 0) await orderCol.bulkWrite(orderOps);
-
-  const unsold = await invCol.find({ isSold: false });
-  const invOps = unsold
-    .filter((row: any) => !row.uploadedByUserId && ownerByProductId.has(row.productId))
-    .map((row: any) => {
-      const owner = ownerByProductId.get(row.productId)!;
-      return { filter: { id: row.id }, update: { $set: { uploadedByUserId: owner.id, uploadedByUsername: owner.username } } };
-    });
-  if (invOps.length > 0) await invCol.bulkWrite(invOps);
-
-  const authOps = products
-    .filter((p) => {
-      const owner = ownerByProductId.get(p.id);
-      return owner?.role === 'ctv' && !(p.authorizedCtvIds || []).includes(owner.id);
-    })
-    .map((p) => ({ filter: { id: p.id }, update: { $set: { authorizedCtvIds: [...(p.authorizedCtvIds || []), ownerByProductId.get(p.id)!.id] } } }));
-  if (authOps.length > 0) await prodCol.bulkWrite(authOps);
-
-  if (orderOps.length + invOps.length + authOps.length > 0) {
-    console.log(`[Migration] Legacy ownership -> uploader attribution: ${orderOps.length} order(s), ${invOps.length} unsold stock row(s), ${authOps.length} CTV authorization(s).`);
-  }
-
-  // Not migrated, just surfaced: anything that can't be bought under the new
-  // price validation would otherwise fail silently at checkout.
-  const badPriced = products.flatMap((p) => (p.variants || []).filter((v) => !isValidPrice(Number(v.price))).map((v) => `${p.name} / ${v.name}`));
-  if (badPriced.length > 0) {
-    console.warn(`[Data check] ${badPriced.length} variant(s) have a non-positive/invalid price and cannot be purchased until fixed: ${badPriced.join('; ')}`);
-  }
-}
-
-// Older deposit rows carry a tx hash (and block number) that the previous
-// code simply generated at random — they don't exist on any chain. This
-// background pass fixes them up, once per row, best effort:
-//  - a stored hash is looked up on its chain; if it really exists it's kept;
-//  - a hash that provably doesn't exist is removed (never shown as real);
-//  - the real transaction is then searched for in the token's Transfer events
-//    into that row's wallet, around the time the row was recorded, matching the
-//    credited amount (each real hash used at most once);
-//  - rows from the removed "simulated deposit" tool never touched a chain, so
-//    they just lose their invented hash.
-// If an RPC can't answer, the row is left as-is and retried on the next start.
-async function recoverDepositTxHashes(): Promise<void> {
-  const depCol = db.collection<DepositTransaction>('deposits');
-  const cryptoCol = db.collection<CryptoOption>('crypto_options');
-  const evm = ['bsc', 'polygon', 'base'];
-
-  const all = await depCol.find();
-
-  // Admin balance adjustments were stored with a random "admin_..." string in
-  // the hash field. They never touch a chain — blank it.
-  const adminFakes = all.filter((d) => d.network === ('admin' as any) && d.txHash);
-  if (adminFakes.length > 0) {
-    await depCol.bulkWrite(adminFakes.map((d) => ({ filter: { id: d.id }, update: { $set: { txHash: '', blockNumber: 0 } } })));
-    console.log(`[Deposits] Removed the invented hash from ${adminFakes.length} admin balance-adjustment row(s).`);
-  }
-
-  const pending = all
-    .filter((d) => evm.includes(d.network) && d.txHashChecked !== true)
-    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-  if (pending.length === 0) return;
-
-  const claimed = new Set(all.filter((d) => d.txHash && d.txHashChecked === true).map((d) => d.txHash.toLowerCase()));
-  let recovered = 0;
-  let cleared = 0;
-  let unresolved = 0;
-  // A row the chain couldn't answer for (RPC down / range unreadable) is retried
-  // on the next start, but only a few times — after that it's closed out with
-  // whatever is known (no hash) instead of re-scanning on every restart forever.
-  const MAX_ATTEMPTS = 3;
-  const noteUnresolved = async (row: DepositTransaction, extra: Partial<DepositTransaction> = {}) => {
-    const attempts = (row.txHashAttempts || 0) + 1;
-    await depCol.updateOne({ id: row.id }, { $set: { ...extra, txHashAttempts: attempts, ...(attempts >= MAX_ATTEMPTS ? { txHashChecked: true } : {}) } });
-    unresolved++;
-  };
-
-  for (const row of pending) {
-    try {
-      if (String(row.id).startsWith('tx_sim_')) {
-        await depCol.updateOne({ id: row.id }, { $set: { txHash: '', blockNumber: 0, txHashChecked: true } });
-        cleared++;
-        continue;
-      }
-      const cfg = await cryptoCol.findOne({ id: row.network });
-      if (!cfg) continue;
-
-      let hashIsFake = false;
-      if (row.txHash) {
-        const exists = await transactionExists(cfg, row.txHash);
-        if (exists === 'yes') {
-          await depCol.updateOne({ id: row.id }, { $set: { txHashChecked: true } });
-          claimed.add(row.txHash.toLowerCase());
-          continue;
-        }
-        if (exists === 'unknown') {
-          await noteUnresolved(row);
-          continue;
-        }
-        hashIsFake = true;
-      }
-
-      const endBlock = await blockAtOrBefore(cfg, Math.floor(new Date(row.timestamp).getTime() / 1000) + 120);
-      let hit: IncomingTransfer | undefined;
-      let scanComplete = false;
-      if (endBlock !== null && row.walletAddress) {
-        const isMatch = (t: IncomingTransfer) => Math.abs(t.amount - row.amount) <= 0.0015 && !claimed.has(t.txHash.toLowerCase());
-        const scan = await scanIncomingTransfers(cfg, row.walletAddress, {
-          fromBlock: Math.max(1, endBlock - 60000),
-          toBlock: endBlock,
-          maxChunks: 30,
-          deadlineMs: 30000,
-          stopWhen: (found) => found.some(isMatch),
-        });
-        hit = scan.transfers.find(isMatch);
-        scanComplete = scan.complete;
-      }
-
-      if (hit) {
-        await depCol.updateOne({ id: row.id }, { $set: { txHash: hit.txHash, blockNumber: hit.blockNumber, txHashChecked: true } });
-        claimed.add(hit.txHash.toLowerCase());
-        recovered++;
-      } else if (hashIsFake) {
-        // Provably not a real tx: stop showing it. Only mark the row done when
-        // the search was conclusive, so an RPC hiccup gets retried next start.
-        cleared++;
-        if (scanComplete) await depCol.updateOne({ id: row.id }, { $set: { txHash: '', blockNumber: 0, txHashChecked: true } });
-        else await noteUnresolved(row, { txHash: '', blockNumber: 0 });
-      } else if (scanComplete) {
-        await depCol.updateOne({ id: row.id }, { $set: { txHashChecked: true } });
-      } else {
-        await noteUnresolved(row);
-      }
-    } catch (err) {
-      unresolved++;
-      console.warn(`[Deposits] Could not verify tx hash of deposit ${row.id}:`, err);
-    }
-  }
-  console.log(`[Deposits] Tx hash check: ${recovered} real hash(es) recovered, ${cleared} invented hash(es) removed, ${unresolved} left for the next start.`);
 }
 
 // Earlier versions seeded accounts with a fixed, source-visible password.
@@ -593,8 +344,6 @@ async function warnAboutLegacyDefaultPasswords(): Promise<void> {
 
 initializeDatabase()
   .then(() => {
-    migrateLegacyOwnershipToUploaders().catch((e) => console.error('[Migration error]', e));
-    recoverDepositTxHashes().catch((e) => console.error('[Deposits] Tx hash check error:', e));
     warnAboutLegacyDefaultPasswords().catch((e) => console.error('[Security check error]', e));
     cleanupOldSoldInventory().catch((e) => console.error('[Cleanup Error]', e));
     const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // re-check once a day
@@ -625,7 +374,7 @@ app.get('/api/user/me', async (req, res) => {
   if (!user) return res.status(401).json({ error: 'Chưa đăng nhập' });
 
   const orderCol = db.collection<Order>('orders');
-  const userOrders = await orderCol.find({ userId: user.id });
+  const userOrders = await orderCol.find({ userId: user.id }, ORDERS_WITHOUT_ACCOUNTS);
   // A refunded order's money came back — it was never actually kept as
   // spending, so it shouldn't count toward "total spent" either.
   const totalSpent = Number(
@@ -946,6 +695,12 @@ function ratingFromReviews(productId: string, allReviews: Review[]): { rating: n
   const rating = reviewCount > 0 ? Number((productReviews.reduce((sum, r) => sum + r.rating, 0) / reviewCount).toFixed(1)) : 0;
   return { rating, reviewCount };
 }
+
+// Orders carry the full list of delivered credentials in `accounts` - by far
+// the heaviest field, and none of the dashboards/stat scans below use it. Every
+// scan over ALL orders excludes it, so cost grows with the number of orders, not
+// with the number of accounts ever sold.
+const ORDERS_WITHOUT_ACCOUNTS = { projection: { accounts: 0 as const } };
 
 // Price sanity for everything an admin types in. A negative price made
 // checkout CREDIT the buyer's wallet instead of charging it, and NaN/Infinity
@@ -1270,7 +1025,7 @@ app.get('/api/products/:id/review-eligibility', async (req, res) => {
 
   const orderCol = db.collection<Order>('orders');
   const reviewCol = db.collection<Review>('reviews');
-  const purchases = await orderCol.find({ userId: user.id, productId: req.params.id, status: 'completed' });
+  const purchases = await orderCol.find({ userId: user.id, productId: req.params.id, status: 'completed' }, ORDERS_WITHOUT_ACCOUNTS);
   const existingReview = await reviewCol.findOne({ userId: user.id, productId: req.params.id });
 
   res.json({
@@ -1307,7 +1062,7 @@ app.post('/api/products/:id/reviews', async (req, res) => {
   if (!product) return res.status(404).json({ error: 'Không tìm thấy sản phẩm' });
 
   const orderCol = db.collection<Order>('orders');
-  const purchases = await orderCol.find({ userId: user.id, productId: req.params.id, status: 'completed' });
+  const purchases = await orderCol.find({ userId: user.id, productId: req.params.id, status: 'completed' }, ORDERS_WITHOUT_ACCOUNTS);
   if (purchases.length === 0) {
     return res.status(403).json({ error: 'Bạn cần mua sản phẩm này trước khi có thể đánh giá' });
   }
@@ -1378,7 +1133,7 @@ app.get('/api/user/review-suggestions', async (req, res) => {
   const orderCol = db.collection<Order>('orders');
   const reviewCol = db.collection<Review>('reviews');
 
-  const myOrders = await orderCol.find({ userId: user.id, status: 'completed' });
+  const myOrders = await orderCol.find({ userId: user.id, status: 'completed' }, ORDERS_WITHOUT_ACCOUNTS);
   const reviewedProductIds = new Set((await reviewCol.find({ userId: user.id })).map((r) => r.productId));
 
   const seen = new Set<string>();
@@ -1467,9 +1222,8 @@ app.get('/api/admin/reviews', requireRole('admin', 'ctv'), async (req, res) => {
     // (permanent) so a product stays in scope even after its old sold
     // inventory rows get cleaned up (see cleanupOldSoldInventory).
     const myProductIds = new Set<string>(allProducts.filter((p) => p.authorizedCtvIds?.includes(user.id)).map((p) => p.id));
-    const myUnsoldRows = await invCol.find({ uploadedByUserId: user.id, isSold: false });
-    for (const row of myUnsoldRows) myProductIds.add(row.productId);
-    const allOrders = await orderCol.find();
+    for (const row of await invCol.groupBy('productId', { uploadedByUserId: user.id, isSold: false })) myProductIds.add(row.key);
+    const allOrders = await orderCol.find({}, ORDERS_WITHOUT_ACCOUNTS);
     for (const o of allOrders) {
       if (o.uploaderBreakdown?.some((e) => e.userId === user.id)) myProductIds.add(o.productId);
     }
@@ -1506,13 +1260,18 @@ app.get('/api/products/:id/sample', async (req, res) => {
   }
 
   const invCol = db.collection<any>('inventory');
-  const availableStock = await invCol.find({ productId: product.id, isSold: false });
-
-  if (availableStock.length === 0) {
+  // Count and one random row, both inside the database - this is a public
+  // endpoint, so it must not load the product's whole stock just to pick one.
+  const availableCount = await invCol.countDocuments({ productId: product.id, isSold: false });
+  if (availableCount === 0) {
+    return res.status(404).json({ error: 'Hiện không có tài khoản nào trong kho để xem mẫu', totalStockAvailable: 0 });
+  }
+  const [sampleRow] = await invCol.sample({ productId: product.id, isSold: false }, 1);
+  if (!sampleRow) {
     return res.status(404).json({ error: 'Hiện không có tài khoản nào trong kho để xem mẫu', totalStockAvailable: 0 });
   }
 
-  const rawSample = availableStock[Math.floor(Math.random() * availableStock.length)].accountData;
+  const rawSample = sampleRow.accountData;
   const catKey = (product.categorySlug || product.image || '').toLowerCase();
 
   const parts = rawSample.split('|');
@@ -1581,7 +1340,7 @@ app.get('/api/products/:id/sample', async (req, res) => {
     platform,
     status: 'Live & Sẵn sàng',
     remainingViews: remaining,
-    totalStockAvailable: availableStock.length,
+    totalStockAvailable: availableCount,
   });
 });
 
@@ -2125,7 +1884,7 @@ app.get('/api/orders/:orderCode', async (req, res) => {
 // accidental all-orders view.
 app.get('/api/admin/orders', requireRole('admin'), async (req, res) => {
   const orderCol = db.collection<Order>('orders');
-  const orders = await orderCol.find();
+  const orders = await orderCol.find({}, ORDERS_WITHOUT_ACCOUNTS);
   orders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   res.json({ orders });
 });
@@ -2140,7 +1899,7 @@ app.get('/api/ctv/orders', requireRole('admin', 'ctv'), async (req, res) => {
   const orderCol = db.collection<Order>('orders');
 
   const ctvUser = (await getSessionUser(req))!;
-  const allOrders = await orderCol.find();
+  const allOrders = await orderCol.find({}, ORDERS_WITHOUT_ACCOUNTS);
   // An order shows up here if this CTV uploaded any part of what it
   // contains — admin can grant several CTVs the same product, so "products
   // I'm authorized on" no longer decides this on its own.
@@ -3133,7 +2892,7 @@ app.get('/api/admin/stats', requireRole('admin'), async (req, res) => {
   const configCol = db.collection<any>('config');
 
   const usersCount = await userCol.countDocuments();
-  const allOrders = await orderCol.find();
+  const allOrders = await orderCol.find({}, ORDERS_WITHOUT_ACCOUNTS);
   // Refunded orders never count toward revenue — the money was given back,
   // so it was never actually kept as revenue in the first place.
   const totalRevenue = allOrders.filter((o) => o.status !== 'refunded').reduce((sum, o) => sum + o.totalPrice, 0);
@@ -3183,7 +2942,7 @@ app.get('/api/admin/online-count', requireRole('admin'), (req, res) => {
 // dashboard.
 app.get('/api/admin/stats/charts', requireRole('admin'), async (req, res) => {
   const orderCol = db.collection<Order>('orders');
-  const allOrders = await orderCol.find();
+  const allOrders = await orderCol.find({}, ORDERS_WITHOUT_ACCOUNTS);
   // Same reasoning as totalRevenue above — a refunded order was never
   // actually kept as revenue, so it shouldn't show up in the revenue chart
   // or count toward a product's "top seller" ranking either.
@@ -3240,7 +2999,7 @@ async function computeCtvFinancials(ctvUser: User) {
   const configCol = db.collection<any>('config');
   const dedCol = db.collection<CtvDeduction>('ctv_deductions');
 
-  const allOrders = await orderCol.find();
+  const allOrders = await orderCol.find({}, ORDERS_WITHOUT_ACCOUNTS);
   // Income is attributed per row this CTV personally uploaded (see
   // uploaderBreakdown) — admin can grant several CTVs the same product, so
   // "orders against my products" doesn't mean anything on its own anymore.
@@ -3299,8 +3058,10 @@ app.get('/api/ctv/stats', requireRole('admin', 'ctv'), async (req, res) => {
   // unsold rows this CTV uploaded (never pruned), and totalUploaded is
   // derived from both so it stays a stable lifetime total instead of
   // shrinking as old sold rows are cleaned up.
-  const myUnsoldRows = await invCol.find({ uploadedByUserId: ctvUser.id, isSold: false });
-  const totalInStock = myUnsoldRows.length;
+  // Counted in the database per product — never load the unsold rows themselves
+  // (each carries a full account line) just to count them.
+  const myUnsoldByProduct = await invCol.groupBy('productId', { uploadedByUserId: ctvUser.id, isSold: false });
+  const totalInStock = myUnsoldByProduct.reduce((sum, r) => sum + r.count, 0);
   const totalSold = myShares.reduce((sum, s) => sum + s.share.quantity, 0);
   const totalUploaded = totalInStock + totalSold;
 
@@ -3316,8 +3077,8 @@ app.get('/api/ctv/stats', requireRole('admin', 'ctv'), async (req, res) => {
     }
     return entry;
   };
-  for (const row of myUnsoldRows) {
-    getOrInit(row.productId, row.productId).totalInStock += 1;
+  for (const row of myUnsoldByProduct) {
+    getOrInit(row.key, row.key).totalInStock += row.count;
   }
   for (const s of myShares) {
     const entry = getOrInit(s.order.productId, s.order.productName);
@@ -3364,7 +3125,7 @@ app.get('/api/ctv/stats/charts', requireRole('admin', 'ctv'), async (req, res) =
   const orderCol = db.collection<Order>('orders');
 
   const ctvUser = (await getSessionUser(req))!;
-  const allOrders = await orderCol.find();
+  const allOrders = await orderCol.find({}, ORDERS_WITHOUT_ACCOUNTS);
   // Same reasoning as /api/ctv/stats — a refunded order was never actually
   // kept as revenue, so it's excluded from the revenue chart/ranking too.
   // buildChartSeries/buildTopProducts only read totalPrice off each entry,
@@ -3476,13 +3237,13 @@ app.get('/api/admin/ctv-breakdown', requireRole('admin'), async (req, res) => {
   const feePercent = cfg ? cfg.platformFeePercent : 5.0;
 
   const sellers = await userCol.find({ role: { $in: ['ctv', 'admin'] } });
-  const allOrders = await orderCol.find();
+  const allOrders = await orderCol.find({}, ORDERS_WITHOUT_ACCOUNTS);
   const allWithdrawals = await wdrCol.find();
   const allDeductions = await dedCol.find();
   const unsoldByUploader = new Map<string, number>();
-  for (const item of await invCol.find({ isSold: false })) {
-    if (!item.uploadedByUserId) continue;
-    unsoldByUploader.set(item.uploadedByUserId, (unsoldByUploader.get(item.uploadedByUserId) || 0) + 1);
+  for (const row of await invCol.groupBy('uploadedByUserId', { isSold: false })) {
+    if (!row.key) continue;
+    unsoldByUploader.set(row.key, row.count);
   }
 
   const breakdown = sellers
