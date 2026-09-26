@@ -410,7 +410,8 @@ export class MongoDBEngine {
   private async connect(): Promise<void> {
     if (process.env.MONGODB_URI) {
       try {
-        console.log(`[MongoDB] Attempting connection to ${this.uri}...`);
+        const safeUri = this.uri.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@');
+        console.log(`[MongoDB] Attempting connection to ${safeUri}...`);
         this.client = new MongoClient(this.uri, { serverSelectionTimeoutMS: 2000 });
         await this.client.connect();
         this.database = this.client.db(this.dbName);
