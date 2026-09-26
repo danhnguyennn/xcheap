@@ -47,7 +47,7 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
     .map((l) => l.trim())
     .filter(Boolean);
 
-  // Default fixed 10 threads without UI selector
+  // Fixed 10 threads concurrency
   const CONCURRENCY = 10;
 
   const handleStart = async () => {
