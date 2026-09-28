@@ -381,25 +381,37 @@ export const CtvPage: React.FC<CtvPageProps> = ({
         </div>
       </div>
 
-      {/* Notifications Toast */}
-      {notification && (
-        <div className="max-w-7xl mx-auto px-4 sm:px-8 mt-4">
+      {/* Thông báo dạng "toast" — cố định (fixed) ở góc dưới bên phải màn
+          hình, giống hệt kiểu bên AdminPage, thay vì banner chèn vào giữa
+          nội dung (đẩy cả trang xuống mỗi khi có thông báo). */}
+      <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2 w-[90vw] max-w-sm">
+        {notification && (
           <div
-            className={`p-3 rounded-xl border flex items-center gap-2 text-xs font-semibold shadow-lg ${
+            className={`px-4 py-2.5 rounded-xl border text-xs font-semibold shadow-2xl flex items-center justify-between gap-2 ${
               notification.type === 'success'
-                ? 'bg-emerald-50 dark:bg-emerald-950/70 border-emerald-500/50 text-emerald-700 dark:text-emerald-300'
-                : 'bg-red-50 dark:bg-red-950/70 border-red-500/50 text-red-700 dark:text-red-300'
+                ? 'bg-emerald-50 dark:bg-emerald-950/70 border-emerald-500 text-emerald-700 dark:text-emerald-300'
+                : 'bg-red-50 dark:bg-red-950/70 border-red-500 text-red-700 dark:text-red-300'
             }`}
           >
-            {notification.type === 'success' ? (
-              <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
-            ) : (
-              <AlertCircle className="w-4 h-4 text-red-600 dark:text-red-400 flex-shrink-0" />
-            )}
-            <span>{notification.message}</span>
+            <span className="flex items-center gap-2">
+              {notification.type === 'success' ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 dark:text-emerald-400 flex-shrink-0" />
+              ) : (
+                <AlertCircle className="w-4 h-4 text-red-600 dark:text-red-400 flex-shrink-0" />
+              )}
+              <span>{notification.message}</span>
+            </span>
+            <button
+              onClick={() => setNotification(null)}
+              className={`ml-3 hover:text-slate-900 hover:dark:text-slate-100 ${
+                notification.type === 'success' ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'
+              }`}
+            >
+              ✕
+            </button>
           </div>
-        </div>
-      )}
+        )}
+      </div>
 
       {/* Main Container */}
       <div className="max-w-7xl mx-auto px-4 sm:px-8 mt-6 space-y-6">

@@ -74,7 +74,15 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [editingCryptoOptId, setEditingCryptoOptId] = useState<string | null>(null);
   const [cryptoOptForm, setCryptoOptForm] = useState<Partial<CryptoOption>>({});
   const [showAddCryptoOptModal, setShowAddCryptoOptModal] = useState(false);
-  const [inventoryItems, setInventoryItems] = useState<any[]>([]);
+  // Per-product counts, computed in the database (see GET /api/admin/inventory
+  // with no productId) — never the raw account rows, so this stays accurate
+  // no matter how large the store's total inventory gets.
+  const [inventoryByProduct, setInventoryByProduct] = useState<{ productId: string; total: number; available: number; sold: number }[]>([]);
+  // Real account rows for one product, fetched on demand (?productId=) only
+  // when that product is expanded — scoped to that product alone, so its
+  // preview can never be crowded out by any other product's inventory.
+  const [productInventoryItems, setProductInventoryItems] = useState<Record<string, any[]>>({});
+  const [loadingInventoryProductIds, setLoadingInventoryProductIds] = useState<Set<string>>(new Set());
   // Which product groups in the inventory list are expanded — starts empty
   // (everything collapsed) so the tab doesn't render dozens of full account
   // tables at once; admin clicks a product's header bar to open just that
@@ -296,7 +304,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       }
       if (invRes.ok) {
         const invData = await invRes.json();
-        setInventoryItems(invData.items || []);
+        setInventoryByProduct(invData.byProduct || []);
       }
       if (feeRes.ok) {
         const feeData = await feeRes.json();
@@ -347,6 +355,41 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     } finally {
       setLoading(false);
     }
+  };
+
+  // Fetches one product's real account rows (?productId=) — scoped to that
+  // product alone, so it's never crowded out by any other product's
+  // inventory (see the comment on GET /api/admin/inventory).
+  const loadProductInventoryItems = async (productId: string) => {
+    setLoadingInventoryProductIds((prev) => new Set(prev).add(productId));
+    try {
+      const res = await fetch(`/api/admin/inventory?productId=${encodeURIComponent(productId)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setProductInventoryItems((prev) => ({ ...prev, [productId]: data.items || [] }));
+      }
+    } catch (e) {
+      // Silent — the row just stays collapsed/empty, admin can re-toggle to retry.
+    } finally {
+      setLoadingInventoryProductIds((prev) => {
+        const next = new Set(prev);
+        next.delete(productId);
+        return next;
+      });
+    }
+  };
+
+  const toggleInventoryProduct = (productId: string) => {
+    const isExpanding = !expandedInventoryProducts.has(productId);
+    setExpandedInventoryProducts((prev) => {
+      const next = new Set(prev);
+      if (next.has(productId)) next.delete(productId);
+      else next.add(productId);
+      return next;
+    });
+    // Always fetch fresh on open rather than trusting a stale cache — stock
+    // changes often (sales, imports), and this is a cheap, single-product query.
+    if (isExpanding) loadProductInventoryItems(productId);
   };
 
   // Deposit network (crypto_options) management — show/hide, edit its
@@ -654,6 +697,10 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         setRawAccountsInput('');
         onRefreshProducts();
         fetchAdminData();
+        // Counts refresh via fetchAdminData above; if this product's account
+        // list happens to be open right now, refresh it too so the newly
+        // imported rows actually show up without a manual re-toggle.
+        if (expandedInventoryProducts.has(importProductId)) loadProductInventoryItems(importProductId);
       } else {
         showNotification(null, data.error || 'Lỗi nhập kho');
       }
@@ -2621,7 +2668,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 <span className="text-xs text-slate-600 dark:text-slate-400">Bấm vào tên sản phẩm để mở/đóng</span>
               </div>
 
-              {inventoryItems.length === 0 ? (
+              {inventoryByProduct.length === 0 ? (
                 <div className="text-center text-xs text-slate-500 dark:text-slate-500 py-6">
                   Kho hàng đang trống. Nhập tài khoản ở form phía trên.
                 </div>
@@ -2629,29 +2676,24 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 <>
                 <div className="space-y-3">
                 {(() => {
-                  const byProduct = new Map<string, typeof inventoryItems>();
-                  inventoryItems.forEach((item) => {
-                    const list = byProduct.get(item.productId) || [];
-                    list.push(item);
-                    byProduct.set(item.productId, list);
-                  });
-                  const productEntries = Array.from(byProduct.entries());
-                  const inventoryTotalPages = Math.max(1, Math.ceil(productEntries.length / INVENTORY_PRODUCTS_PER_PAGE));
+                  const inventoryTotalPages = Math.max(1, Math.ceil(inventoryByProduct.length / INVENTORY_PRODUCTS_PER_PAGE));
                   // Clamped rather than reset via effect — if a bulk import
                   // or filter change shrinks the product count while the
                   // admin is sitting on a now out-of-range page, this just
                   // quietly shows the last valid page instead of a blank one.
                   const safeInventoryPage = Math.min(inventoryPage, inventoryTotalPages);
-                  const pagedEntries = productEntries.slice(
+                  const pagedEntries = inventoryByProduct.slice(
                     (safeInventoryPage - 1) * INVENTORY_PRODUCTS_PER_PAGE,
                     safeInventoryPage * INVENTORY_PRODUCTS_PER_PAGE
                   );
 
                   return (
                     <>
-                    {pagedEntries.map(([productId, items]) => {
+                    {pagedEntries.map(({ productId, total }) => {
                     const product = products.find((p) => p.id === productId);
                     const isExpanded = expandedInventoryProducts.has(productId);
+                    const isLoadingItems = loadingInventoryProductIds.has(productId);
+                    const items = productInventoryItems[productId] || [];
                     const byVariant = new Map<string, typeof items>();
                     items.forEach((item) => {
                       const list = byVariant.get(item.variantId) || [];
@@ -2663,23 +2705,22 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                       <div key={productId} className="border border-[#e1e5e4] dark:border-[#32353d] rounded-lg overflow-hidden">
                         <button
                           type="button"
-                          onClick={() =>
-                            setExpandedInventoryProducts((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(productId)) next.delete(productId);
-                              else next.add(productId);
-                              return next;
-                            })
-                          }
+                          onClick={() => toggleInventoryProduct(productId)}
                           className="w-full bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-[#dde1e0] hover:dark:bg-[#363941] px-3 py-2 text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center justify-between transition"
                         >
                           <span className="flex items-center gap-1.5">
                             <ChevronRight className={`w-3.5 h-3.5 text-slate-500 dark:text-slate-500 transition-transform ${isExpanded ? 'rotate-90' : ''}`} />
                             {product?.name || productId}
                           </span>
-                          <span className="text-slate-600 dark:text-slate-400 font-normal">{items.length} tài khoản</span>
+                          <span className="text-slate-600 dark:text-slate-400 font-normal">{total.toLocaleString()} tài khoản</span>
                         </button>
-                        {isExpanded && Array.from(byVariant.entries()).map(([variantId, variantItems]) => {
+                        {isExpanded && isLoadingItems && (
+                          <div className="px-3 py-3 text-[11px] text-slate-500 dark:text-slate-500 flex items-center gap-1.5">
+                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                            <span>Đang tải danh sách tài khoản...</span>
+                          </div>
+                        )}
+                        {isExpanded && !isLoadingItems && Array.from(byVariant.entries()).map(([variantId, variantItems]) => {
                           const variant = product?.variants.find((v) => v.id === variantId);
                           // Chưa bán trước, đã bán sau; trong mỗi nhóm thì mới
                           // nhập kho nhất lên đầu — so admin sees what's
@@ -2723,7 +2764,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                     {inventoryTotalPages > 1 && (
                       <div className="flex items-center justify-between text-xs pt-1">
                         <span className="text-slate-600 dark:text-slate-400">
-                          Trang {safeInventoryPage}/{inventoryTotalPages} ({productEntries.length} sản phẩm)
+                          Trang {safeInventoryPage}/{inventoryTotalPages} ({inventoryByProduct.length} sản phẩm)
                         </span>
                         <div className="flex items-center gap-2">
                           <button
@@ -2827,13 +2868,13 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                             <tr key={o.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34] transition">
                               <td className="p-3 font-mono font-bold text-slate-900 dark:text-slate-100">#{o.orderCode.toUpperCase()}</td>
                               <td className="p-3 text-slate-700 dark:text-slate-300">{o.username}</td>
-                              <td className="p-3 text-slate-700 dark:text-slate-300">
-                                <div>{o.productName}</div>
-                                <div className="text-[10px] text-slate-500 dark:text-slate-500">{o.variantName}</div>
+                              <td className="p-3 text-slate-700 dark:text-slate-300 max-w-[220px]">
+                                <div className="truncate" title={o.productName}>{o.productName}</div>
+                                <div className="text-[10px] text-slate-500 dark:text-slate-500 truncate" title={o.variantName}>{o.variantName}</div>
                               </td>
-                              <td className="p-3 text-slate-700 dark:text-slate-300">{o.quantity}</td>
-                              <td className="p-3 font-mono font-bold text-emerald-600 dark:text-emerald-400">${formatMoney(o.totalPrice)}</td>
-                              <td className="p-3">
+                              <td className="p-3 text-slate-700 dark:text-slate-300 whitespace-nowrap">{o.quantity}</td>
+                              <td className="p-3 font-mono font-bold text-emerald-600 dark:text-emerald-400 whitespace-nowrap">${formatMoney(o.totalPrice)}</td>
+                              <td className="p-3 whitespace-nowrap">
                                 {o.status === 'refunded' ? (
                                   <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/30">
                                     Đã hoàn tiền
@@ -2844,7 +2885,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                                   </span>
                                 )}
                               </td>
-                              <td className="p-3 font-mono text-[10px] text-slate-600 dark:text-slate-400">
+                              <td className="p-3 font-mono text-[10px] text-slate-600 dark:text-slate-400 whitespace-nowrap">
                                 {new Date(o.createdAt).toLocaleString('vi-VN')}
                               </td>
                               <td className="p-3 text-right">

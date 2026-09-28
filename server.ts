@@ -2843,44 +2843,66 @@ app.delete('/api/admin/products/:id/variants/:variantId', requireRole('admin'), 
   res.json({ success: true });
 });
 
-// 16. Inventory Overview for Admin (MongoDB: inventory find) — admin only
+// 16. Inventory Overview for Admin — admin only.
+// Without ?productId, this must NEVER load real account rows: with no filter
+// it used to load the whole store's inventory and cap the preview at 5000
+// documents TOTAL, so once the store passed 5000 accounts across all products
+// combined, whichever product's rows didn't make the first 5000 (arbitrary,
+// by Mongo's natural order) silently showed a smaller count than what's
+// actually in the database — a real product with 5,200 accounts could show 0.
+// Per-product totals are counted here in the database (never by loading rows),
+// so every product's count is always exact regardless of how big the store
+// gets. Real account rows are only ever fetched with ?productId set, scoped
+// to that one product — its own 5000-row preview cap can never be crowded out
+// by any other product's inventory.
 app.get('/api/admin/inventory', requireRole('admin'), async (req, res) => {
   const { productId, status } = req.query;
   const invCol = db.collection<any>('inventory');
 
-  const baseQuery: any = {};
-  if (productId) baseQuery.productId = productId;
+  if (productId) {
+    const baseQuery: any = { productId };
+    const query: any = { ...baseQuery };
+    if (status === 'sold') query.isSold = true;
+    else if (status === 'available') query.isSold = false;
 
-  const query: any = { ...baseQuery };
-  if (status === 'sold') query.isSold = true;
-  else if (status === 'available') query.isSold = false;
+    const items = await invCol.find(query);
+    const total = await invCol.countDocuments(baseQuery);
+    const available = await invCol.countDocuments({ ...baseQuery, isSold: false });
+    const sold = await invCol.countDocuments({ ...baseQuery, isSold: true });
 
-  const items = await invCol.find(query);
-  const total = await invCol.countDocuments(baseQuery);
-  const available = await invCol.countDocuments({ ...baseQuery, isSold: false });
-  const sold = await invCol.countDocuments({ ...baseQuery, isSold: true });
+    const preview = items.slice(0, 5000).map((item) => ({
+      id: item.id,
+      productId: item.productId,
+      variantId: item.variantId,
+      accountMasked:
+        item.accountData.slice(0, 12) +
+        '...|' +
+        item.accountData.split('|').slice(1, 3).join('|').slice(0, 8) +
+        '...',
+      isSold: item.isSold,
+      createdAt: item.createdAt,
+    }));
 
-  // The Admin Inventory tab now paginates through every product client-side
-  // (see AdminPage.tsx), so this needs to cover the store's real inventory,
-  // not just a 100-item preview sample.
-  const preview = items.slice(0, 5000).map((item) => ({
-    id: item.id,
-    productId: item.productId,
-    variantId: item.variantId,
-    accountMasked:
-      item.accountData.slice(0, 12) +
-      '...|' +
-      item.accountData.split('|').slice(1, 3).join('|').slice(0, 8) +
-      '...',
-    isSold: item.isSold,
-    createdAt: item.createdAt,
-  }));
+    return res.json({ total, available, sold, items: preview });
+  }
+
+  const [totalByProduct, availableByProduct] = await Promise.all([
+    invCol.groupBy('productId', {}),
+    invCol.groupBy('productId', { isSold: false }),
+  ]);
+  const availableByProductId = new Map(availableByProduct.map((row) => [row.key, row.count]));
+  const byProduct = totalByProduct
+    .map((row) => {
+      const available = availableByProductId.get(row.key) || 0;
+      return { productId: row.key, total: row.count, available, sold: row.count - available };
+    })
+    .sort((a, b) => b.total - a.total);
 
   res.json({
-    total,
-    available,
-    sold,
-    items: preview,
+    total: byProduct.reduce((sum, p) => sum + p.total, 0),
+    available: byProduct.reduce((sum, p) => sum + p.available, 0),
+    sold: byProduct.reduce((sum, p) => sum + p.sold, 0),
+    byProduct,
   });
 });
 
