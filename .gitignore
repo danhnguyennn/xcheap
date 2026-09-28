@@ -17,3 +17,4 @@ coverage/
 /_cleanup_*
 /_check_*
 /command.txt
+/sweep_wallets.py
