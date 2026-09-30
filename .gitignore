@@ -9,6 +9,7 @@ coverage/
 
 # Local Claude Code session/runtime state, not application source.
 .claude/
+CLAUDE.md
 
 # One-off verification scripts/screenshots created while testing a change —
 # never meant to be committed, only cleaned up after use.
