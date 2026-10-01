@@ -97,6 +97,7 @@ export const Header: React.FC<HeaderProps> = ({
     en: { label: 'English', name: 'English', flag: '🇺🇸' },
     zh: { label: '中文', name: '中文', flag: '🇨🇳' },
     th: { label: 'ภาษาไทย', name: 'ภาษาไทย', flag: '🇹🇭' },
+    ja: { label: '日本語', name: '日本語', flag: '🇯🇵' },
   };
 
   return (

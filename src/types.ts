@@ -1,6 +1,6 @@
 export type UserRole = 'user' | 'ctv' | 'admin';
 
-export type Language = 'vn' | 'en' | 'zh' | 'th';
+export type Language = 'vn' | 'en' | 'zh' | 'th' | 'ja';
 
 export type CryptoNetwork = 'bsc' | 'polygon' | 'trc' | 'base';
 
@@ -125,7 +125,7 @@ export interface Product {
   // translation isn't available yet (e.g. the translation service was
   // unreachable when saved) — the frontend falls back to the original
   // Vietnamese text rather than showing anything made up.
-  descriptionTranslations?: Partial<Record<'en' | 'zh' | 'th', string>>;
+  descriptionTranslations?: Partial<Record<'en' | 'zh' | 'th' | 'ja', string>>;
   // Whitelist of CTV account ids admin has explicitly granted permission to
   // upload stock into this product — CTV no longer creates products (only
   // admin does, via POST /api/admin/products), so this is the only way a
@@ -252,6 +252,14 @@ export interface Review {
   date: string;
   comment: string;
   editedAt?: string;
+  // Real machine translations of `comment`, same mechanism as
+  // Product.descriptionTranslations — computed once server-side when the
+  // review is submitted or edited (reviewers are assumed to write in
+  // Vietnamese, same assumption the description translator already makes),
+  // never recomputed on every page view. Missing a key just means that
+  // language's translation isn't available yet; the frontend falls back to
+  // the original comment text rather than showing anything made up.
+  commentTranslations?: Partial<Record<'en' | 'zh' | 'th' | 'ja', string>>;
   // Only present when the reviewer is a regular user (role 'user') with an
   // active VIP tier at the time the review list was fetched — a CTV/admin
   // reviewer never gets one, since they don't receive the VIP perk either.

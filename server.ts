@@ -208,48 +208,56 @@ const DEFAULT_REVIEW_SUGGESTIONS: Record<Language, string>[] = [
     en: 'Account exactly as described, super fast transaction!',
     zh: '账号完全符合描述，交易速度很快！',
     th: 'บัญชีตรงตามที่อธิบายไว้ ทำธุรกรรมรวดเร็วมาก!',
+    ja: '説明通りのアカウントで、発送もスピーディーでした！',
   },
   {
     vn: 'Chất lượng tốt, admin hỗ trợ nhiệt tình. Sẽ ủng hộ tiếp!',
     en: 'Great quality, admin support is very helpful. Will buy again!',
     zh: '质量很好，管理员服务热情，还会继续支持！',
     th: 'คุณภาพดี แอดมินช่วยเหลือดีมาก จะอุดหนุนต่อแน่นอน!',
+    ja: '品質も良く、サポートも親切です。また購入します！',
   },
   {
     vn: 'Uy tín, đúng như cam kết. Rất hài lòng!',
     en: 'Trustworthy, exactly as promised. Very satisfied!',
     zh: '很靠谱，完全符合承诺，非常满意！',
     th: 'น่าเชื่อถือ ตรงตามที่รับปากไว้ พอใจมาก!',
+    ja: '信頼できる販売者で、約束通りの内容でした。とても満足です！',
   },
   {
     vn: 'Giao hàng tự động cực nhanh, tài khoản hoạt động tốt!',
     en: 'Auto-delivery was super fast, account works great!',
     zh: '自动发货速度超快，账号运行良好！',
     th: 'ส่งสินค้าอัตโนมัติรวดเร็วมาก บัญชีใช้งานได้ดี!',
+    ja: '自動発送がとても速く、アカウントも問題なく使えました！',
   },
   {
     vn: 'Giá tốt, chất lượng ổn, sẽ quay lại mua thêm!',
     en: 'Good price, solid quality, will come back for more!',
     zh: '价格实惠，质量稳定，还会再来购买！',
     th: 'ราคาดี คุณภาพเสถียร จะกลับมาซื้อเพิ่มแน่นอน!',
+    ja: '価格も品質も満足、またリピートします！',
   },
   {
     vn: 'Shop uy tín, đóng gói thông tin tài khoản rõ ràng, dễ dùng.',
     en: 'Trustworthy shop, account info is clearly laid out and easy to use.',
     zh: '商店很靠谱，账号信息整理清晰，使用方便。',
     th: 'ร้านน่าเชื่อถือ ข้อมูลบัญชีจัดเรียงชัดเจน ใช้งานง่าย',
+    ja: '信頼できる販売者で、アカウント情報も分かりやすく使いやすかったです。',
   },
   {
     vn: 'Trải nghiệm mua hàng tuyệt vời, đúng cam kết bảo hành.',
     en: 'Excellent shopping experience, warranty exactly as promised.',
     zh: '购物体验很棒，保修完全兑现承诺。',
     th: 'ประสบการณ์ซื้อสินค้ายอดเยี่ยม รับประกันตรงตามที่สัญญาไว้',
+    ja: '購入体験が素晴らしく、保証の約束もきちんと守ってもらえました。',
   },
   {
     vn: 'Rất đáng tiền, tài khoản ổn định sau nhiều ngày sử dụng.',
     en: 'Totally worth it, account has stayed stable after days of use.',
     zh: '非常值得，使用多天后账号依然稳定。',
     th: 'คุ้มค่ามาก บัญชียังเสถียรดีหลังใช้งานมาหลายวัน',
+    ja: '十分に価値があり、アカウントも数日間安定して使えています。',
   },
 ];
 
@@ -1081,6 +1089,7 @@ app.post('/api/products/:id/reviews', async (req, res) => {
     rating: cleanRating,
     date: new Date().toISOString(),
     comment: cleanComment,
+    commentTranslations: await translateDescriptionToAllLanguages(cleanComment),
   };
   await reviewCol.insertOne(newReview);
   res.json({ success: true, review: newReview });
@@ -1115,9 +1124,21 @@ app.put('/api/products/:id/reviews', async (req, res) => {
     return res.status(400).json({ error: 'Vui lòng viết nội dung đánh giá trước khi gửi' });
   }
 
+  // Only re-translate when the comment text actually changed — editing just
+  // the star rating shouldn't burn a translation-API call for content that
+  // hasn't moved (same reasoning as the product description editor).
+  const retranslate = cleanComment !== existingReview.comment;
+
   await reviewCol.updateOne(
     { id: existingReview.id },
-    { $set: { rating: cleanRating, comment: cleanComment, editedAt: new Date().toISOString() } }
+    {
+      $set: {
+        rating: cleanRating,
+        comment: cleanComment,
+        editedAt: new Date().toISOString(),
+        ...(retranslate ? { commentTranslations: await translateDescriptionToAllLanguages(cleanComment) } : {}),
+      },
+    }
   );
   const updated = await reviewCol.findOne({ id: existingReview.id });
   res.json({ success: true, review: updated });
@@ -1155,7 +1176,7 @@ app.get('/api/review-comment-suggestions', async (req, res) => {
   res.json({ suggestions });
 });
 
-const REVIEW_SUGGESTION_LANGUAGES: Language[] = ['vn', 'en', 'zh', 'th'];
+const REVIEW_SUGGESTION_LANGUAGES: Language[] = ['vn', 'en', 'zh', 'th', 'ja'];
 
 // Every suggestion needs real text in all 4 languages — a partial object
 // would leave the pill blank for whichever language wasn't filled in.
@@ -3533,9 +3554,9 @@ app.post('/api/ctv/products', requireRole('admin'), async (req, res) => {
 // never re-requested on every page view, and never fabricated: a language
 // the service couldn't reach just stays absent, and the frontend falls back
 // to showing the original Vietnamese text for it.
-const MYMEMORY_LANG_CODES: Record<'en' | 'zh' | 'th', string> = { en: 'en', zh: 'zh-CN', th: 'th' };
+const MYMEMORY_LANG_CODES: Record<'en' | 'zh' | 'th' | 'ja', string> = { en: 'en', zh: 'zh-CN', th: 'th', ja: 'ja' };
 
-async function translateFromVietnamese(text: string, targetLang: 'en' | 'zh' | 'th'): Promise<string | null> {
+async function translateFromVietnamese(text: string, targetLang: 'en' | 'zh' | 'th' | 'ja'): Promise<string | null> {
   const trimmed = text.trim();
   if (!trimmed) return null;
   try {
@@ -3551,16 +3572,18 @@ async function translateFromVietnamese(text: string, targetLang: 'en' | 'zh' | '
   }
 }
 
-async function translateDescriptionToAllLanguages(text: string): Promise<Partial<Record<'en' | 'zh' | 'th', string>>> {
-  const [en, zh, th] = await Promise.all([
+async function translateDescriptionToAllLanguages(text: string): Promise<Partial<Record<'en' | 'zh' | 'th' | 'ja', string>>> {
+  const [en, zh, th, ja] = await Promise.all([
     translateFromVietnamese(text, 'en'),
     translateFromVietnamese(text, 'zh'),
     translateFromVietnamese(text, 'th'),
+    translateFromVietnamese(text, 'ja'),
   ]);
-  const result: Partial<Record<'en' | 'zh' | 'th', string>> = {};
+  const result: Partial<Record<'en' | 'zh' | 'th' | 'ja', string>> = {};
   if (en) result.en = en;
   if (zh) result.zh = zh;
   if (th) result.th = th;
+  if (ja) result.ja = ja;
   return result;
 }
 

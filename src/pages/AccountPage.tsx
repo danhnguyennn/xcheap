@@ -34,6 +34,7 @@ const LOCALE_MAP: Record<Language, string> = {
   en: 'en-US',
   zh: 'zh-CN',
   th: 'th-TH',
+  ja: 'ja-JP',
 };
 
 export const AccountPage: React.FC<AccountPageProps> = ({ user, language, onBackToStore, onRefreshUser }) => {

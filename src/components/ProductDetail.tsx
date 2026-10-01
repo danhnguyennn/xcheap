@@ -473,7 +473,7 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
   // language's translation isn't available (service was unreachable when
   // saved), fall back to the original Vietnamese text rather than showing
   // nothing or a fabricated translation.
-  const isTranslatedLanguage = language === 'en' || language === 'zh' || language === 'th';
+  const isTranslatedLanguage = language === 'en' || language === 'zh' || language === 'th' || language === 'ja';
   const translatedDescription = isTranslatedLanguage ? product.descriptionTranslations?.[language] : undefined;
   const displayDescription = translatedDescription || product.descriptionHtml;
   const descriptionIsMachineTranslated = isTranslatedLanguage && !!translatedDescription;
@@ -1208,6 +1208,13 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
                   const authorVipTier = rev.authorVipTierKey
                     ? VIP_TIERS.find((tier) => tier.key === rev.authorVipTierKey)
                     : undefined;
+                  // Same mechanism as the product description above: reviewers
+                  // are assumed to write in Vietnamese, so a real cached
+                  // machine translation is shown for any other site language,
+                  // falling back to the original text when none is available.
+                  const translatedComment = isTranslatedLanguage ? rev.commentTranslations?.[language] : undefined;
+                  const displayComment = translatedComment || rev.comment;
+                  const commentIsMachineTranslated = isTranslatedLanguage && !!translatedComment;
                   return (
                   <div key={rev.id} className="p-3 bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e2e6e5] dark:border-[#30333b] rounded-lg">
                     <div className="flex items-center justify-between mb-1">
@@ -1222,7 +1229,10 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
                       <span className="text-[10px] text-slate-600 dark:text-slate-400">{new Date(rev.date).toLocaleDateString()}</span>
                     </div>
                     <div className="text-amber-600 dark:text-amber-400 text-xs mb-1">{'★'.repeat(rev.rating)}{'☆'.repeat(5 - rev.rating)}</div>
-                    <p className="text-slate-700 dark:text-slate-300 text-xs">{rev.comment}</p>
+                    <p className="text-slate-700 dark:text-slate-300 text-xs">{displayComment}</p>
+                    {commentIsMachineTranslated && (
+                      <p className="text-[10px] text-slate-500 dark:text-slate-500 italic mt-1">{t.pdAutoTranslatedNote}</p>
+                    )}
                   </div>
                   );
                 })

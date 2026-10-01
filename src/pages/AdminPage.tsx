@@ -48,8 +48,8 @@ interface AdminPageProps {
   onRefreshUser: () => void;
 }
 
-const EMPTY_SUGGESTION_TEXT: Record<Language, string> = { vn: '', en: '', zh: '', th: '' };
-const SUGGESTION_LANGUAGE_LABELS: Record<Language, string> = { vn: 'VN', en: 'EN', zh: 'ZH', th: 'TH' };
+const EMPTY_SUGGESTION_TEXT: Record<Language, string> = { vn: '', en: '', zh: '', th: '', ja: '' };
+const SUGGESTION_LANGUAGE_LABELS: Record<Language, string> = { vn: 'VN', en: 'EN', zh: 'ZH', th: 'TH', ja: 'JA' };
 
 export const AdminPage: React.FC<AdminPageProps> = ({
   user,
