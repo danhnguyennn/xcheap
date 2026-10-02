@@ -3,6 +3,7 @@ import { Product, ProductVariant, User, Language, UserRole, CryptoNetwork, Crypt
 import { translations } from '../locales/translations';
 import { formatMoney } from '../utils/pricing';
 import { SimpleBarChart, BarChartDatum } from '../components/charts/SimpleBarChart';
+import { showCopyToast } from '../components/Toast';
 import {
   ShieldCheck,
   Users,
@@ -36,7 +37,8 @@ import {
   Eye,
   EyeOff,
   Flame,
-  UserCheck
+  UserCheck,
+  Copy
 } from 'lucide-react';
 
 interface AdminPageProps {
@@ -377,6 +379,17 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         return next;
       });
     }
+  };
+
+  // Bulk-copy for Check Live X — copies every username in `items` (one per
+  // line) in a single clipboard write, instead of one-by-one.
+  const copyUsernames = (items: any[], label: string) => {
+    if (items.length === 0) {
+      showCopyToast(`Không có tài khoản ${label}`);
+      return;
+    }
+    navigator.clipboard.writeText(items.map((i) => i.username).join('\n'));
+    showCopyToast(`Đã sao chép ${items.length} username ${label}`);
   };
 
   const toggleInventoryProduct = (productId: string) => {
@@ -2732,8 +2745,31 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                           });
                           return (
                             <div key={variantId}>
-                              <div className="bg-[#eff2f1] dark:bg-[#1d1f24] px-3 py-1.5 text-[11px] font-semibold text-slate-600 dark:text-slate-400">
-                                {variant?.name || variantId}
+                              <div className="bg-[#eff2f1] dark:bg-[#1d1f24] px-3 py-1.5 text-[11px] font-semibold text-slate-600 dark:text-slate-400 flex items-center justify-between gap-2">
+                                <span>{variant?.name || variantId}</span>
+                                <span className="flex items-center gap-2 font-normal text-[10px]">
+                                  <button
+                                    type="button"
+                                    onClick={() => copyUsernames(sortedItems, '(tất cả)')}
+                                    className="flex items-center gap-0.5 text-slate-500 dark:text-slate-500 hover:text-emerald-600 hover:dark:text-emerald-400 transition"
+                                  >
+                                    <Copy className="w-3 h-3" />Tất cả
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => copyUsernames(sortedItems.filter((i) => !i.isSold), 'chưa bán')}
+                                    className="flex items-center gap-0.5 text-slate-500 dark:text-slate-500 hover:text-emerald-600 hover:dark:text-emerald-400 transition"
+                                  >
+                                    <Copy className="w-3 h-3" />Chưa bán
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => copyUsernames(sortedItems.filter((i) => i.isSold), 'đã bán')}
+                                    className="flex items-center gap-0.5 text-slate-500 dark:text-slate-500 hover:text-emerald-600 hover:dark:text-emerald-400 transition"
+                                  >
+                                    <Copy className="w-3 h-3" />Đã bán
+                                  </button>
+                                </span>
                               </div>
                               <div className="max-h-64 overflow-y-auto">
                                 <div className="overflow-x-auto">
@@ -2741,8 +2777,21 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                                   <tbody className="divide-y divide-[#e4e8e7] dark:divide-[#2d3036] font-mono text-[11px]">
                                     {sortedItems.map((item) => (
                                       <tr key={item.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34]">
-                                        <td className="p-2.5 text-slate-700 dark:text-slate-300">{item.accountMasked}</td>
-                                        <td className="p-2.5 text-right w-24">
+                                        <td className="px-[5px] py-[2.5px] text-slate-700 dark:text-slate-300">{item.accountMasked}</td>
+                                        <td className="px-[5px] py-[2.5px] w-10">
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              navigator.clipboard.writeText(item.username);
+                                              showCopyToast(`Đã sao chép username "${item.username}"`);
+                                            }}
+                                            title={`Sao chép username "${item.username}" (dùng cho Check Live X)`}
+                                            className="p-1 text-slate-500 dark:text-slate-500 hover:text-emerald-600 hover:dark:text-emerald-400 hover:bg-emerald-50 hover:dark:bg-emerald-950/70 rounded transition"
+                                          >
+                                            <Copy className="w-3.5 h-3.5" />
+                                          </button>
+                                        </td>
+                                        <td className="px-[5px] py-[2.5px] text-right w-24">
                                           {item.isSold ? (
                                             <span className="bg-red-50 dark:bg-red-950/70 text-red-600 dark:text-red-400 px-1.5 py-0.5 rounded text-[10px]">Đã bán</span>
                                           ) : (

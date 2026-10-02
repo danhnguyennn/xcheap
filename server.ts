@@ -2895,6 +2895,12 @@ app.get('/api/admin/inventory', requireRole('admin'), async (req, res) => {
       id: item.id,
       productId: item.productId,
       variantId: item.variantId,
+      // The username itself isn't a secret the way the password/2FA/cookie
+      // fields are — it's the public handle admin needs on hand to paste into
+      // the Check Live X tool. Sent as its own clean field (original casing)
+      // since accountMasked's fixed 12-char slice can cut a longer username
+      // off mid-string.
+      username: item.accountData.split('|')[0].trim(),
       accountMasked:
         item.accountData.slice(0, 12) +
         '...|' +
