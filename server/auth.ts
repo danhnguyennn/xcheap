@@ -1,7 +1,15 @@
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import session from 'express-session';
-import MongoStore from 'connect-mongo';
+// Named import, not the default — esbuild's CJS bundling of this external
+// package (dist/server.cjs, built via `--packages=external`) forces a
+// default import's `.default` to resolve to the whole required module
+// object instead of connect-mongo's own inner class, even though the
+// package itself sets `__esModule` and a correct `.default` (tsx's own dev
+// loader doesn't have this quirk, which is why this only broke in the
+// production Docker build, never in `npm run dev`). The named export isn't
+// affected by that interop ambiguity.
+import { MongoStore } from 'connect-mongo';
 import type { Request, Response, NextFunction } from 'express';
 import { db } from './mongodb';
 import { User, UserRole } from '../src/types';
