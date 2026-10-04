@@ -1,6 +1,7 @@
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import session from 'express-session';
+import MongoStore from 'connect-mongo';
 import type { Request, Response, NextFunction } from 'express';
 import { db } from './mongodb';
 import { User, UserRole } from '../src/types';
@@ -45,8 +46,35 @@ export function sessionMiddleware() {
     console.warn('[auth] SESSION_SECRET is not set in environment. Using fallback development session secret.');
   }
 
+  // Without a persistent store, express-session falls back to MemoryStore —
+  // sessions live only in this process's RAM, so every deploy/restart (e.g.
+  // `npm run build` + restarting the server) wipes every logged-in user's
+  // session at once, even though their browser still holds a now-orphaned
+  // cookie (getSessionUser's req.session.userId lookup just comes back
+  // empty, which reads the same as never having logged in). Persisting
+  // sessions in the same MongoDB the rest of the app already uses means a
+  // restart no longer logs anyone out. Falls back to MemoryStore only when
+  // no MONGODB_URI is configured at all (local/offline dev), matching how
+  // MongoDBEngine itself degrades to in-memory mode in server/mongodb.ts.
+  const mongoUrl = process.env.MONGODB_URI;
+  let store: session.Store | undefined;
+  if (mongoUrl) {
+    store = MongoStore.create({
+      mongoUrl,
+      dbName: process.env.MONGODB_DB_NAME || 'xscr_store_db',
+      collectionName: 'sessions',
+      ttl: 60 * 60 * 24 * 7, // matches cookie.maxAge below (seconds, not ms)
+    });
+    store.on('error', (err) => {
+      console.warn('[auth] Session store (MongoDB) error — falling back to in-memory sessions for this process:', err);
+    });
+  } else {
+    console.warn('[auth] MONGODB_URI is not set. Sessions will use in-memory storage and will NOT survive a server restart.');
+  }
+
   return session({
     secret,
+    store,
     resave: false,
     saveUninitialized: false,
     // Rolling: every authenticated request pushes maxAge back out, so an
