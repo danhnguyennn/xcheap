@@ -7,6 +7,27 @@
 
 @theme {
   --font-sans: Arial, "Helvetica Neue", Helvetica, sans-serif;
+  --animate-modal-pop: modal-pop 0.18s ease-out;
+}
+
+/* Subtle scale+fade entrance for dialogs (e.g. the pre-order modal) —
+   kept short (180ms) and respects reduced-motion like the rest of the app's
+   native Tailwind animations (animate-spin/ping/pulse). */
+@keyframes modal-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-modal-pop {
+    animation: none;
+  }
 }
 
 @layer base {
