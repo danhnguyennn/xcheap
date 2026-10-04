@@ -64,7 +64,7 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
         isLive: false,
         status: 'CHECKING',
         outputLine: line,
-        reason: 'Đang kiểm tra...',
+        reason: t.toolsCheckingStatus,
       };
     });
     setResults(initialResults);
@@ -116,7 +116,7 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
             followers: data.followers,
             post: data.post,
             created_at: data.created_at,
-            reason: data.reason || (isLive ? 'Hoạt động' : 'Tài khoản không khả dụng'),
+            reason: data.reason || (isLive ? t.toolsLiveReasonDefault : t.toolsNotAvailableReasonDefault),
             outputLine: line,
           };
           return next;
@@ -131,7 +131,7 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
             isLive: false,
             status: 'DIE',
             rawStatus: 'ERROR',
-            reason: err.message || 'Lỗi kết nối',
+            reason: err.message || t.toolsConnectionError,
             outputLine: line,
           };
           return next;
@@ -275,16 +275,16 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
         <div className="flex items-center justify-between gap-2 mb-1 flex-wrap">
           <label className="font-bold text-slate-800 dark:text-slate-200 text-xs flex items-center gap-1.5">
             <ShieldCheck className="w-3.5 h-3.5 text-emerald-500" />
-            <span>Danh sách tài khoản X (Twitter) cần kiểm tra:</span>
+            <span>{t.toolsCheckLiveInputLabel}</span>
           </label>
           <div className="flex items-center gap-2">
             <label className="flex items-center gap-1.5 text-[11px] font-semibold text-emerald-700 dark:text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/30 px-2.5 py-1 rounded-lg cursor-pointer transition">
               <Upload className="w-3.5 h-3.5" />
-              <span>Tải file .txt</span>
+              <span>{t.toolsUploadTxtBtn}</span>
               <input type="file" accept=".txt" onChange={handleFileSelect} disabled={isRunning} className="hidden" />
             </label>
             <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
-              {lines.length} dòng
+              {lines.length} {t.toolsLinesCountSuffix}
             </span>
           </div>
         </div>
@@ -298,7 +298,7 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
           className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl p-3 font-mono text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-500 disabled:opacity-60"
         />
         <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
-          Định dạng: <code className="text-emerald-700 dark:text-emerald-300 font-mono">username</code>, mỗi tài khoản 1 dòng
+          {t.toolsFormatLabel} <code className="text-emerald-700 dark:text-emerald-300 font-mono">username</code>, {t.toolsOneAccountPerLineSuffix}
         </p>
       </div>
 
@@ -311,7 +311,7 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
             className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold px-4 py-2 rounded-xl text-xs flex items-center gap-2 transition cursor-pointer shadow-sm"
           >
             <Play className="w-3.5 h-3.5 fill-current" />
-            <span>Kiểm Tra Live X</span>
+            <span>{t.toolsCheckLiveStartBtn}</span>
           </button>
         ) : (
           <button
@@ -319,7 +319,7 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
             className="bg-rose-600 hover:bg-rose-500 text-white font-bold px-4 py-2 rounded-xl text-xs flex items-center gap-2 transition cursor-pointer shadow-sm"
           >
             <Square className="w-3.5 h-3.5 fill-current" />
-            <span>Dừng Lại ({currentIndex}/{lines.length})</span>
+            <span>{t.toolsStopBtnTemplate.replace('{current}', String(currentIndex)).replace('{total}', String(lines.length))}</span>
           </button>
         )}
 
@@ -331,7 +331,7 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
             }}
             className="px-3 py-2 rounded-xl text-xs font-semibold bg-[#e7ebe9] dark:bg-[#282a30] text-slate-700 dark:text-slate-300 hover:bg-[#dee2e0] hover:dark:bg-[#32353d] transition cursor-pointer"
           >
-            Xóa Dữ Liệu
+            {t.toolsClearDataBtn}
           </button>
         )}
       </div>
@@ -350,7 +350,7 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
                     : 'bg-[#e7ebe9] dark:bg-[#282a30] text-slate-600 dark:text-slate-400'
                 }`}
               >
-                Tất cả ({results.length})
+                {t.toolsFilterAllTemplate.replace('{n}', String(results.length))}
               </button>
 
               <button
@@ -407,17 +407,17 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
                 <button
                   onClick={handleCopyLive}
                   className="text-emerald-700 dark:text-emerald-300 hover:text-slate-900 hover:dark:text-slate-100 text-xs font-semibold flex items-center gap-1.5 bg-[#f2f4f3] dark:bg-[#1a1b1f] px-2.5 py-1.5 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] cursor-pointer"
-                  title="Copy tài khoản LIVE"
+                  title={t.toolsCopyStatusTooltipTemplate.replace('{status}', 'LIVE')}
                 >
                   {copiedLive ? (
                     <>
                       <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
-                      <span>Đã chép LIVE</span>
+                      <span>{t.toolsCopiedStatusTemplate.replace('{status}', 'LIVE')}</span>
                     </>
                   ) : (
                     <>
                       <Copy className="w-3.5 h-3.5" />
-                      <span>Copy LIVE ({liveCount})</span>
+                      <span>{t.toolsCopyStatusBtnTemplate.replace('{status}', 'LIVE').replace('{n}', String(liveCount))}</span>
                     </>
                   )}
                 </button>
@@ -427,17 +427,17 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
                 <button
                   onClick={handleCopyTemporarily}
                   className="text-amber-700 dark:text-amber-400 hover:text-slate-900 hover:dark:text-slate-100 text-xs font-semibold flex items-center gap-1.5 bg-[#f2f4f3] dark:bg-[#1a1b1f] px-2.5 py-1.5 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] cursor-pointer"
-                  title="Copy tài khoản TEMPORARILY"
+                  title={t.toolsCopyStatusTooltipTemplate.replace('{status}', 'TEMPORARILY')}
                 >
                   {copiedTemporarily ? (
                     <>
                       <Check className="w-3.5 h-3.5 text-amber-600 dark:text-amber-400" />
-                      <span>Đã chép TEMPORARILY</span>
+                      <span>{t.toolsCopiedStatusTemplate.replace('{status}', 'TEMPORARILY')}</span>
                     </>
                   ) : (
                     <>
                       <Copy className="w-3.5 h-3.5" />
-                      <span>Copy TEMPORARILY ({temporarilyCount})</span>
+                      <span>{t.toolsCopyStatusBtnTemplate.replace('{status}', 'TEMPORARILY').replace('{n}', String(temporarilyCount))}</span>
                     </>
                   )}
                 </button>
@@ -447,17 +447,17 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
                 <button
                   onClick={handleCopyWrong}
                   className="text-purple-700 dark:text-purple-400 hover:text-slate-900 hover:dark:text-slate-100 text-xs font-semibold flex items-center gap-1.5 bg-[#f2f4f3] dark:bg-[#1a1b1f] px-2.5 py-1.5 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] cursor-pointer"
-                  title="Copy tài khoản WRONG (không tồn tại)"
+                  title={`${t.toolsCopyStatusTooltipTemplate.replace('{status}', 'WRONG')} ${t.toolsWrongNotExistSuffix}`}
                 >
                   {copiedWrong ? (
                     <>
                       <Check className="w-3.5 h-3.5 text-purple-600 dark:text-purple-400" />
-                      <span>Đã chép WRONG</span>
+                      <span>{t.toolsCopiedStatusTemplate.replace('{status}', 'WRONG')}</span>
                     </>
                   ) : (
                     <>
                       <Copy className="w-3.5 h-3.5" />
-                      <span>Copy WRONG ({wrongCount})</span>
+                      <span>{t.toolsCopyStatusBtnTemplate.replace('{status}', 'WRONG').replace('{n}', String(wrongCount))}</span>
                     </>
                   )}
                 </button>
@@ -467,17 +467,17 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
                 <button
                   onClick={handleCopyDie}
                   className="text-rose-700 dark:text-rose-400 hover:text-slate-900 hover:dark:text-slate-100 text-xs font-semibold flex items-center gap-1.5 bg-[#f2f4f3] dark:bg-[#1a1b1f] px-2.5 py-1.5 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] cursor-pointer"
-                  title="Copy tài khoản DIE"
+                  title={t.toolsCopyStatusTooltipTemplate.replace('{status}', 'DIE')}
                 >
                   {copiedDie ? (
                     <>
                       <Check className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400" />
-                      <span>Đã chép DIE</span>
+                      <span>{t.toolsCopiedStatusTemplate.replace('{status}', 'DIE')}</span>
                     </>
                   ) : (
                     <>
                       <Copy className="w-3.5 h-3.5" />
-                      <span>Copy DIE ({dieCount})</span>
+                      <span>{t.toolsCopyStatusBtnTemplate.replace('{status}', 'DIE').replace('{n}', String(dieCount))}</span>
                     </>
                   )}
                 </button>
@@ -486,7 +486,7 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
               <button
                 onClick={handleCopyAll}
                 className="text-slate-700 dark:text-slate-300 hover:text-slate-900 hover:dark:text-slate-100 text-xs font-semibold flex items-center gap-1.5 bg-[#f2f4f3] dark:bg-[#1a1b1f] px-2.5 py-1.5 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] cursor-pointer"
-                title="Copy tất cả"
+                title={t.toolsCopyAllBtn || 'Copy Tất Cả'}
               >
                 {copiedAll ? (
                   <>
@@ -504,10 +504,10 @@ export const CheckLiveXTab: React.FC<CheckLiveXTabProps> = ({ language }) => {
               <button
                 onClick={handleDownloadResults}
                 className="text-slate-700 dark:text-slate-300 hover:text-slate-900 hover:dark:text-slate-100 text-xs font-semibold flex items-center gap-1.5 bg-[#f2f4f3] dark:bg-[#1a1b1f] px-2.5 py-1.5 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] cursor-pointer"
-                title="Tải xuống kết quả đang lọc (.txt)"
+                title={t.toolsDownloadFilteredTooltip}
               >
                 <Download className="w-3.5 h-3.5" />
-                <span>Tải Xuống ({filteredResults.length})</span>
+                <span>{t.toolsDownloadBtnTemplate.replace('{n}', String(filteredResults.length))}</span>
               </button>
             </div>
           </div>

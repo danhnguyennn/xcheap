@@ -28,6 +28,17 @@ function computeTotp(secretKeyRaw: string): string | null {
   }
 }
 
+// Accepts a bare secret per line, "Label|SECRET", or a full
+// Username|Password|2FA|... account line — every account in this store is
+// already uploaded/exported in that exact pipe format, so admin can paste
+// straight from inventory without manually stripping the other fields out.
+function parseSecretLine(line: string): { label: string; secret: string } {
+  const parts = line.split('|').map((p) => p.trim());
+  if (parts.length <= 1) return { label: '', secret: parts[0] || '' };
+  if (parts.length === 2) return { label: parts[0], secret: parts[1] };
+  return { label: parts[0], secret: parts[2] };
+}
+
 type ToolKey = '2fa' | 'splitter' | 'email' | 'renew-hotmail' | 'check-live-x' | 'get-cookie-x';
 
 interface ToolsPageProps {
@@ -51,11 +62,12 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
     { key: 'get-cookie-x', icon: <Cookie className="w-3.5 h-3.5" />, label: t.getCookieX || 'Get Cookie X' },
   ];
 
-  // 2FA TOTP Generator state
-  const [secretKey, setSecretKey] = useState('');
-  const [totpCode, setTotpCode] = useState<string | null>(null);
+  // 2FA TOTP Generator state — one secret per line, each gets its own live code.
+  const [multiSecretInput, setMultiSecretInput] = useState('');
+  const [totpResults, setTotpResults] = useState<{ label: string; secret: string; code: string | null }[]>([]);
   const [secondsRemaining, setSecondsRemaining] = useState(30);
-  const [copiedTotp, setCopiedTotp] = useState(false);
+  const [copiedTotpIdx, setCopiedTotpIdx] = useState<number | null>(null);
+  const [copiedAllTotp, setCopiedAllTotp] = useState(false);
 
   // Splitter state — the two real formats accounts in this store actually
   // come in, plus a custom option for anything else. Field order here is
@@ -89,10 +101,10 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
       const text = await navigator.clipboard.readText();
       if (text) {
         setRawText(text);
-        showSplitterNotice('Đã dán dữ liệu từ Clipboard');
+        showSplitterNotice(t.toolsPastedNotice);
       }
     } catch {
-      showSplitterNotice('Vui lòng dùng phím tắt Ctrl+V để dán');
+      showSplitterNotice(t.toolsPasteManualNotice);
     }
   };
 
@@ -102,13 +114,13 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
     const unique = Array.from(new Set(rawLines));
     setRawText(unique.join('\n'));
     const diff = rawLines.length - unique.length;
-    showSplitterNotice(`Đã loại bỏ ${diff} dòng trùng lặp (${unique.length} dòng duy nhất)`);
+    showSplitterNotice(t.toolsDedupeNoticeTemplate.replace('{removed}', String(diff)).replace('{unique}', String(unique.length)));
   };
 
   const handleCleanRawText = () => {
     const rawLines = rawText.split('\n').map((l) => l.trim()).filter(Boolean);
     setRawText(rawLines.join('\n'));
-    showSplitterNotice(`Đã làm sạch khoảng trắng và dòng trống (${rawLines.length} dòng)`);
+    showSplitterNotice(t.toolsCleanNoticeTemplate.replace('{n}', String(rawLines.length)));
   };
 
   const handleClearRawText = () => {
@@ -116,7 +128,6 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
     setSplitRows(null);
     setParsedFields([]);
     setOutputFields([]);
-    showSplitterNotice('Đã xóa dữ liệu');
   };
 
   const handleDownloadSplitOutput = () => {
@@ -130,7 +141,7 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    showSplitterNotice('Đã tải file kết quả');
+    showSplitterNotice(t.toolsDownloadedNotice);
   };
 
   const activeInputFields =
@@ -190,30 +201,42 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
   const [copiedLineIndex, setCopiedLineIndex] = useState<number | null>(null);
   const [copiedAllLines, setCopiedAllLines] = useState(false);
 
-  // Recomputes the real TOTP code every second so it's always correct for
-  // the live 30-second window — not just refreshed at the boundary, so
-  // pasting a new secret shows the right code immediately instead of a
-  // stale one.
+  // Recomputes every secret's TOTP code every second so it's always correct
+  // for the live 30-second window — not just refreshed at the boundary, so
+  // pasting a new batch shows the right codes immediately instead of stale
+  // ones. All secrets share the same countdown: TOTP's 30s window is tied to
+  // the wall clock, not to any individual secret.
   useEffect(() => {
     const tick = () => {
       const now = new Date();
       setSecondsRemaining(30 - (now.getSeconds() % 30));
-      setTotpCode(computeTotp(secretKey));
+      const lines = multiSecretInput.split('\n').map((l) => l.trim()).filter(Boolean);
+      setTotpResults(
+        lines.map((line) => {
+          const { label, secret } = parseSecretLine(line);
+          return { label, secret, code: computeTotp(secret) };
+        })
+      );
     };
     tick();
     const interval = setInterval(tick, 1000);
     return () => clearInterval(interval);
-  }, [secretKey]);
+  }, [multiSecretInput]);
 
-  const handleGenerateTotp = () => {
-    setTotpCode(computeTotp(secretKey));
+  const handleCopyTotpLine = (idx: number) => {
+    const r = totpResults[idx];
+    if (!r?.code) return;
+    navigator.clipboard.writeText(r.code);
+    setCopiedTotpIdx(idx);
+    setTimeout(() => setCopiedTotpIdx(null), 2000);
   };
 
-  const handleCopyTotp = () => {
-    if (!totpCode) return;
-    navigator.clipboard.writeText(totpCode);
-    setCopiedTotp(true);
-    setTimeout(() => setCopiedTotp(false), 2000);
+  const handleCopyAllTotp = () => {
+    const valid = totpResults.filter((r) => r.code);
+    if (valid.length === 0) return;
+    navigator.clipboard.writeText(valid.map((r) => (r.label ? `${r.label}|${r.code}` : r.code)).join('\n'));
+    setCopiedAllTotp(true);
+    setTimeout(() => setCopiedAllTotp(false), 2000);
   };
 
   const handleSplit = () => {
@@ -347,7 +370,7 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
             newRefreshToken: null,
             expiresIn: 0,
             status: 'DIE',
-            errorMessage: data?.error || 'Token không hợp lệ hoặc đã hết hạn',
+            errorMessage: data?.error || t.toolsInvalidTokenError,
             renewedAt: new Date().toLocaleTimeString(),
           });
         }
@@ -361,7 +384,7 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
           newRefreshToken: null,
           expiresIn: 0,
           status: 'DIE',
-          errorMessage: err.message || 'Lỗi kết nối',
+          errorMessage: err.message || t.toolsConnectionError,
           renewedAt: new Date().toLocaleTimeString(),
         });
       }
@@ -444,57 +467,80 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
             <div className="space-y-3">
               <div>
                 <label className="font-bold text-slate-800 dark:text-slate-200 block mb-1">{t.twoFaTool}</label>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={secretKey}
-                    onChange={(e) => setSecretKey(e.target.value.replace(/\s+/g, ''))}
-                    placeholder={t.twoFaPlaceholder}
-                    className="flex-1 bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] rounded-lg px-3 py-2 text-xs font-mono text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-500 uppercase"
-                  />
-                  <button
-                    onClick={handleGenerateTotp}
-                    className="bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 font-bold px-4 py-2 rounded-lg transition"
-                  >
-                    {t.getTwoFaCode}
-                  </button>
-                </div>
-              </div>
-
-              <div className="p-4 bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                <div>
-                  <span className="text-[11px] text-slate-600 dark:text-slate-400 block mb-1">
-                    {t.toolsCurrent2FACode}
+                <textarea
+                  rows={4}
+                  value={multiSecretInput}
+                  onChange={(e) => setMultiSecretInput(e.target.value)}
+                  placeholder={t.twoFaPlaceholder}
+                  className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl p-3 font-mono text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-500 uppercase"
+                />
+                {totpResults.length > 0 && (
+                  <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono block mt-1">
+                    {totpResults.length} {t.toolsLinesCountSuffix}
                   </span>
-                  <div
-                    className={`text-3xl font-mono font-black tracking-wider ${
-                      totpCode
-                        ? 'text-emerald-600 dark:text-emerald-400'
-                        : secretKey.trim()
-                        ? 'text-red-500 dark:text-red-400 text-base'
-                        : 'text-slate-400 dark:text-slate-600'
-                    }`}
-                  >
-                    {totpCode ? `${totpCode.slice(0, 3)} ${totpCode.slice(3)}` : secretKey.trim() ? t.toolsInvalidSecretKey : '••• •••'}
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-between sm:justify-end gap-3">
-                  <div className="sm:text-right">
-                    <span className="text-[11px] text-slate-600 dark:text-slate-400 block">{t.toolsRefreshIn}</span>
-                    <span className="text-xs font-mono font-bold text-emerald-600 dark:text-emerald-400">{secondsRemaining}s</span>
-                  </div>
-
-                  <button
-                    onClick={handleCopyTotp}
-                    disabled={!totpCode}
-                    className="bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-emerald-500/30 text-emerald-700 dark:text-emerald-300 px-3.5 py-2 rounded-lg font-bold flex items-center gap-1.5 transition flex-shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    {copiedTotp ? <Check className="w-4 h-4 text-emerald-600 dark:text-emerald-400" /> : <Copy className="w-4 h-4" />}
-                    <span>{copiedTotp ? t.pdCopiedLabel : t.toolsCopyShort}</span>
-                  </button>
-                </div>
+                )}
               </div>
+
+              {totpResults.length === 0 ? (
+                <div className="text-center text-xs text-slate-500 dark:text-slate-500 py-6 border border-[#e2e6e5] dark:border-[#30333b] rounded-xl">
+                  {t.twoFaEmptyHint}
+                </div>
+              ) : (
+                <div className="space-y-2.5 pt-2 border-t border-[#e2e6e5] dark:border-[#30333b]">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[11px] text-slate-600 dark:text-slate-400">{t.toolsRefreshIn}</span>
+                      <span className="text-xs font-mono font-bold text-emerald-600 dark:text-emerald-400">{secondsRemaining}s</span>
+                    </div>
+                    <button
+                      onClick={handleCopyAllTotp}
+                      className="text-slate-700 dark:text-slate-300 hover:text-slate-900 hover:dark:text-slate-100 text-xs font-semibold flex items-center gap-1.5 bg-[#f2f4f3] dark:bg-[#1a1b1f] px-2.5 py-1.5 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] cursor-pointer"
+                    >
+                      {copiedAllTotp ? <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                      <span>{copiedAllTotp ? t.toolsCopiedAll : t.toolsCopyAllBtn}</span>
+                    </button>
+                  </div>
+
+                  <div className="space-y-1.5 max-h-96 overflow-y-auto pr-1">
+                    {totpResults.map((r, idx) => (
+                      <div
+                        key={idx}
+                        className="flex items-center gap-2 px-2.5 py-2 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] bg-[#fafcfb] dark:bg-[#181a1e] hover:border-emerald-500/30 transition text-xs"
+                      >
+                        <span className="font-mono text-[10px] text-slate-500 dark:text-slate-400 bg-[#e7ebe9] dark:bg-[#282a30] px-1.5 py-0.5 rounded font-bold flex-shrink-0">
+                          #{idx + 1}
+                        </span>
+                        {/* The secret itself (not just the optional label) sits
+                            right before its code, so admin can match a code
+                            back to exactly which pasted secret it came from —
+                            truncated with the full value on hover since
+                            secrets can run long. */}
+                        <span className="font-mono text-slate-600 dark:text-slate-400 truncate flex-1 min-w-0" title={r.label ? `${r.label} | ${r.secret}` : r.secret}>
+                          {r.label ? `${r.label} | ${r.secret}` : r.secret}
+                        </span>
+                        <span
+                          className={`font-mono font-black tracking-wider flex-shrink-0 ${
+                            r.code ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-500 dark:text-red-400 text-[11px]'
+                          }`}
+                        >
+                          {r.code ? `${r.code.slice(0, 3)} ${r.code.slice(3)}` : t.toolsInvalidSecretKey}
+                        </span>
+                        <button
+                          onClick={() => handleCopyTotpLine(idx)}
+                          disabled={!r.code}
+                          className="text-slate-500 dark:text-slate-400 hover:text-emerald-600 dark:hover:text-emerald-400 hover:bg-[#e7ebe9] dark:hover:bg-[#282a30] p-1.5 rounded transition flex-shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          {copiedTotpIdx === idx ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -567,7 +613,7 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
                   </label>
                   {rawText && (
                     <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
-                      {rawText.split('\n').filter((l) => l.trim()).length} dòng
+                      {rawText.split('\n').filter((l) => l.trim()).length} {t.toolsLinesCountSuffix}
                     </span>
                   )}
                 </div>
@@ -578,10 +624,10 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
                     type="button"
                     onClick={handlePasteRawText}
                     className="text-[11px] font-semibold bg-white dark:bg-[#22242a] hover:bg-slate-50 hover:dark:bg-[#2c2f37] text-slate-700 dark:text-slate-200 border border-[#e2e6e5] dark:border-[#30333b] px-2.5 py-1 rounded-lg transition flex items-center gap-1 cursor-pointer shadow-xs"
-                    title="Dán nhanh văn bản từ Clipboard"
+                    title={t.toolsPasteTooltip}
                   >
                     <Clipboard className="w-3 h-3 text-emerald-500" />
-                    <span>Dán (Paste)</span>
+                    <span>{t.toolsPasteBtn}</span>
                   </button>
 
                   <button
@@ -589,10 +635,10 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
                     onClick={handleRemoveDuplicatesRawText}
                     disabled={!rawText.trim()}
                     className="text-[11px] font-semibold bg-white dark:bg-[#22242a] hover:bg-slate-50 hover:dark:bg-[#2c2f37] text-slate-700 dark:text-slate-200 border border-[#e2e6e5] dark:border-[#30333b] px-2.5 py-1 rounded-lg transition flex items-center gap-1 cursor-pointer disabled:opacity-50 shadow-xs"
-                    title="Lọc và xóa các dòng trùng lặp"
+                    title={t.toolsDedupeTooltip}
                   >
                     <Sparkles className="w-3 h-3 text-blue-500" />
-                    <span>Lọc trùng</span>
+                    <span>{t.toolsDedupeBtn}</span>
                   </button>
 
                   <button
@@ -600,9 +646,9 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
                     onClick={handleCleanRawText}
                     disabled={!rawText.trim()}
                     className="text-[11px] font-semibold bg-white dark:bg-[#22242a] hover:bg-slate-50 hover:dark:bg-[#2c2f37] text-slate-700 dark:text-slate-200 border border-[#e2e6e5] dark:border-[#30333b] px-2.5 py-1 rounded-lg transition flex items-center gap-1 cursor-pointer disabled:opacity-50 shadow-xs"
-                    title="Xóa khoảng trắng thừa và dòng trống"
+                    title={t.toolsCleanTooltip}
                   >
-                    <span>Làm sạch dòng</span>
+                    <span>{t.toolsCleanBtn}</span>
                   </button>
 
                   {rawText && (
@@ -610,10 +656,10 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
                       type="button"
                       onClick={handleClearRawText}
                       className="text-[11px] font-semibold text-rose-600 dark:text-rose-400 hover:text-rose-700 px-2.5 py-1 rounded-lg transition flex items-center gap-1 cursor-pointer ml-auto"
-                      title="Xóa toàn bộ văn bản nhập"
+                      title={t.toolsClearInputTooltip}
                     >
                       <Trash2 className="w-3 h-3" />
-                      <span>Xóa trắng</span>
+                      <span>{t.toolsClearInputBtn}</span>
                     </button>
                   )}
                 </div>
@@ -644,10 +690,10 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
                   <div>
                     <div className="flex items-center justify-between mb-1.5">
                       <span className="font-bold text-slate-800 dark:text-slate-200 text-xs">
-                        Bảng xem trước dữ liệu:
+                        {t.toolsPreviewTableLabel}
                       </span>
                       <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
-                        Hiển thị {Math.min(10, splitRows.length)} / {splitRows.length} dòng
+                        {t.toolsShowingRowsTemplate.replace('{shown}', String(Math.min(10, splitRows.length))).replace('{total}', String(splitRows.length))}
                       </span>
                     </div>
 
@@ -693,14 +739,14 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
                           onClick={() => setOutputFields([...availableOutputFields])}
                           className="px-2 py-0.5 rounded bg-[#f0f3f2] dark:bg-[#282a30] text-slate-700 dark:text-slate-300 hover:text-emerald-600 font-semibold cursor-pointer"
                         >
-                          Chọn tất cả
+                          {t.toolsSelectAllBtn}
                         </button>
                         <button
                           type="button"
                           onClick={() => setOutputFields(['Username'])}
                           className="px-2 py-0.5 rounded bg-[#f0f3f2] dark:bg-[#282a30] text-slate-700 dark:text-slate-300 hover:text-emerald-600 font-semibold cursor-pointer"
                         >
-                          Chỉ Username
+                          {t.toolsSelectUsernameOnlyBtn}
                         </button>
                         <button
                           type="button"
@@ -714,7 +760,7 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
                           onClick={() => setOutputFields([])}
                           className="px-2 py-0.5 rounded text-rose-600 dark:text-rose-400 hover:underline font-semibold cursor-pointer"
                         >
-                          Bỏ chọn
+                          {t.toolsDeselectBtn}
                         </button>
                       </div>
                     </div>
@@ -754,7 +800,7 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
                         </label>
                         {splitOutputLines.length > 0 && (
                           <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
-                            ({splitOutputLines.length} dòng)
+                            ({splitOutputLines.length} {t.toolsLinesCountSuffix})
                           </span>
                         )}
                       </div>
@@ -766,17 +812,26 @@ export const ToolsPage: React.FC<ToolsPageProps> = ({ language, onBackToStore })
                           className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-3 py-1.5 rounded-lg transition flex items-center gap-1 text-xs disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer shadow-xs"
                         >
                           {copiedSplitOutput ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                          <span>{copiedSplitOutput ? t.pdCopiedLabel : 'Sao chép kết quả'}</span>
+                          <span>{copiedSplitOutput ? t.pdCopiedLabel : t.toolsCopyOutputBtn}</span>
                         </button>
 
                         <button
                           onClick={handleDownloadSplitOutput}
                           disabled={splitOutputLines.length === 0}
                           className="bg-[#f0f3f2] dark:bg-[#22242a] hover:bg-slate-200 hover:dark:bg-[#2c2f37] border border-[#e2e6e5] dark:border-[#30333b] text-slate-700 dark:text-slate-200 font-semibold px-2.5 py-1.5 rounded-lg transition flex items-center gap-1 text-xs disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
-                          title="Tải về máy file .txt"
+                          title={t.toolsDownloadTxtTooltip}
                         >
                           <Download className="w-3.5 h-3.5" />
-                          <span>Tải .TXT</span>
+                          <span>{t.toolsDownloadTxtBtn}</span>
+                        </button>
+
+                        <button
+                          onClick={() => setSplitRows(null)}
+                          className="text-rose-600 dark:text-rose-400 hover:text-rose-700 font-semibold px-2.5 py-1.5 rounded-lg transition flex items-center gap-1 text-xs cursor-pointer"
+                          title={t.toolsClearResultTooltip}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>{t.toolsClearResultBtn}</span>
                         </button>
                       </div>
                     </div>

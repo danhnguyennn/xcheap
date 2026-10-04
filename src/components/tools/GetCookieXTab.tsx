@@ -106,12 +106,12 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
 
     const initialResults: CookieResult[] = lines.map((line, idx) => {
       const parsed = parseXTokens(line);
-      const label = parsed.username || line.split('|')[0] || `Dòng #${idx + 1}`;
+      const label = parsed.username || line.split('|')[0] || t.toolsLineNumberTemplate.replace('{n}', String(idx + 1));
       return {
         id: idx + 1,
         input: line,
         username: parsed.username,
-        outputLine: `${label} | Đang xử lý...`,
+        outputLine: `${label} | ${t.toolsProcessingSuffix}`,
         cookie: null,
         status: 'PROCESSING',
       };
@@ -155,10 +155,10 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
               id: index + 1,
               input: line,
               username: parsed.username,
-              outputLine: `${itemLabel} | Thất bại`,
+              outputLine: `${itemLabel} | ${t.toolsFailedSuffix}`,
               cookie: null,
               status: 'ERROR',
-              error: 'Thất bại',
+              error: t.toolsFailedSuffix,
             };
           }
           return next;
@@ -170,10 +170,10 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
             id: index + 1,
             input: line,
             username: parsed.username,
-            outputLine: `${itemLabel} | Thất bại`,
+            outputLine: `${itemLabel} | ${t.toolsFailedSuffix}`,
             cookie: null,
             status: 'ERROR',
-            error: 'Thất bại',
+            error: t.toolsFailedSuffix,
           };
           return next;
         });
@@ -242,10 +242,10 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
         <div className="flex items-center justify-between gap-2 mb-1 flex-wrap">
           <label className="font-bold text-slate-800 dark:text-slate-200 text-xs flex items-center gap-1.5">
             <Cookie className="w-3.5 h-3.5 text-amber-500" />
-            <span>Danh sách tài khoản X (Twitter):</span>
+            <span>{t.toolsGetCookieInputLabel}</span>
           </label>
           <span className="text-[11px] text-slate-500 dark:text-slate-400 font-mono">
-            {lines.length} dòng
+            {lines.length} {t.toolsLinesCountSuffix}
           </span>
         </div>
 
@@ -258,7 +258,7 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
           className="w-full bg-[#f5f6f6] dark:bg-[#16181b] border border-[#e2e6e5] dark:border-[#30333b] rounded-xl p-3 font-mono text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-emerald-500 disabled:opacity-60"
         />
         <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">
-          Định dạng: <code className="text-emerald-700 dark:text-emerald-300 font-mono">username|oauth_token|oauth_token_secret</code>, mỗi tài khoản 1 dòng
+          {t.toolsFormatLabel} <code className="text-emerald-700 dark:text-emerald-300 font-mono">username|oauth_token|oauth_token_secret</code>, {t.toolsOneAccountPerLineSuffix}
         </p>
       </div>
 
@@ -271,7 +271,7 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
             className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-bold px-4 py-2 rounded-xl text-xs flex items-center gap-2 transition cursor-pointer shadow-sm"
           >
             <Play className="w-3.5 h-3.5 fill-current" />
-            <span>Bắt Đầu Get Cookie X</span>
+            <span>{t.toolsGetCookieStartBtn}</span>
           </button>
         ) : (
           <button
@@ -279,7 +279,7 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
             className="bg-rose-600 hover:bg-rose-500 text-white font-bold px-4 py-2 rounded-xl text-xs flex items-center gap-2 transition cursor-pointer shadow-sm"
           >
             <Square className="w-3.5 h-3.5 fill-current" />
-            <span>Dừng Lại ({processedCount}/{lines.length})</span>
+            <span>{t.toolsStopBtnTemplate.replace('{current}', String(processedCount)).replace('{total}', String(lines.length))}</span>
           </button>
         )}
 
@@ -292,7 +292,7 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
             }}
             className="px-3 py-2 rounded-xl text-xs font-semibold bg-[#e7ebe9] dark:bg-[#282a30] text-slate-700 dark:text-slate-300 hover:bg-[#dee2e0] hover:dark:bg-[#32353d] transition cursor-pointer"
           >
-            Xóa Dữ Liệu
+            {t.toolsClearDataBtn}
           </button>
         )}
       </div>
@@ -303,14 +303,14 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 flex-wrap">
               <span className="text-xs font-bold text-slate-900 dark:text-slate-100">
-                Kết Quả Get Cookie:
+                {t.toolsGetCookieResultsLabel}
               </span>
               <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30">
-                Thành công: {successCount}
+                {t.toolsSuccessCountTemplate.replace('{n}', String(successCount))}
               </span>
               {errorCount > 0 && (
                 <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-500/15 text-rose-700 dark:text-rose-400 border border-rose-500/30">
-                  Thất bại: {errorCount}
+                  {t.toolsFailCountTemplate.replace('{n}', String(errorCount))}
                 </span>
               )}
             </div>
@@ -320,17 +320,17 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
                 <button
                   onClick={handleCopyOnlyCookies}
                   className="text-emerald-700 dark:text-emerald-300 hover:text-slate-900 hover:dark:text-slate-100 text-xs font-semibold flex items-center gap-1.5 bg-[#f2f4f3] dark:bg-[#1a1b1f] px-2.5 py-1.5 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] cursor-pointer"
-                  title="Copy danh sách có cookie"
+                  title={t.toolsCopyValidCookiesTooltip}
                 >
                   {copiedOnlyCookies ? (
                     <>
                       <Check className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
-                      <span>Đã chép Cookie</span>
+                      <span>{t.toolsCopiedCookieLabel}</span>
                     </>
                   ) : (
                     <>
                       <Copy className="w-3.5 h-3.5" />
-                      <span>Copy Cookie Hợp Lệ</span>
+                      <span>{t.toolsCopyValidCookiesBtn}</span>
                     </>
                   )}
                 </button>
@@ -340,17 +340,17 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
                 <button
                   onClick={handleCopyFailed}
                   className="text-rose-700 dark:text-rose-300 hover:text-slate-900 hover:dark:text-slate-100 text-xs font-semibold flex items-center gap-1.5 bg-[#f2f4f3] dark:bg-[#1a1b1f] px-2.5 py-1.5 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] cursor-pointer"
-                  title="Copy danh sách thất bại"
+                  title={t.toolsCopyFailedTooltip}
                 >
                   {copiedFailed ? (
                     <>
                       <Check className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400" />
-                      <span>Đã chép Thất Bại</span>
+                      <span>{t.toolsCopiedFailedLabel}</span>
                     </>
                   ) : (
                     <>
                       <Copy className="w-3.5 h-3.5" />
-                      <span>Copy Thất Bại</span>
+                      <span>{t.toolsCopyFailedBtn}</span>
                     </>
                   )}
                 </button>
@@ -359,7 +359,7 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
               <button
                 onClick={handleCopyAll}
                 className="text-slate-700 dark:text-slate-300 hover:text-slate-900 hover:dark:text-slate-100 text-xs font-semibold flex items-center gap-1.5 bg-[#f2f4f3] dark:bg-[#1a1b1f] px-2.5 py-1.5 rounded-lg border border-[#e2e6e5] dark:border-[#30333b] cursor-pointer"
-                title="Copy tất cả"
+                title={t.toolsCopyAllBtn || 'Copy Tất Cả'}
               >
                 {copiedAll ? (
                   <>
@@ -399,7 +399,7 @@ export const GetCookieXTab: React.FC<GetCookieXTabProps> = ({ language }) => {
                         : 'bg-rose-500/15 text-rose-700 dark:text-rose-400 border border-rose-500/30'
                     }`}
                   >
-                    {isSuccess ? 'THÀNH CÔNG' : isProcessing ? 'ĐANG XỬ LÝ' : 'THẤT BÀI'}
+                    {isSuccess ? t.toolsSuccessStatusBadge : isProcessing ? t.toolsProcessingStatusBadge : t.toolsFailedStatusBadge}
                   </span>
 
                   <span
