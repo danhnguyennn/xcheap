@@ -453,6 +453,7 @@ export default function App() {
               fetchProducts();
             }}
             onRequireLogin={() => navigate('login')}
+            onRefreshUser={fetchUser}
           />
         ) : (
           <>

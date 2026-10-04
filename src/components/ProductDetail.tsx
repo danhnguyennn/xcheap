@@ -35,6 +35,10 @@ interface ProductDetailProps {
   onOpenTools: () => void;
   onPurchaseSuccess: (orderData: any) => void;
   onRequireLogin: () => void;
+  // Placing or cancelling a pre-order now moves real money (held amount is
+  // deducted/refunded immediately — see server.ts) just like a checkout
+  // does, so it needs the same balance refresh afterward.
+  onRefreshUser: () => void;
 }
 
 const ProductDetailContent: React.FC<ProductDetailProps> = ({
@@ -47,6 +51,7 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
   onOpenTools,
   onPurchaseSuccess,
   onRequireLogin,
+  onRefreshUser,
 }) => {
   const t = translations[language];
 
@@ -73,6 +78,18 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
   }, [selectedVariant?.id, liveVariants, language]);
 
   const [quantity, setQuantity] = useState(1);
+  // How many days a pre-order holds its claim before auto-cancelling and
+  // refunding — capped at 14 server-side too (see PREORDER_MAX_DURATION_DAYS
+  // in server.ts), this is just the UI's own matching cap. Defaults to 3,
+  // not the max — most restocks land well within that, and the picker in
+  // the pre-order modal lets the buyer raise it up to 14 if they want longer.
+  const PREORDER_MAX_DAYS = 14;
+  const PREORDER_DEFAULT_DAYS = 3;
+  const [preorderDays, setPreorderDays] = useState(PREORDER_DEFAULT_DAYS);
+  // The pre-order flow is a deliberate confirmation step (it holds real
+  // money right away) — picking quantity/days and confirming happens in its
+  // own modal instead of inline on the page.
+  const [showPreorderModal, setShowPreorderModal] = useState(false);
   const [couponCode, setCouponCode] = useState('');
   const [appliedVoucher, setAppliedVoucher] = useState<{ code: string; discountPercent: number } | null>(null);
   const [discountError, setDiscountError] = useState('');
@@ -324,6 +341,18 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
     return () => clearInterval(interval);
   }, [product.id]);
 
+  // Escape closes the pre-order modal — has to be a document listener, not
+  // an onKeyDown on the backdrop div, since a plain non-focusable div never
+  // actually receives keyboard events.
+  useEffect(() => {
+    if (!showPreorderModal) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !isPreordering) setShowPreorderModal(false);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [showPreorderModal, isPreordering]);
+
   // Price calculation with VIP discount & coupon — CTV/admin no longer get
   // any automatic purchase discount, so this preview must match
   // computeUnitPriceForUser() server-side exactly: only role 'user' with an
@@ -420,9 +449,10 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
     }
   };
 
-  // Đặt trước: không trừ tiền, không giao hàng ngay — chỉ ghi nhận nhu cầu.
-  // Server sẽ tự động trừ tiền + giao tài khoản (xem fulfillPendingPreorders
-  // trong server.ts) ngay khi admin nhập kho đủ hàng cho đúng biến thể này.
+  // Đặt trước: giữ tiền ngay (trừ heldAmount khỏi số dư) nhưng chưa giao
+  // hàng. Server sẽ tự động giao tài khoản (xem fulfillPendingPreorders
+  // trong server.ts) ngay khi admin nhập kho đủ hàng, hoặc tự hủy + hoàn
+  // tiền nếu hết hạn (preorderDays, tối đa 14 ngày) mà vẫn chưa có hàng.
   const handlePreorder = async () => {
     setErrorMessage('');
     if (!user) {
@@ -434,13 +464,15 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
       const res = await fetch(`/api/products/${product.id}/preorder`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ variantId: selectedVariant.id, quantity }),
+        body: JSON.stringify({ variantId: selectedVariant.id, quantity, durationDays: preorderDays }),
       });
       const data = await res.json();
       if (!res.ok) {
         setErrorMessage(data.error || t.pdPreorderError);
       } else {
         await fetchMyPreorders();
+        onRefreshUser();
+        setShowPreorderModal(false);
       }
     } catch (err) {
       setErrorMessage(t.pdCannotConnect);
@@ -453,7 +485,10 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
     setIsPreordering(true);
     try {
       const res = await fetch(`/api/user/preorders/${preorderId}`, { method: 'DELETE' });
-      if (res.ok) await fetchMyPreorders();
+      if (res.ok) {
+        await fetchMyPreorders();
+        onRefreshUser();
+      }
     } catch {
       // Silent — user can just retry the cancel.
     } finally {
@@ -463,9 +498,7 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
 
   // Đơn đặt trước còn hiệu lực (đang chờ hàng, hoặc đã có hàng nhưng số dư
   // chưa đủ để tự giao) cho đúng biến thể đang được chọn.
-  const myPreorderForVariant = myPreorders.find(
-    (p) => p.variantId === selectedVariant.id && (p.status === 'pending' || p.status === 'insufficient_balance')
-  );
+  const myPreorderForVariant = myPreorders.find((p) => p.variantId === selectedVariant.id && p.status === 'pending');
 
   // CTV/admin always write the description in Vietnamese — for any other
   // site language, show the real machine-translated version cached on the
@@ -854,7 +887,12 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
                   type="button"
                   onClick={() => setQuantity(Math.min(selectedVariant.stockCount || 9999, quantity + 1))}
                   className="w-9 h-9 flex items-center justify-center bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-[#dde2e0] dark:border-[#373b43] rounded-lg text-slate-800 dark:text-slate-200 text-lg font-bold disabled:opacity-30 transition"
-                  disabled={quantity >= selectedVariant.stockCount}
+                  // selectedVariant.stockCount is 0 while out of stock (the
+                  // pre-order case) — `quantity >= 0` was always true there,
+                  // so this button was permanently stuck disabled and a
+                  // pre-order could never actually be placed for more than 1.
+                  // Only cap against real stock when there IS real stock.
+                  disabled={selectedVariant.stockCount > 0 && quantity >= selectedVariant.stockCount}
                 >
                   +
                 </button>
@@ -949,37 +987,49 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
             )}
           </div>
 
+
           {/* Action Buttons */}
           <div className="flex flex-col sm:flex-row items-center gap-3">
             {!selectedVariant.inStock || selectedVariant.stockCount === 0 ? (
               myPreorderForVariant ? (
-                // Đã đặt trước rồi — hiện trạng thái thay vì cho bấm lại,
-                // kèm nút hủy nếu muốn đặt trước lại từ đầu.
-                <div className="w-full sm:flex-1 flex items-center justify-between gap-2 bg-amber-50 dark:bg-amber-950/40 border-2 border-amber-500/60 text-amber-800 dark:text-amber-300 text-xs font-semibold py-2.5 px-3.5 rounded-xl shadow-md">
-                  <div className="flex items-center gap-2 min-w-0">
-                    <Clock className="w-4 h-4 flex-shrink-0" />
-                    <span className="truncate">
-                      {myPreorderForVariant.status === 'insufficient_balance'
-                        ? t.pdPreorderInsufficientBalance
-                        : t.pdPreorderPendingTemplate.replace('{n}', String(myPreorderForVariant.quantity))}
+                // Đã đặt trước rồi — hiện trạng thái (số lượng, tiền đã giữ,
+                // còn bao nhiêu ngày trước khi tự hủy) thay vì cho bấm lại,
+                // kèm nút hủy (hoàn tiền ngay) nếu muốn đặt trước lại từ đầu.
+                <div className="w-full sm:flex-1 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 bg-amber-50 dark:bg-amber-950/40 border-2 border-amber-500/60 text-amber-800 dark:text-amber-300 text-xs font-semibold py-2.5 px-3.5 rounded-xl shadow-md">
+                  <div className="flex items-start gap-2 min-w-0">
+                    <Clock className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                    <span className="break-words">
+                      {t.pdPreorderPendingTemplate
+                        .replace('{n}', String(myPreorderForVariant.quantity))
+                        .replace('{amount}', formatMoney(myPreorderForVariant.heldAmount))
+                        .replace(
+                          '{days}',
+                          String(Math.max(0, Math.ceil((new Date(myPreorderForVariant.expiresAt).getTime() - Date.now()) / 86400000)))
+                        )}
                     </span>
                   </div>
                   <button
                     onClick={() => handleCancelPreorder(myPreorderForVariant.id)}
                     disabled={isPreordering}
-                    className="flex-shrink-0 text-[11px] font-bold underline underline-offset-2 hover:text-amber-950 hover:dark:text-amber-100 disabled:opacity-50"
+                    className="flex-shrink-0 self-start sm:self-auto text-[11px] font-bold underline underline-offset-2 hover:text-amber-950 hover:dark:text-amber-100 disabled:opacity-50"
                   >
                     {t.pdPreorderCancelBtn}
                   </button>
                 </div>
               ) : (
                 <button
-                  onClick={handlePreorder}
-                  disabled={isPreordering}
+                  onClick={() => {
+                    setErrorMessage('');
+                    if (!user) {
+                      onRequireLogin();
+                      return;
+                    }
+                    setShowPreorderModal(true);
+                  }}
                   className="w-full sm:flex-1 bg-amber-500 hover:bg-amber-400 text-slate-950 font-black text-sm py-3 rounded-xl flex items-center justify-center gap-2 transition disabled:opacity-50 shadow-md shadow-amber-500/20"
                 >
                   <Clock className="w-4 h-4" />
-                  <span>{isPreordering ? t.pdProcessing : t.pdPreorderButton}</span>
+                  <span>{t.pdPreorderButton}</span>
                 </button>
               )
             ) : (
@@ -1332,6 +1382,196 @@ const ProductDetailContent: React.FC<ProductDetailProps> = ({
               >
                 {t.pdDone}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Pre-order modal — the one place quantity + hold duration are
+          chosen and confirmed. A dedicated dialog rather than inline page
+          controls because this action holds real money immediately (see
+          handlePreorder), so it gets the same explicit-confirmation
+          treatment as the checkout success receipt above. */}
+      {showPreorderModal && (
+        <div
+          className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-3 sm:p-4"
+          onClick={() => !isPreordering && setShowPreorderModal(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="preorder-modal-title"
+            onClick={(e) => e.stopPropagation()}
+            className="animate-modal-pop bg-[#eef0ef] dark:bg-[#202227] border border-[#e1e4e3] dark:border-[#32363e] rounded-2xl max-w-md w-full shadow-2xl overflow-hidden flex flex-col max-h-[92vh]"
+          >
+            {/* Modal Header — product thumbnail for context, same soft
+                gradient treatment as the checkout success header above, just
+                in the site's amber "pre-order" accent instead of emerald. */}
+            <div className="relative flex-shrink-0 bg-gradient-to-b from-amber-500/15 via-amber-500/5 to-transparent px-5 pt-5 pb-4 border-b border-[#e2e6e5] dark:border-[#30333b]">
+              <button
+                onClick={() => setShowPreorderModal(false)}
+                disabled={isPreordering}
+                aria-label={t.pdModalCancelBtn}
+                className="absolute top-3 right-3 text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100 p-1.5 rounded-lg hover:bg-black/5 hover:dark:bg-white/10 transition disabled:opacity-40 focus:outline-none focus:ring-2 focus:ring-amber-500"
+              >
+                ✕
+              </button>
+              <div className="flex items-center gap-3 pr-8">
+                {/* ProductShopArt hardcodes w-full h-full internally, which
+                    wins over a smaller size passed via className (Tailwind
+                    doesn't resolve conflicting utilities by prop order) — a
+                    fixed-size wrapper with overflow-hidden is what actually
+                    constrains it, same trick as everywhere else that needs
+                    this component smaller than its default full-bleed use. */}
+                <div className="w-12 h-12 rounded-xl overflow-hidden flex-shrink-0 shadow-sm">
+                  <ProductShopArt type={product.image} className="w-full h-full" />
+                </div>
+                <div className="min-w-0">
+                  <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wide text-amber-700 dark:text-amber-400 mb-0.5">
+                    <Clock className="w-3 h-3" />
+                    {t.pdPreorderButton}
+                  </span>
+                  <h2 id="preorder-modal-title" className="text-sm font-bold text-slate-900 dark:text-slate-100 truncate">
+                    {product.name}
+                  </h2>
+                  <p className="text-[11px] text-slate-600 dark:text-slate-400 truncate">{selectedVariant.name}</p>
+                </div>
+              </div>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-5 overflow-y-auto space-y-4 text-xs">
+              <p className="text-slate-600 dark:text-slate-400">{t.pdPreorderModalDesc}</p>
+
+              {errorMessage && (
+                <div className="p-2.5 bg-red-50 dark:bg-red-950/70 border border-red-500/50 rounded-lg text-[11px] text-red-800 dark:text-red-200 flex items-center gap-1.5">
+                  <ShieldAlert className="w-3.5 h-3.5 flex-shrink-0" />
+                  <span>{errorMessage}</span>
+                </div>
+              )}
+
+              {/* Quantity — label and stepper share one row (justify-between)
+                  so the row fills the card width symmetrically, matching the
+                  summary card below instead of hugging one side. */}
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <label className="text-xs font-bold text-slate-800 dark:text-slate-200 block">
+                    {t.pdQuantityLabel}
+                  </label>
+                  <span className="text-[11px] text-slate-500 dark:text-slate-500 font-mono">
+                    ${formatMoney(selectedVariant.price)} / {t.pdQuantityLabel.toLowerCase()}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setQuantity(Math.max(1, quantity - 1))}
+                    disabled={quantity <= 1}
+                    className="w-9 h-9 flex items-center justify-center bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-[#dde2e0] dark:border-[#373b43] rounded-lg text-slate-800 dark:text-slate-200 text-lg font-bold disabled:opacity-30 transition focus:outline-none focus:ring-2 focus:ring-amber-500"
+                  >
+                    –
+                  </button>
+                  <input
+                    type="number"
+                    min="1"
+                    value={quantity}
+                    onChange={(e) => {
+                      const val = parseInt(e.target.value);
+                      setQuantity(isNaN(val) || val <= 0 ? 1 : val);
+                    }}
+                    aria-label={t.pdQuantityLabel}
+                    className="w-14 text-center text-sm font-mono font-bold text-slate-900 dark:text-slate-100 bg-[#edf0ef] dark:bg-[#202328] border border-[#dde2e0] dark:border-[#373b43] focus:border-amber-400 rounded-lg py-1.5 focus:outline-none focus:ring-2 focus:ring-amber-500 transition"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setQuantity(quantity + 1)}
+                    className="w-9 h-9 flex items-center justify-center bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-[#dde2e0] dark:border-[#373b43] rounded-lg text-slate-800 dark:text-slate-200 text-lg font-bold transition focus:outline-none focus:ring-2 focus:ring-amber-500"
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
+
+              {/* Hold duration — quick-pick pills for the common choices
+                  (faster than repeated +/- taps) plus a fine-tune stepper
+                  for anything in between, capped at PREORDER_MAX_DAYS. */}
+              <div>
+                <label className="text-xs font-bold text-slate-800 dark:text-slate-200 block mb-1.5">
+                  {t.pdPreorderDaysLabel}
+                </label>
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {[1, 3, 7, 14].map((d) => (
+                      <button
+                        key={d}
+                        type="button"
+                        onClick={() => setPreorderDays(d)}
+                        className={`px-2.5 h-9 rounded-lg text-xs font-bold font-mono transition focus:outline-none focus:ring-2 focus:ring-amber-500 ${
+                          preorderDays === d
+                            ? 'bg-amber-500 text-slate-950 shadow-sm shadow-amber-500/30'
+                            : 'bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-[#dde2e0] dark:border-[#373b43] text-slate-700 dark:text-slate-300'
+                        }`}
+                      >
+                        {d}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="flex items-center gap-1.5 flex-shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => setPreorderDays(Math.max(1, preorderDays - 1))}
+                      disabled={preorderDays <= 1}
+                      className="w-7 h-7 flex items-center justify-center bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-[#dde2e0] dark:border-[#373b43] rounded-lg text-slate-800 dark:text-slate-200 font-bold disabled:opacity-30 transition focus:outline-none focus:ring-2 focus:ring-amber-500"
+                    >
+                      –
+                    </button>
+                    <span className="w-14 text-center text-xs font-mono font-bold text-amber-700 dark:text-amber-400">
+                      {preorderDays} {t.pdPreorderDaysSuffix}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setPreorderDays(Math.min(PREORDER_MAX_DAYS, preorderDays + 1))}
+                      disabled={preorderDays >= PREORDER_MAX_DAYS}
+                      className="w-7 h-7 flex items-center justify-center bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-[#dde2e0] dark:border-[#373b43] rounded-lg text-slate-800 dark:text-slate-200 font-bold disabled:opacity-30 transition focus:outline-none focus:ring-2 focus:ring-amber-500"
+                    >
+                      +
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Held-amount summary — the money-holding confirmation itself */}
+              <div className="bg-amber-50 dark:bg-amber-950/40 border border-amber-500/40 rounded-xl p-3.5 space-y-1.5">
+                <div className="flex items-center justify-between text-slate-700 dark:text-slate-300">
+                  <span>{t.pdQuantityLabel}</span>
+                  <span className="font-mono">${formatMoney(selectedVariant.price)} × {quantity}</span>
+                </div>
+                <div className="flex items-center justify-between font-bold pt-1.5 border-t border-amber-500/30">
+                  <span className="text-amber-800 dark:text-amber-300">{t.pdPreorderHeldAmountLabel}</span>
+                  <span className="text-amber-700 dark:text-amber-400 font-mono text-sm">
+                    ${formatMoney(selectedVariant.price * quantity)}
+                  </span>
+                </div>
+              </div>
+
+              {/* Actions */}
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  onClick={() => setShowPreorderModal(false)}
+                  disabled={isPreordering}
+                  className="flex-1 bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-[#dde2e0] dark:border-[#373b43] text-slate-700 dark:text-slate-300 font-semibold py-2.5 rounded-xl transition disabled:opacity-50 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                >
+                  {t.pdModalCancelBtn}
+                </button>
+                <button
+                  onClick={handlePreorder}
+                  disabled={isPreordering}
+                  className="flex-1 bg-amber-500 hover:bg-amber-400 text-slate-950 font-black py-2.5 rounded-xl flex items-center justify-center gap-1.5 transition disabled:opacity-50 shadow-md shadow-amber-500/20 focus:outline-none focus:ring-2 focus:ring-amber-600"
+                >
+                  <Clock className="w-4 h-4" />
+                  <span>{isPreordering ? t.pdProcessing : t.pdPreorderConfirmBtn}</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>

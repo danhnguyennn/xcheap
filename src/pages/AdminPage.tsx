@@ -90,6 +90,25 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   // tables at once; admin clicks a product's header bar to open just that
   // one.
   const [expandedInventoryProducts, setExpandedInventoryProducts] = useState<Set<string>>(new Set());
+  // Cross-warehouse username search (GET /api/admin/inventory?search=) — so
+  // admin can find one problem account without knowing which product it was
+  // uploaded into, instead of expanding every product one by one.
+  const [inventorySearch, setInventorySearch] = useState('');
+  const [inventorySearchResults, setInventorySearchResults] = useState<any[] | null>(null);
+  const [isSearchingInventory, setIsSearchingInventory] = useState(false);
+  const [inventorySearchTruncated, setInventorySearchTruncated] = useState(false);
+  // Upload (bulk-import) batch history — collapsed by default, loaded only
+  // when admin actually opens it.
+  const [showUploadHistory, setShowUploadHistory] = useState(false);
+  const [uploadHistory, setUploadHistory] = useState<any[]>([]);
+  const [isLoadingUploadHistory, setIsLoadingUploadHistory] = useState(false);
+  // Per-batch detail (the actual imported/duplicate username lists) — fetched
+  // lazily per row only when admin expands it, and cached afterward since a
+  // past batch's content never changes.
+  const [expandedHistoryId, setExpandedHistoryId] = useState<string | null>(null);
+  const [historyDetail, setHistoryDetail] = useState<Record<string, { importedUsernames: string[]; duplicateUsernames: string[] }>>({});
+  const [loadingHistoryDetailId, setLoadingHistoryDetailId] = useState<string | null>(null);
+  const [historyDetailTab, setHistoryDetailTab] = useState<'imported' | 'duplicate'>('imported');
   const [vouchers, setVouchers] = useState<Voucher[]>([]);
   const [productReviews, setProductReviews] = useState<(Review & { productName: string })[]>([]);
   const [reviewEditableMaxRating, setReviewEditableMaxRating] = useState(3);
@@ -153,6 +172,12 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [importVariantId, setImportVariantId] = useState<string>(products[0]?.variants[0]?.id || '');
   const [rawAccountsInput, setRawAccountsInput] = useState('');
   const [isImporting, setIsImporting] = useState(false);
+  // Detail of the most recent bulk import — which usernames actually went
+  // in vs. which were skipped as duplicates — so admin can review a batch
+  // instead of only seeing a total count in the toast. Cleared on the next
+  // import attempt (not kept around once stale).
+  const [lastImportDetail, setLastImportDetail] = useState<{ importedUsernames: string[]; duplicateUsernames: string[] } | null>(null);
+  const [importDetailTab, setImportDetailTab] = useState<'imported' | 'duplicate'>('imported');
 
   // User edit / create state
   const [adjustUserId, setAdjustUserId] = useState('');
@@ -362,6 +387,22 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   // Fetches one product's real account rows (?productId=) — scoped to that
   // product alone, so it's never crowded out by any other product's
   // inventory (see the comment on GET /api/admin/inventory).
+  // Re-fetches only the database-aggregated per-product counts (the summary
+  // list, not any product's real rows) — used after a delete so the "X tài
+  // khoản" counts stay correct without re-running the whole fetchAdminData
+  // multi-endpoint load just for one number.
+  const refreshInventorySummary = async () => {
+    try {
+      const res = await fetch('/api/admin/inventory');
+      if (res.ok) {
+        const data = await res.json();
+        setInventoryByProduct(data.byProduct || []);
+      }
+    } catch (e) {
+      // Silent — summary just stays as it was, admin can switch tabs to force a reload.
+    }
+  };
+
   const loadProductInventoryItems = async (productId: string) => {
     setLoadingInventoryProductIds((prev) => new Set(prev).add(productId));
     try {
@@ -403,6 +444,114 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     // Always fetch fresh on open rather than trusting a stale cache — stock
     // changes often (sales, imports), and this is a cheap, single-product query.
     if (isExpanding) loadProductInventoryItems(productId);
+  };
+
+  const handleInventorySearch = async () => {
+    const q = inventorySearch.trim();
+    if (!q) {
+      setInventorySearchResults(null);
+      return;
+    }
+    setIsSearchingInventory(true);
+    try {
+      const res = await fetch(`/api/admin/inventory?search=${encodeURIComponent(q)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setInventorySearchResults(data.items || []);
+        setInventorySearchTruncated(!!data.truncated);
+      }
+    } catch (e) {
+      // Silent — the search box just stays as-is, admin can retry.
+    } finally {
+      setIsSearchingInventory(false);
+    }
+  };
+
+  const clearInventorySearch = () => {
+    setInventorySearch('');
+    setInventorySearchResults(null);
+  };
+
+  // Pulls one problem account out of the warehouse before anyone buys it —
+  // the server itself refuses this once the item is sold (it's the buyer's
+  // delivered credential at that point), so the button is also hidden for
+  // sold rows here to match.
+  const handleDeleteInventoryItem = async (item: any) => {
+    if (!window.confirm(`Xóa tài khoản "${item.username}" khỏi kho? Hành động này không thể hoàn tác.`)) return;
+    try {
+      const res = await fetch(`/api/admin/inventory/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) {
+        showCopyToast(data.error || 'Không thể xóa tài khoản');
+        return;
+      }
+      showCopyToast(`Đã xóa tài khoản "${item.username}" khỏi kho`);
+      // Refresh whichever view(s) could be showing this row.
+      if (inventorySearchResults) {
+        setInventorySearchResults((prev) => (prev ? prev.filter((i) => i.id !== item.id) : prev));
+      }
+      if (productInventoryItems[item.productId]) {
+        await loadProductInventoryItems(item.productId);
+      }
+      await refreshInventorySummary();
+    } catch (e) {
+      showCopyToast('Lỗi kết nối, không thể xóa tài khoản');
+    }
+  };
+
+  const loadUploadHistory = async () => {
+    setIsLoadingUploadHistory(true);
+    try {
+      const res = await fetch('/api/admin/inventory-upload-history');
+      if (res.ok) {
+        const data = await res.json();
+        setUploadHistory(data.entries || []);
+      }
+    } catch (e) {
+      // Silent — the panel just stays empty, admin can toggle it closed/open to retry.
+    } finally {
+      setIsLoadingUploadHistory(false);
+    }
+  };
+
+  const toggleUploadHistory = () => {
+    const next = !showUploadHistory;
+    setShowUploadHistory(next);
+    if (next) loadUploadHistory();
+  };
+
+  const toggleHistoryDetail = async (entryId: string) => {
+    if (expandedHistoryId === entryId) {
+      setExpandedHistoryId(null);
+      return;
+    }
+    setExpandedHistoryId(entryId);
+    setHistoryDetailTab('imported');
+    if (historyDetail[entryId]) return; // cached — a past batch never changes
+    setLoadingHistoryDetailId(entryId);
+    try {
+      const res = await fetch(`/api/admin/inventory-upload-history/${encodeURIComponent(entryId)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setHistoryDetail((prev) => ({
+          ...prev,
+          [entryId]: { importedUsernames: data.importedUsernames || [], duplicateUsernames: data.duplicateUsernames || [] },
+        }));
+      }
+    } catch (e) {
+      // Silent — the row just stays collapsed/empty, admin can re-toggle to retry.
+    } finally {
+      setLoadingHistoryDetailId(null);
+    }
+  };
+
+  const copyUsernameList = (list: string[], label: string) => {
+    if (list.length === 0) {
+      showCopyToast(`Không có tài khoản ${label}`);
+      return;
+    }
+    navigator.clipboard.writeText(list.join('\n'));
+    showCopyToast(`Đã sao chép ${list.length} username ${label}`);
   };
 
   // Deposit network (crypto_options) management — show/hide, edit its
@@ -693,6 +842,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     }
 
     setIsImporting(true);
+    setLastImportDetail(null);
     try {
       const res = await fetch('/api/admin/stock/bulk-import', {
         method: 'POST',
@@ -707,6 +857,8 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       if (res.ok) {
         const dupText = data.duplicateCount > 0 ? `, bỏ qua ${data.duplicateCount} tài khoản trùng username đã có trong kho` : '';
         showNotification(`✅ Đã nhập thành công ${data.importedCount} tài khoản vào kho${dupText}!`);
+        setLastImportDetail({ importedUsernames: data.importedUsernames || [], duplicateUsernames: data.duplicateUsernames || [] });
+        setImportDetailTab('imported');
         setRawAccountsInput('');
         onRefreshProducts();
         fetchAdminData();
@@ -2668,6 +2820,62 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                   <span>{isImporting ? 'Đang nhập vào kho...' : 'Bắt Đầu Nhập Kho'}</span>
                 </button>
               </div>
+
+              {/* Detail of the batch that was just imported — which usernames
+                  actually went in vs. which were skipped as duplicates,
+                  instead of only a total count in the toast above. */}
+              {lastImportDetail && (
+                <div className="border-t border-[#e0e4e2] dark:border-[#33363e] pt-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setImportDetailTab('imported')}
+                        className={`text-xs font-bold px-2.5 py-1 rounded-lg transition ${
+                          importDetailTab === 'imported'
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-[#e7ebe9] dark:bg-[#282a30] text-slate-600 dark:text-slate-400'
+                        }`}
+                      >
+                        Đã nhập ({lastImportDetail.importedUsernames.length})
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setImportDetailTab('duplicate')}
+                        className={`text-xs font-bold px-2.5 py-1 rounded-lg transition ${
+                          importDetailTab === 'duplicate'
+                            ? 'bg-amber-600 text-white'
+                            : 'bg-[#e7ebe9] dark:bg-[#282a30] text-slate-600 dark:text-slate-400'
+                        }`}
+                      >
+                        Trùng lặp ({lastImportDetail.duplicateUsernames.length})
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setLastImportDetail(null)}
+                      className="text-xs font-semibold text-slate-500 dark:text-slate-500 hover:text-slate-800 hover:dark:text-slate-200"
+                    >
+                      Đóng
+                    </button>
+                  </div>
+
+                  {(() => {
+                    const list = importDetailTab === 'imported' ? lastImportDetail.importedUsernames : lastImportDetail.duplicateUsernames;
+                    return list.length === 0 ? (
+                      <div className="text-center text-xs text-slate-500 dark:text-slate-500 py-4 border border-[#dde2e0] dark:border-[#373b43] rounded-lg">
+                        {importDetailTab === 'imported' ? 'Không có tài khoản nào được nhập' : 'Không có tài khoản nào trùng lặp'}
+                      </div>
+                    ) : (
+                      <div className="max-h-48 overflow-y-auto border border-[#dde2e0] dark:border-[#373b43] rounded-lg p-2 font-mono text-[11px] text-slate-700 dark:text-slate-300 space-y-0.5">
+                        {list.map((u, idx) => (
+                          <div key={idx}>{u}</div>
+                        ))}
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
             </div>
 
             {/* Inventory Inspection — grouped by product then variant instead of
@@ -2681,7 +2889,105 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 <span className="text-xs text-slate-600 dark:text-slate-400">Bấm vào tên sản phẩm để mở/đóng</span>
               </div>
 
-              {inventoryByProduct.length === 0 ? (
+              {/* Cross-warehouse username search — find a problem account to
+                  pull out without having to know which product it's under. */}
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={inventorySearch}
+                  onChange={(e) => setInventorySearch(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleInventorySearch(); }}
+                  placeholder="Tìm username trong toàn bộ kho..."
+                  className="flex-1 bg-[#f5f6f6] dark:bg-[#16181b] border border-[#dee2e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-xs text-slate-800 dark:text-slate-200 focus:border-purple-500 focus:outline-none"
+                />
+                <button
+                  type="button"
+                  onClick={handleInventorySearch}
+                  disabled={isSearchingInventory || !inventorySearch.trim()}
+                  className="bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-purple-500/30 text-purple-700 dark:text-purple-300 font-bold text-xs px-4 py-2 rounded-lg transition disabled:opacity-50 flex items-center gap-1.5"
+                >
+                  <Search className="w-3.5 h-3.5" />
+                  <span>{isSearchingInventory ? 'Đang tìm...' : 'Tìm'}</span>
+                </button>
+                {inventorySearchResults !== null && (
+                  <button
+                    type="button"
+                    onClick={clearInventorySearch}
+                    className="text-xs font-semibold text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100 px-2 py-2"
+                  >
+                    Hủy
+                  </button>
+                )}
+              </div>
+
+              {inventorySearchResults !== null ? (
+                <div className="space-y-2">
+                  <div className="text-xs text-slate-600 dark:text-slate-400">
+                    Tìm thấy {inventorySearchResults.length} kết quả{inventorySearchTruncated ? ' (đã giới hạn 200, thu hẹp từ khóa để xem đủ)' : ''} cho "{inventorySearch}"
+                  </div>
+                  {inventorySearchResults.length === 0 ? (
+                    <div className="text-center text-xs text-slate-500 dark:text-slate-500 py-6 border border-[#dde2e0] dark:border-[#373b43] rounded-lg">
+                      Không tìm thấy tài khoản nào khớp "{inventorySearch}"
+                    </div>
+                  ) : (
+                    <div className="overflow-x-auto border border-[#dde2e0] dark:border-[#373b43] rounded-lg">
+                      <table className="w-full text-left font-mono text-[11px]">
+                        <thead className="bg-[#e9ece9] dark:bg-[#17191d] text-slate-600 dark:text-slate-400 border-b border-[#dee2e0] dark:border-[#363a43]">
+                          <tr>
+                            <th className="px-[5px] py-1.5">Username</th>
+                            <th className="px-[5px] py-1.5">Sản phẩm / Biến thể</th>
+                            <th className="px-[5px] py-1.5 w-10"></th>
+                            <th className="px-[5px] py-1.5 text-right w-24">Trạng thái</th>
+                            <th className="px-[5px] py-1.5 text-right w-10"></th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-[#e4e8e7] dark:divide-[#2d3036]">
+                          {inventorySearchResults.map((item) => (
+                            <tr key={item.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34]">
+                              <td className="px-[5px] py-[2.5px] text-slate-700 dark:text-slate-300">{item.accountMasked}</td>
+                              <td className="px-[5px] py-[2.5px] text-slate-600 dark:text-slate-400 whitespace-nowrap">
+                                {item.productName} / {item.variantName}
+                              </td>
+                              <td className="px-[5px] py-[2.5px] w-10">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    navigator.clipboard.writeText(item.username);
+                                    showCopyToast(`Đã sao chép username "${item.username}"`);
+                                  }}
+                                  title={`Sao chép username "${item.username}" (dùng cho Check Live X)`}
+                                  className="p-1 text-slate-500 dark:text-slate-500 hover:text-emerald-600 hover:dark:text-emerald-400 hover:bg-emerald-50 hover:dark:bg-emerald-950/70 rounded transition"
+                                >
+                                  <Copy className="w-3.5 h-3.5" />
+                                </button>
+                              </td>
+                              <td className="px-[5px] py-[2.5px] text-right w-24">
+                                {item.isSold ? (
+                                  <span className="bg-red-50 dark:bg-red-950/70 text-red-600 dark:text-red-400 px-1.5 py-0.5 rounded text-[10px]">Đã bán</span>
+                                ) : (
+                                  <span className="bg-emerald-50 dark:bg-emerald-950/70 text-emerald-600 dark:text-emerald-400 px-1.5 py-0.5 rounded text-[10px]">Sẵn sàng</span>
+                                )}
+                              </td>
+                              <td className="px-[5px] py-[2.5px] text-right w-10">
+                                {!item.isSold && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDeleteInventoryItem(item)}
+                                    title={`Xóa tài khoản "${item.username}" khỏi kho`}
+                                    className="p-1 text-slate-500 dark:text-slate-500 hover:text-red-600 hover:dark:text-red-400 hover:bg-red-50 hover:dark:bg-red-950/70 rounded transition"
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </button>
+                                )}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              ) : inventoryByProduct.length === 0 ? (
                 <div className="text-center text-xs text-slate-500 dark:text-slate-500 py-6">
                   Kho hàng đang trống. Nhập tài khoản ở form phía trên.
                 </div>
@@ -2798,6 +3104,18 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                                             <span className="bg-emerald-50 dark:bg-emerald-950/70 text-emerald-600 dark:text-emerald-400 px-1.5 py-0.5 rounded text-[10px]">Sẵn sàng</span>
                                           )}
                                         </td>
+                                        <td className="px-[5px] py-[2.5px] text-right w-10">
+                                          {!item.isSold && (
+                                            <button
+                                              type="button"
+                                              onClick={() => handleDeleteInventoryItem(item)}
+                                              title={`Xóa tài khoản "${item.username}" khỏi kho`}
+                                              className="p-1 text-slate-500 dark:text-slate-500 hover:text-red-600 hover:dark:text-red-400 hover:bg-red-50 hover:dark:bg-red-950/70 rounded transition"
+                                            >
+                                              <Trash2 className="w-3.5 h-3.5" />
+                                            </button>
+                                          )}
+                                        </td>
                                       </tr>
                                     ))}
                                   </tbody>
@@ -2838,6 +3156,151 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 })()}
                 </div>
                 </>
+              )}
+            </div>
+
+            {/* Upload (bulk-import) batch history — collapsed by default,
+                independent of orders: what went INTO the warehouse, not
+                what customers bought out of it. */}
+            <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl p-5 shadow space-y-3">
+              <button
+                type="button"
+                onClick={toggleUploadHistory}
+                className="w-full flex items-center justify-between"
+              >
+                <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                  <ChevronRight className={`w-3.5 h-3.5 text-slate-500 dark:text-slate-500 transition-transform ${showUploadHistory ? 'rotate-90' : ''}`} />
+                  <Upload className="w-4 h-4 text-purple-600 dark:text-purple-400" />
+                  <span>Lịch Sử Nhập Kho</span>
+                </h3>
+              </button>
+
+              {showUploadHistory && (
+                isLoadingUploadHistory ? (
+                  <div className="text-center text-xs text-slate-500 dark:text-slate-500 py-6 flex items-center justify-center gap-1.5">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>Đang tải lịch sử...</span>
+                  </div>
+                ) : uploadHistory.length === 0 ? (
+                  <div className="text-center text-xs text-slate-500 dark:text-slate-500 py-6">
+                    Chưa có lượt nhập kho nào.
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto border border-[#dde2e0] dark:border-[#373b43] rounded-lg">
+                    <table className="w-full text-left text-xs min-w-[640px]">
+                      <thead className="bg-[#e9ece9] dark:bg-[#17191d] text-slate-600 dark:text-slate-400 border-b border-[#dee2e0] dark:border-[#363a43]">
+                        <tr>
+                          <th className="p-2.5">Thời gian</th>
+                          <th className="p-2.5">Người nhập</th>
+                          <th className="p-2.5">Sản phẩm / Biến thể</th>
+                          <th className="p-2.5 text-right">Nhập mới</th>
+                          <th className="p-2.5 text-right">Trùng lặp bỏ qua</th>
+                          <th className="p-2.5 text-right">Chi tiết</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-[#e4e8e7] dark:divide-[#2d3036] font-mono text-[11px]">
+                        {uploadHistory.map((entry) => {
+                          const isExpanded = expandedHistoryId === entry.id;
+                          const isLoadingDetail = loadingHistoryDetailId === entry.id;
+                          const detail = historyDetail[entry.id];
+                          return (
+                          <React.Fragment key={entry.id}>
+                          <tr className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34]">
+                            <td className="p-2.5 text-slate-600 dark:text-slate-400 whitespace-nowrap">
+                              {new Date(entry.createdAt).toLocaleString('vi-VN')}
+                            </td>
+                            <td className="p-2.5 text-slate-700 dark:text-slate-300">{entry.uploadedByUsername}</td>
+                            <td className="p-2.5 text-slate-700 dark:text-slate-300 whitespace-nowrap">
+                              {entry.productName} / {entry.variantName}
+                            </td>
+                            <td className="p-2.5 text-right text-emerald-600 dark:text-emerald-400 font-bold">{entry.importedCount}</td>
+                            <td className="p-2.5 text-right text-slate-500 dark:text-slate-500">{entry.duplicateCount}</td>
+                            <td className="p-2.5 text-right">
+                              <button
+                                type="button"
+                                onClick={() => toggleHistoryDetail(entry.id)}
+                                className="text-purple-600 dark:text-purple-400 hover:underline font-semibold inline-flex items-center gap-0.5"
+                              >
+                                <ChevronRight className={`w-3 h-3 transition-transform ${isExpanded ? 'rotate-90' : ''}`} />
+                                Xem
+                              </button>
+                            </td>
+                          </tr>
+                          {isExpanded && (
+                            <tr>
+                              <td colSpan={6} className="p-3 bg-[#f5f6f6] dark:bg-[#1a1b1f]">
+                                {isLoadingDetail || !detail ? (
+                                  <div className="text-center text-[11px] text-slate-500 dark:text-slate-500 py-3 flex items-center justify-center gap-1.5">
+                                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                    <span>Đang tải chi tiết...</span>
+                                  </div>
+                                ) : (
+                                  <div className="space-y-2">
+                                    <div className="flex items-center justify-between">
+                                      <div className="flex items-center gap-1.5">
+                                        <button
+                                          type="button"
+                                          onClick={() => setHistoryDetailTab('imported')}
+                                          className={`text-[11px] font-bold px-2.5 py-1 rounded-lg transition ${
+                                            historyDetailTab === 'imported'
+                                              ? 'bg-emerald-600 text-white'
+                                              : 'bg-[#e7ebe9] dark:bg-[#282a30] text-slate-600 dark:text-slate-400'
+                                          }`}
+                                        >
+                                          Đã nhập ({detail.importedUsernames.length})
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => setHistoryDetailTab('duplicate')}
+                                          className={`text-[11px] font-bold px-2.5 py-1 rounded-lg transition ${
+                                            historyDetailTab === 'duplicate'
+                                              ? 'bg-amber-600 text-white'
+                                              : 'bg-[#e7ebe9] dark:bg-[#282a30] text-slate-600 dark:text-slate-400'
+                                          }`}
+                                        >
+                                          Trùng lặp ({detail.duplicateUsernames.length})
+                                        </button>
+                                      </div>
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          copyUsernameList(
+                                            historyDetailTab === 'imported' ? detail.importedUsernames : detail.duplicateUsernames,
+                                            historyDetailTab === 'imported' ? 'đã nhập' : 'trùng lặp'
+                                          )
+                                        }
+                                        className="text-[11px] font-semibold text-slate-600 dark:text-slate-400 hover:text-purple-600 hover:dark:text-purple-400 inline-flex items-center gap-1"
+                                      >
+                                        <Copy className="w-3 h-3" />
+                                        Sao chép danh sách
+                                      </button>
+                                    </div>
+                                    {(() => {
+                                      const list = historyDetailTab === 'imported' ? detail.importedUsernames : detail.duplicateUsernames;
+                                      return list.length === 0 ? (
+                                        <div className="text-center text-[11px] text-slate-500 dark:text-slate-500 py-3 border border-[#dde2e0] dark:border-[#373b43] rounded-lg">
+                                          {historyDetailTab === 'imported' ? 'Không có tài khoản nào được nhập' : 'Không có tài khoản nào trùng lặp'}
+                                        </div>
+                                      ) : (
+                                        <div className="max-h-48 overflow-y-auto border border-[#dde2e0] dark:border-[#373b43] rounded-lg p-2 text-[11px] text-slate-700 dark:text-slate-300 space-y-0.5">
+                                          {list.map((u: string, idx: number) => (
+                                            <div key={idx}>{u}</div>
+                                          ))}
+                                        </div>
+                                      );
+                                    })()}
+                                  </div>
+                                )}
+                              </td>
+                            </tr>
+                          )}
+                          </React.Fragment>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )
               )}
             </div>
           </div>

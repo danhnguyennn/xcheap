@@ -330,6 +330,36 @@ async function cleanupOldSoldInventory(): Promise<void> {
   }
 }
 
+// A pre-order that's still 'pending' once its own expiresAt (set at
+// placement — see POST /api/products/:id/preorder, capped at
+// PREORDER_MAX_DURATION_DAYS) has passed never got the stock it was waiting
+// on in time. Auto-cancels it and refunds heldAmount straight back to the
+// buyer's balance — the same outcome as a manual cancel, just system-driven.
+// Ownership-flip guarded the same way fulfillPendingPreorders is, so this
+// can never race a stock import that fulfills the same pre-order at nearly
+// the same moment (whichever update actually matches "still pending" wins).
+async function checkExpiredPreorders(): Promise<void> {
+  const preorderCol = db.collection<PreOrder>('preorders');
+  const userCol = db.collection<User>('users');
+  const nowIso = new Date().toISOString();
+  const overdue = await preorderCol.find({ status: 'pending', expiresAt: { $lt: nowIso } });
+  if (overdue.length === 0) return;
+
+  let refundedCount = 0;
+  for (const p of overdue) {
+    const ownership = await preorderCol.updateOne(
+      { id: p.id, status: 'pending' },
+      { $set: { status: 'expired', refundedAt: nowIso } }
+    );
+    if (ownership.matchedCount === 0) continue; // fulfilled/cancelled just before we got to it
+    await userCol.updateOne({ id: p.userId }, { $inc: { balance: p.heldAmount } });
+    refundedCount++;
+  }
+  if (refundedCount > 0) {
+    console.log(`[Preorder] Auto-cancelled and refunded ${refundedCount} expired pre-order(s).`);
+  }
+}
+
 // Earlier versions seeded accounts with a fixed, source-visible password.
 // Any privileged account still using it is effectively open to anyone who has
 // read the code — flag them loudly at every startup until it's changed.
@@ -356,6 +386,13 @@ initializeDatabase()
     cleanupOldSoldInventory().catch((e) => console.error('[Cleanup Error]', e));
     const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // re-check once a day
     setInterval(() => cleanupOldSoldInventory().catch((e) => console.error('[Cleanup Error]', e)), CLEANUP_INTERVAL_MS);
+
+    checkExpiredPreorders().catch((e) => console.error('[Preorder Expiry Error]', e));
+    // Expiry is day-granularity (max 14 days) but real money is held, so this
+    // checks far more often than the inventory cleanup above — an hour's
+    // worst-case delay on a refund is reasonable, a day's would not be.
+    const PREORDER_EXPIRY_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+    setInterval(() => checkExpiredPreorders().catch((e) => console.error('[Preorder Expiry Error]', e)), PREORDER_EXPIRY_CHECK_INTERVAL_MS);
   })
   .catch((e) => console.error('[MongoDB Init Error]', e));
 
@@ -776,8 +813,10 @@ async function importInventoryAccounts(
   productId: string,
   variantId: string,
   rawAccounts: string,
-  uploadedBy: { userId: string; username: string }
-): Promise<{ importedCount: number; duplicateCount: number; duplicateUsernames: string[] }> {
+  uploadedBy: { userId: string; username: string },
+  productName: string,
+  variantName: string
+): Promise<{ importedCount: number; duplicateCount: number; duplicateUsernames: string[]; importedUsernames: string[] }> {
   const lines = rawAccounts.split('\n').map((l) => l.trim()).filter(Boolean);
   const extractUsername = (line: string) => inventoryUsernameKey(line);
 
@@ -802,7 +841,12 @@ async function importInventoryAccounts(
   for (const line of lines) {
     const username = extractUsername(line);
     if (!username || existingUsernames.has(username) || seenInThisBatch.has(username)) {
-      duplicateUsernames.push(username || line);
+      // A username-less line used to fall back to the raw `line` here — fine
+      // while this array was only ever counted for a toast, but now that
+      // admin can actually see this list (see GET .../bulk-import's
+      // response), echoing the raw line back would leak its password/2FA
+      // fields for any malformed paste. A fixed placeholder instead.
+      duplicateUsernames.push(username || '[dòng không hợp lệ]');
       continue;
     }
     seenInThisBatch.add(username);
@@ -827,6 +871,29 @@ async function importInventoryAccounts(
 
   if (newItems.length > 0) {
     await invCol.insertMany(newItems);
+    // One row per upload batch — lets admin review who nhập kho what, when,
+    // and how much, independent of any order (no money/sale involved yet at
+    // this point). Names are denormalized at write time, same reasoning as
+    // Order.productName elsewhere: the product/variant could be renamed or
+    // deleted later without this history becoming unreadable.
+    await db.collection<any>('inventory_upload_history').insertOne({
+      id: `uh_${importedAt}_${batchTag}`,
+      productId,
+      productName,
+      variantId,
+      variantName,
+      uploadedByUserId: uploadedBy.userId,
+      uploadedByUsername: uploadedBy.username,
+      importedCount: newItems.length,
+      duplicateCount: duplicateUsernames.length,
+      // Full lists, not just counts — lets admin re-open this exact batch
+      // later (GET .../inventory-upload-history/:id) to review and copy
+      // which accounts actually went in vs. were skipped, instead of that
+      // detail only existing for a few seconds right after the import runs.
+      importedUsernames: newItems.map((item) => item.usernameKey),
+      duplicateUsernames,
+      createdAt: new Date().toISOString(),
+    });
     // New stock just landed for this exact variant — immediately try to
     // clear any pre-orders waiting on it instead of leaving buyers who
     // already asked to be notified/delivered sitting until the next unrelated
@@ -834,7 +901,12 @@ async function importInventoryAccounts(
     await fulfillPendingPreorders(productId, variantId);
   }
 
-  return { importedCount: newItems.length, duplicateCount: duplicateUsernames.length, duplicateUsernames: duplicateUsernames.slice(0, 30) };
+  return {
+    importedCount: newItems.length,
+    duplicateCount: duplicateUsernames.length,
+    duplicateUsernames,
+    importedUsernames: newItems.map((item) => item.usernameKey),
+  };
 }
 
 // Groups claimed inventory rows by whoever uploaded them into the
@@ -1386,13 +1458,13 @@ async function computeUnitPriceForUser(user: User, listedPrice: number): Promise
 
 // Runs right after new stock is imported for a variant — walks that
 // variant's pending pre-orders oldest-first (FIFO) and auto-delivers as many
-// as the fresh stock covers. Money is only ever taken here, at the moment an
-// account is actually handed over, never when the pre-order was placed. If a
-// stock claim can't cover the next pre-order's full quantity, fulfillment
-// stops there (the remaining stock is left for whichever pre-order needed
-// less, on the next import) rather than letting a later, smaller pre-order
-// jump the queue. If a specific buyer's balance can't cover it at delivery
-// time, that one pre-order is marked so it doesn't block the ones behind it.
+// as the fresh stock covers. Money was already taken when each pre-order was
+// placed (heldAmount/unitPrice locked in then — see POST .../preorder), so
+// delivery here never touches balance again, just claims stock and hands it
+// over at the price that was already charged. If a stock claim can't cover
+// the next pre-order's full quantity, fulfillment stops there (the remaining
+// stock is left for whichever pre-order needed less, on the next import)
+// rather than letting a later, smaller pre-order jump the queue.
 async function fulfillPendingPreorders(productId: string, variantId: string): Promise<void> {
   const preorderCol = db.collection<PreOrder>('preorders');
   const invCol = db.collection<any>('inventory');
@@ -1453,26 +1525,12 @@ async function fulfillPendingPreorders(productId: string, variantId: string): Pr
 
     const buyer = await userCol.findOne({ id: preorder.userId });
     if (!buyer) {
-      // Account no longer exists — nobody to charge or deliver to. Hand the
-      // reserved stock back and close the pre-order instead of leaving those
-      // accounts marked sold with no order behind them.
+      // Account no longer exists — nobody to deliver to, and no balance to
+      // refund the hold into either. Hand the reserved stock back and close
+      // the pre-order instead of leaving those accounts marked sold with no
+      // order behind them.
       await releaseClaimed();
       await preorderCol.updateOne({ id: preorder.id }, { $set: { status: 'cancelled' } });
-      continue;
-    }
-
-    const unitPrice = await computeUnitPriceForUser(buyer, variant.price);
-    const totalPrice = Number((unitPrice * preorder.quantity).toFixed(3));
-
-    const balanceUpdate = await userCol.updateOne(
-      { id: buyer.id, balance: { $gte: totalPrice } },
-      { $inc: { balance: -totalPrice } }
-    );
-    if (balanceUpdate.matchedCount === 0) {
-      // Release the stock back for the next pre-order in line — this buyer's
-      // balance is their problem to fix, not a reason to hold up the queue.
-      await releaseClaimed();
-      await preorderCol.updateOne({ id: preorder.id }, { $set: { status: 'insufficient_balance' } });
       continue;
     }
 
@@ -1488,8 +1546,8 @@ async function fulfillPendingPreorders(productId: string, variantId: string): Pr
       variantId: variant.id,
       variantName: variant.name,
       quantity: preorder.quantity,
-      unitPrice,
-      totalPrice,
+      unitPrice: preorder.unitPrice,
+      totalPrice: preorder.heldAmount,
       accounts: deliveredAccounts,
       createdAt: new Date().toISOString(),
       status: 'completed',
@@ -1727,17 +1785,24 @@ async function notifyAdmin(type: string, title: string, message: string, related
 }
 
 // 6b. Pre-orders — placed against a variant that's currently out of stock.
-// No balance is touched here; the actual charge + delivery only happens
-// later, automatically, inside fulfillPendingPreorders() once an admin
-// imports matching stock (see importInventoryAccounts above).
+// Money IS held here now: unitPrice is locked in and heldAmount deducted
+// from the buyer's balance immediately, atomically (the same balance-guard
+// pattern as checkout, so two concurrent requests can't both pass the
+// balance check and overdraw). Delivery later (fulfillPendingPreorders)
+// never touches money again — it just claims stock and hands it over. If
+// the pre-order expires first (see checkExpiredPreorders), heldAmount is
+// refunded back automatically.
+const PREORDER_MAX_DURATION_DAYS = 14;
+
 app.post('/api/products/:id/preorder', async (req, res) => {
-  const { variantId, quantity = 1 } = req.body;
+  const { variantId, quantity = 1, durationDays } = req.body;
   const user = await getSessionUser(req);
   if (!user) return res.status(401).json({ error: 'Vui lòng đăng nhập để đặt trước' });
 
   const prodCol = db.collection<Product>('products');
   const invCol = db.collection<any>('inventory');
   const preorderCol = db.collection<PreOrder>('preorders');
+  const userCol = db.collection<User>('users');
 
   const product = await prodCol.findOne({ id: req.params.id });
   if (!product) return res.status(404).json({ error: 'Không tìm thấy sản phẩm' });
@@ -1746,8 +1811,12 @@ app.post('/api/products/:id/preorder', async (req, res) => {
   if ((product.isHidden || variant.isHidden) && user.role === 'user') {
     return res.status(404).json({ error: 'Sản phẩm này hiện không được bán.' });
   }
+  if (!isValidPrice(Number(variant.price))) {
+    return res.status(400).json({ error: 'Giá của sản phẩm này đang không hợp lệ — vui lòng liên hệ admin.' });
+  }
 
   const cleanQuantity = Math.max(1, Math.floor(Number(quantity)) || 1);
+  const cleanDurationDays = Math.min(PREORDER_MAX_DURATION_DAYS, Math.max(1, Math.floor(Number(durationDays)) || PREORDER_MAX_DURATION_DAYS));
 
   // Đặt trước chỉ áp dụng khi phân loại này thực sự đang hết hàng — còn hàng
   // thì phải mua bình thường qua /api/orders/checkout (giữ nguyên logic trừ
@@ -1757,21 +1826,38 @@ app.post('/api/products/:id/preorder', async (req, res) => {
     return res.status(400).json({ error: 'Phân loại này vẫn còn hàng — vui lòng đặt mua trực tiếp thay vì đặt trước.' });
   }
 
+  const unitPrice = await computeUnitPriceForUser(user, variant.price);
+  const chargeAmount = Number((unitPrice * cleanQuantity).toFixed(3));
+
+  // Atomic balance-guarded deduction — same shape as checkout's own charge:
+  // the filter itself requires enough balance, so a race between two
+  // requests from the same account can never let both through.
+  const charge = await userCol.updateOne({ id: user.id, balance: { $gte: chargeAmount } }, { $inc: { balance: -chargeAmount } });
+  if (charge.matchedCount === 0) {
+    return res.status(400).json({ error: `Số dư không đủ để đặt trước (cần $${chargeAmount.toFixed(2)}).` });
+  }
+
   // Nếu user đã có 1 đơn đặt trước đang chờ (pending) cho đúng phân loại
-  // này, cộng dồn số lượng vào đơn cũ thay vì tạo thêm bản ghi trùng lặp.
+  // này, cộng dồn số lượng + tiền giữ vào đơn cũ thay vì tạo thêm bản ghi
+  // trùng lặp. Hạn tự hủy (expiresAt) giữ nguyên theo đơn gốc — nạp thêm
+  // không kéo dài thời hạn.
   const existing = await preorderCol.findOne({ userId: user.id, variantId, status: 'pending' });
   if (existing) {
-    await preorderCol.updateOne({ id: existing.id }, { $inc: { quantity: cleanQuantity } });
+    await preorderCol.updateOne(
+      { id: existing.id },
+      { $inc: { quantity: cleanQuantity, heldAmount: chargeAmount }, $set: { unitPrice } }
+    );
     const updated = await preorderCol.findOne({ id: existing.id });
     await notifyAdmin(
       'preorder_placed',
       `Đặt trước thêm: ${product.name}`,
-      `${user.username} vừa đặt trước thêm ${cleanQuantity} tài khoản "${variant.name}" (tổng ${updated?.quantity ?? cleanQuantity}).`,
+      `${user.username} vừa đặt trước thêm ${cleanQuantity} tài khoản "${variant.name}" (tổng ${updated?.quantity ?? cleanQuantity}, đã giữ $${(updated?.heldAmount ?? chargeAmount).toFixed(2)}).`,
       existing.id
     );
     return res.json({ success: true, preorder: updated });
   }
 
+  const nowIso = new Date().toISOString();
   const newPreorder: PreOrder = {
     id: 'pre_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6),
     userId: user.id,
@@ -1781,14 +1867,18 @@ app.post('/api/products/:id/preorder', async (req, res) => {
     variantId: variant.id,
     variantName: variant.name,
     quantity: cleanQuantity,
-    createdAt: new Date().toISOString(),
+    unitPrice,
+    heldAmount: chargeAmount,
+    durationDays: cleanDurationDays,
+    createdAt: nowIso,
+    expiresAt: new Date(Date.now() + cleanDurationDays * 24 * 60 * 60 * 1000).toISOString(),
     status: 'pending',
   };
   await preorderCol.insertOne(newPreorder);
   await notifyAdmin(
     'preorder_placed',
     `Đặt trước mới: ${product.name}`,
-    `${user.username} vừa đặt trước ${cleanQuantity} tài khoản "${variant.name}" — sẽ tự động giao khi có hàng.`,
+    `${user.username} vừa đặt trước ${cleanQuantity} tài khoản "${variant.name}", đã giữ $${chargeAmount.toFixed(2)} — tự hủy và hoàn tiền sau ${cleanDurationDays} ngày nếu chưa có hàng.`,
     newPreorder.id
   );
   res.json({ success: true, preorder: newPreorder });
@@ -1805,19 +1895,30 @@ app.get('/api/user/preorders', async (req, res) => {
   res.json({ preorders: mine });
 });
 
-// A user can cancel their own still-pending pre-order — nothing to refund
-// since a pre-order never held any money in the first place.
+// A user can cancel their own still-pending pre-order — heldAmount goes
+// straight back to their balance since it was deducted up front at
+// placement time (see POST .../preorder).
 app.delete('/api/user/preorders/:id', async (req, res) => {
   const user = await getSessionUser(req);
   if (!user) return res.status(401).json({ error: 'Vui lòng đăng nhập' });
   const preorderCol = db.collection<PreOrder>('preorders');
+  const userCol = db.collection<User>('users');
   const preorder = await preorderCol.findOne({ id: req.params.id });
   if (!preorder || preorder.userId !== user.id) return res.status(404).json({ error: 'Không tìm thấy đơn đặt trước' });
-  if (preorder.status !== 'pending' && preorder.status !== 'insufficient_balance') {
+  if (preorder.status !== 'pending') {
     return res.status(400).json({ error: 'Đơn đặt trước này không còn ở trạng thái chờ để hủy' });
   }
-  await preorderCol.updateOne({ id: req.params.id }, { $set: { status: 'cancelled' } });
-  res.json({ success: true });
+  // Ownership flip first (same race-guard reasoning as fulfillPendingPreorders)
+  // so a cancel racing against fulfillment/expiry can't double-refund.
+  const ownership = await preorderCol.updateOne(
+    { id: req.params.id, status: 'pending' },
+    { $set: { status: 'cancelled', refundedAt: new Date().toISOString() } }
+  );
+  if (ownership.matchedCount === 0) {
+    return res.status(400).json({ error: 'Đơn đặt trước này không còn ở trạng thái chờ để hủy' });
+  }
+  await userCol.updateOne({ id: user.id }, { $inc: { balance: preorder.heldAmount } });
+  res.json({ success: true, refundedAmount: preorder.heldAmount });
 });
 
 // Admin visibility over every pre-order in the system, across all users.
@@ -1992,7 +2093,9 @@ app.get('/api/deposit/wallets', async (req, res) => {
   // A network an admin has hidden from the deposit page must not appear
   // here either — this response is exactly what the deposit modal renders.
   const activeCryptoOptions = (await cryptoOptCol.find()).filter((o) => !o.isHidden);
-  const optionsWithUserAddress = activeCryptoOptions.map((opt) => ({
+  // Same reasoning as the public /api/crypto-options — rpcUrl is never read
+  // by the deposit modal and must not leak to any logged-in user.
+  const optionsWithUserAddress = activeCryptoOptions.map(({ rpcUrl, ...opt }) => ({
     ...opt,
     userDepositAddress: userWallets[opt.id],
   }));
@@ -2263,7 +2366,11 @@ const KNOWN_CRYPTO_NETWORK_IDS: CryptoNetwork[] = ['bsc', 'polygon', 'trc', 'bas
 
 app.get('/api/crypto-options', async (req, res) => {
   const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
-  const options = (await cryptoOptCol.find()).filter((o) => !o.isHidden);
+  // rpcUrl is never read by any storefront/deposit frontend code — only the
+  // admin config panel (its own /api/admin/crypto-options) needs it. This is
+  // a public, unauthenticated endpoint, so a private/paid RPC URL (which can
+  // carry a provider API key in its path) must never leak out through it.
+  const options = (await cryptoOptCol.find()).filter((o) => !o.isHidden).map(({ rpcUrl, ...pub }) => pub);
   res.json({ options });
 });
 
@@ -2350,10 +2457,16 @@ app.post('/api/admin/stock/bulk-import', requireRole('admin', 'ctv'), async (req
     return res.status(403).json({ error: 'Bạn chưa được admin cấp quyền bán sản phẩm này.' });
   }
 
-  const result = await importInventoryAccounts(invCol, productId, variantId, rawAccounts, {
-    userId: uploader.id,
-    username: uploader.username,
-  });
+  const variant = product.variants.find((v) => v.id === variantId);
+  const result = await importInventoryAccounts(
+    invCol,
+    productId,
+    variantId,
+    rawAccounts,
+    { userId: uploader.id, username: uploader.username },
+    product.name,
+    variant?.name || variantId
+  );
 
   // Stock is never stored on the variant — GET /api/products always counts
   // unsold inventory rows live, so there's nothing else to update here.
@@ -2366,9 +2479,17 @@ app.post('/api/admin/stock/bulk-import', requireRole('admin', 'ctv'), async (req
   });
 });
 
-// 12. Delete single inventory item (MongoDB: deleteOne) — admin only
+// 12. Delete single inventory item (MongoDB: deleteOne) — admin only. For
+// pulling a specific bad/problem account out of the warehouse (wrong format,
+// already dead, etc.) before anyone buys it. A row that's already sold must
+// never be deleted here — it's the buyer's purchased credential and the
+// order's own record of what was delivered (see Order.accounts), not spare
+// stock to clean up.
 app.delete('/api/admin/inventory/:id', requireRole('admin'), async (req, res) => {
   const invCol = db.collection<any>('inventory');
+  const item = await invCol.findOne({ id: req.params.id });
+  if (!item) return res.status(404).json({ error: 'Không tìm thấy tài khoản trong kho' });
+  if (item.isSold) return res.status(400).json({ error: 'Không thể xóa tài khoản đã bán' });
   await invCol.deleteOne({ id: req.params.id });
   res.json({ success: true });
 });
@@ -2765,8 +2886,18 @@ app.post('/api/admin/products/:id/authorize-ctv', requireRole('admin'), async (r
 // held for a pre-order, so nothing to refund).
 async function cancelOpenPreorders(filter: { productId?: string; variantId?: string }): Promise<number> {
   const preorderCol = db.collection<PreOrder>('preorders');
-  const open = await preorderCol.find({ ...filter, status: { $in: ['pending', 'insufficient_balance'] } } as any);
-  await preorderCol.bulkWrite(open.map((p) => ({ filter: { id: p.id }, update: { $set: { status: 'cancelled' as const } } })));
+  const userCol = db.collection<User>('users');
+  const open = await preorderCol.find({ ...filter, status: 'pending' } as any);
+  const nowIso = new Date().toISOString();
+  await preorderCol.bulkWrite(
+    open.map((p) => ({ filter: { id: p.id }, update: { $set: { status: 'cancelled' as const, refundedAt: nowIso } } }))
+  );
+  // The product/variant being removed is exactly why these pre-orders can
+  // never be fulfilled now — each buyer's held money goes back to them, same
+  // as a normal cancel.
+  for (const p of open) {
+    await userCol.updateOne({ id: p.userId }, { $inc: { balance: p.heldAmount } });
+  }
   return open.length;
 }
 
@@ -2877,8 +3008,49 @@ app.delete('/api/admin/products/:id/variants/:variantId', requireRole('admin'), 
 // to that one product — its own 5000-row preview cap can never be crowded out
 // by any other product's inventory.
 app.get('/api/admin/inventory', requireRole('admin'), async (req, res) => {
-  const { productId, status } = req.query;
+  const { productId, status, search } = req.query;
   const invCol = db.collection<any>('inventory');
+
+  // Cross-warehouse username search — so admin can find a problem account
+  // (to pull it before anyone buys it) without first having to know which
+  // product it was uploaded into. Matches against the indexed usernameKey,
+  // never loads the full warehouse into memory to do it.
+  const searchText = typeof search === 'string' ? search.trim().toLowerCase() : '';
+  if (searchText) {
+    const escaped = searchText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const query: any = { usernameKey: { $regex: escaped, $options: 'i' } };
+    if (productId) query.productId = productId;
+    if (status === 'sold') query.isSold = true;
+    else if (status === 'available') query.isSold = false;
+
+    const SEARCH_LIMIT = 200;
+    const items = await invCol.find(query, { limit: SEARCH_LIMIT, sort: { createdAt: -1 } });
+    const prodCol = db.collection<Product>('products');
+    const matchedProductIds = [...new Set(items.map((i) => i.productId))];
+    const products = matchedProductIds.length ? await prodCol.find({ id: { $in: matchedProductIds } }) : [];
+    const productById = new Map(products.map((p) => [p.id, p]));
+
+    const results = items.map((item) => {
+      const product = productById.get(item.productId);
+      const variant = product?.variants.find((v) => v.id === item.variantId);
+      return {
+        id: item.id,
+        productId: item.productId,
+        productName: product?.name || item.productId,
+        variantId: item.variantId,
+        variantName: variant?.name || item.variantId,
+        username: item.accountData.split('|')[0].trim(),
+        accountMasked:
+          item.accountData.slice(0, 12) +
+          '...|' +
+          item.accountData.split('|').slice(1, 3).join('|').slice(0, 8) +
+          '...',
+        isSold: item.isSold,
+        createdAt: item.createdAt,
+      };
+    });
+    return res.json({ items: results, truncated: items.length === SEARCH_LIMIT });
+  }
 
   if (productId) {
     const baseQuery: any = { productId };
@@ -2930,6 +3102,46 @@ app.get('/api/admin/inventory', requireRole('admin'), async (req, res) => {
     available: byProduct.reduce((sum, p) => sum + p.available, 0),
     sold: byProduct.reduce((sum, p) => sum + p.sold, 0),
     byProduct,
+  });
+});
+
+// Upload history — one row per bulk-import batch (written in
+// importInventoryAccounts), independent of orders: this is about what was
+// put INTO the warehouse, not what customers bought out of it. Newest first,
+// capped the same way GET /api/orders is — page/limit optional for
+// backward-compatible unpaginated use, real pagination when requested.
+app.get('/api/admin/inventory-upload-history', requireRole('admin'), async (req, res) => {
+  const historyCol = db.collection<any>('inventory_upload_history');
+  // The list view only ever needs the counts — never the full username
+  // lists (which can be thousands of entries long per batch and would bloat
+  // every page load). Full detail is fetched per-row, on demand, via
+  // GET .../inventory-upload-history/:id below.
+  let rows = await historyCol.find({}, { projection: { importedUsernames: 0, duplicateUsernames: 0 } });
+  rows.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+  const rawPage = req.query.page ? parseInt(String(req.query.page), 10) : NaN;
+  const rawLimit = req.query.limit ? parseInt(String(req.query.limit), 10) : NaN;
+  if (!isNaN(rawPage) || !isNaN(rawLimit)) {
+    const page = Number.isFinite(rawPage) && rawPage > 0 ? rawPage : 1;
+    const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 200) : 50;
+    const start = (page - 1) * limit;
+    return res.json({ entries: rows.slice(start, start + limit), total: rows.length, page, limit });
+  }
+
+  res.json({ entries: rows.slice(0, 200), total: rows.length });
+});
+
+// Full detail (the actual imported/duplicate username lists) of one upload
+// batch — fetched lazily when admin opens a row, never as part of the list
+// above, so reviewing one old batch never has to pull every batch's lists
+// over the wire first.
+app.get('/api/admin/inventory-upload-history/:id', requireRole('admin'), async (req, res) => {
+  const historyCol = db.collection<any>('inventory_upload_history');
+  const entry = await historyCol.findOne({ id: req.params.id });
+  if (!entry) return res.status(404).json({ error: 'Không tìm thấy lượt nhập kho này' });
+  res.json({
+    importedUsernames: entry.importedUsernames || [],
+    duplicateUsernames: entry.duplicateUsernames || [],
   });
 });
 
@@ -3537,10 +3749,15 @@ app.post('/api/ctv/products', requireRole('admin'), async (req, res) => {
   // warehouse) instead of silently discarding them.
   let importResult = { importedCount: 0, duplicateCount: 0, duplicateUsernames: [] as string[] };
   if (rawAccounts && typeof rawAccounts === 'string' && rawAccounts.trim()) {
-    importResult = await importInventoryAccounts(invCol, newId, resolvedVariants[0].id, rawAccounts, {
-      userId: ctvUser.id,
-      username: ctvUser.username,
-    });
+    importResult = await importInventoryAccounts(
+      invCol,
+      newId,
+      resolvedVariants[0].id,
+      rawAccounts,
+      { userId: ctvUser.id, username: ctvUser.username },
+      newProduct.name,
+      resolvedVariants[0].name
+    );
   }
 
   res.json({ success: true, product: newProduct, ...importResult });

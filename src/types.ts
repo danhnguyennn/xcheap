@@ -196,10 +196,17 @@ export interface CtvDeduction {
 }
 
 // A "đặt trước" (pre-order) placed against a variant that's currently out of
-// stock — no money changes hands until real inventory shows up and it's
-// auto-fulfilled (see fulfillPendingPreorders in server.ts). It never holds
-// a price: pricing (role/VIP discounts) is only ever computed live, at the
-// moment it's actually fulfilled, exactly like a normal checkout.
+// stock. Unlike the old model, money IS held up front: unitPrice (role/VIP
+// discounts applied) is locked in and heldAmount = unitPrice * quantity is
+// deducted from the buyer's balance the moment the pre-order is placed (see
+// POST /api/products/:id/preorder) — never computed again at delivery time,
+// which also removes the old 'insufficient_balance' status entirely (balance
+// is already guaranteed by the time a pre-order exists). The buyer also
+// chooses how many days to hold the reservation for (durationDays, 1–14) —
+// expiresAt is set once at creation and never extended by a later top-up
+// (see "cộng dồn số lượng" in the same endpoint). A background job
+// (checkExpiredPreorders in server.ts) auto-cancels any pre-order still
+// pending past its expiresAt and refunds heldAmount back to the buyer.
 export interface PreOrder {
   id: string;
   userId: string;
@@ -209,10 +216,17 @@ export interface PreOrder {
   variantId: string;
   variantName: string;
   quantity: number;
+  unitPrice: number;
+  heldAmount: number;
+  durationDays: number;
   createdAt: string;
-  status: 'pending' | 'fulfilled' | 'insufficient_balance' | 'cancelled';
+  expiresAt: string;
+  status: 'pending' | 'fulfilled' | 'cancelled' | 'expired';
   fulfilledAt?: string;
   orderId?: string;
+  // Set on both a user-initiated cancel and a system auto-expire — the two
+  // cases where heldAmount actually goes back to the buyer's balance.
+  refundedAt?: string;
 }
 
 // A real, server-generated event admin needs to see — e.g. a user placing a
