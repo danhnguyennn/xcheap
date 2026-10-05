@@ -4,7 +4,7 @@ import express from 'express';
 import path from 'path';
 import { cryptoOptions } from './src/data/storeData';
 import { getVipTier } from './src/data/vipTiers';
-import { User, UserRole, Product, Order, PreOrder, AdminNotification, DepositTransaction, CryptoNetwork, CryptoOption, WithdrawalRequest, CtvStats, Category, Voucher, Review, ReviewSuggestion, Language, CtvDeduction } from './src/types';
+import { User, UserRole, Product, Order, PreOrder, AdminNotification, DepositTransaction, CryptoNetwork, CryptoOption, WithdrawalRequest, CtvStats, Category, Voucher, Review, ReviewSuggestion, Language, CtvDeduction, AdminAuditLogEntry } from './src/types';
 import { db, generateObjectId, MongoCollection, inventoryUsernameKey } from './server/mongodb';
 import { getOrCreateUserWallet, ensureUserDepositWallets } from './server/walletVault';
 import { sessionMiddleware, getSessionUser, requireAuth, requireRole, hashPassword, verifyPassword, toPublicUser, generateApiKey } from './server/auth';
@@ -380,6 +380,30 @@ async function warnAboutLegacyDefaultPasswords(): Promise<void> {
   }
 }
 
+// Records one privileged admin/CTV action for the audit log — who did what,
+// to what, and when (see AdminAuditLogEntry). Called after a mutation has
+// already succeeded, right before the route sends its response. A logging
+// failure is swallowed rather than thrown — the action itself already went
+// through, and failing the request just because the audit write hiccupped
+// would be worse than a rare missing log entry.
+async function logAdminAction(actor: User, action: string, summary: string, targetId?: string): Promise<void> {
+  try {
+    const logCol = db.collection<AdminAuditLogEntry>('admin_audit_log');
+    await logCol.insertOne({
+      id: 'audit_' + generateObjectId(),
+      actorId: actor.id,
+      actorUsername: actor.username,
+      actorRole: actor.role,
+      action,
+      summary,
+      targetId,
+      createdAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error('[AuditLog] Failed to record action', action, err);
+  }
+}
+
 initializeDatabase()
   .then(() => {
     warnAboutLegacyDefaultPasswords().catch((e) => console.error('[Security check error]', e));
@@ -393,6 +417,16 @@ initializeDatabase()
     // worst-case delay on a refund is reasonable, a day's would not be.
     const PREORDER_EXPIRY_CHECK_INTERVAL_MS = 60 * 60 * 1000;
     setInterval(() => checkExpiredPreorders().catch((e) => console.error('[Preorder Expiry Error]', e)), PREORDER_EXPIRY_CHECK_INTERVAL_MS);
+
+    pollAllDepositsBatch().catch((e) => console.error('[Deposit Poll Error]', e));
+    // 3 minutes: frequent enough that a deposit from someone who never
+    // reopens the deposit modal still lands within a few minutes, but each
+    // tick is just one batched multicall round trip per network (see
+    // multicallBalances) — nowhere near enough request volume to trip a
+    // public RPC endpoint's rate limit, unlike polling every user
+    // individually would be.
+    const DEPOSIT_POLL_INTERVAL_MS = 3 * 60 * 1000;
+    setInterval(() => pollAllDepositsBatch().catch((e) => console.error('[Deposit Poll Error]', e)), DEPOSIT_POLL_INTERVAL_MS);
   })
   .catch((e) => console.error('[MongoDB Init Error]', e));
 
@@ -436,6 +470,12 @@ app.get('/api/user/me', async (req, res) => {
   // Only a user's own /api/user/me response ever carries their real API key
   // back out — every other endpoint returns the key-stripped public shape.
   publicUser.apiKey = user.apiKey;
+  // Just a boolean — never the hash itself. Lets the admin/CTV dashboard
+  // know whether to show the PIN-entry gate (see requireRole) and whether
+  // the account settings UI should offer "change/remove PIN" vs "set PIN".
+  if (user.role === 'admin' || user.role === 'ctv') {
+    publicUser.hasAdminPin = !!user.adminPinHash;
+  }
   res.json({ user: publicUser, totalDeposited, totalSpent });
 });
 
@@ -487,6 +527,68 @@ app.post('/api/auth/change-password', requireAuth(), async (req, res) => {
   await userCol.updateOne({ id: user.id }, { $set: { passwordHash: await hashPassword(newPassword) }, $inc: { authVersion: 1 } });
   const refreshed = await userCol.findOne({ id: user.id });
   if (req.session.userId) req.session.authVersion = refreshed?.authVersion ?? 0;
+  res.json({ success: true });
+});
+
+// Sets (or changes) the opt-in secondary PIN that gates the admin/CTV
+// dashboard for THIS account (see requireRole in server/auth.ts) — requires
+// re-entering the real account password first, same as change-password,
+// since this is a new standing credential being created. Verifies
+// immediately so the account that just set it isn't prompted again in the
+// same session.
+app.post('/api/auth/set-admin-pin', requireAuth(), async (req, res) => {
+  const user = (await getSessionUser(req))!;
+  if (user.role !== 'admin' && user.role !== 'ctv') {
+    return res.status(403).json({ error: 'Chỉ tài khoản admin/CTV mới có thể đặt mã PIN này' });
+  }
+  const { currentPassword, newPin } = req.body;
+  if (!currentPassword || !newPin) {
+    return res.status(400).json({ error: 'Vui lòng nhập đầy đủ mật khẩu hiện tại và mã PIN mới' });
+  }
+  if (!/^\d{4,10}$/.test(String(newPin))) {
+    return res.status(400).json({ error: 'Mã PIN phải gồm 4-10 chữ số' });
+  }
+  if (!user.passwordHash || !(await verifyPassword(currentPassword, user.passwordHash))) {
+    return res.status(401).json({ error: 'Mật khẩu hiện tại không đúng' });
+  }
+  const userCol = db.collection<User>('users');
+  await userCol.updateOne({ id: user.id }, { $set: { adminPinHash: await hashPassword(String(newPin)) } });
+  clearPinFailures(user.id);
+  req.session.adminPinVerified = true;
+  res.json({ success: true });
+});
+
+// Removes the secondary PIN — also gated behind re-entering the real
+// password, so an attacker who only has a stolen/open session can't simply
+// turn the extra protection off.
+app.post('/api/auth/clear-admin-pin', requireAuth(), async (req, res) => {
+  const user = (await getSessionUser(req))!;
+  const { currentPassword } = req.body;
+  if (!currentPassword) return res.status(400).json({ error: 'Vui lòng nhập mật khẩu hiện tại' });
+  if (!user.passwordHash || !(await verifyPassword(currentPassword, user.passwordHash))) {
+    return res.status(401).json({ error: 'Mật khẩu hiện tại không đúng' });
+  }
+  const userCol = db.collection<User>('users');
+  await userCol.updateOne({ id: user.id }, { $unset: { adminPinHash: '' } });
+  res.json({ success: true });
+});
+
+// Checked by the admin/CTV dashboard right after login when GET /api/user/me
+// reports hasAdminPin — on success this is what actually flips
+// req.session.adminPinVerified, which is what requireRole checks from then
+// on for the rest of this browser session.
+app.post('/api/auth/verify-admin-pin', requireAuth(), async (req, res) => {
+  const user = (await getSessionUser(req))!;
+  if (!user.adminPinHash) return res.status(400).json({ error: 'Tài khoản này chưa đặt mã PIN' });
+  if (isPinLocked(user.id)) return res.status(429).json({ error: PIN_LOCKED_MESSAGE });
+
+  const { pin } = req.body;
+  if (!pin || !(await verifyPassword(String(pin), user.adminPinHash))) {
+    recordPinFailure(user.id);
+    return res.status(401).json({ error: 'Mã PIN không đúng' });
+  }
+  clearPinFailures(user.id);
+  req.session.adminPinVerified = true;
   res.json({ success: true });
 });
 
@@ -1929,6 +2031,34 @@ app.get('/api/admin/preorders', requireRole('admin'), async (req, res) => {
   res.json({ preorders: all });
 });
 
+// Admin can force-cancel any user's still-pending pre-order (e.g. the buyer
+// can't be reached, or the product is being discontinued before the normal
+// per-product delete flow runs) — same refund behavior as the buyer's own
+// cancel (DELETE /api/user/preorders/:id), just without the ownership check.
+app.delete('/api/admin/preorders/:id', requireRole('admin'), async (req, res) => {
+  const preorderCol = db.collection<PreOrder>('preorders');
+  const userCol = db.collection<User>('users');
+  const preorder = await preorderCol.findOne({ id: req.params.id });
+  if (!preorder) return res.status(404).json({ error: 'Không tìm thấy đơn đặt trước' });
+  if (preorder.status !== 'pending') {
+    return res.status(400).json({ error: 'Đơn đặt trước này không còn ở trạng thái chờ để hủy' });
+  }
+  // Same ownership-flip guard as every other cancel/fulfill path, so this
+  // can never race a buyer's own cancel or a stock import fulfilling it at
+  // nearly the same moment into a double refund.
+  const ownership = await preorderCol.updateOne(
+    { id: req.params.id, status: 'pending' },
+    { $set: { status: 'cancelled', refundedAt: new Date().toISOString() } }
+  );
+  if (ownership.matchedCount === 0) {
+    return res.status(400).json({ error: 'Đơn đặt trước này không còn ở trạng thái chờ để hủy' });
+  }
+  await userCol.updateOne({ id: preorder.userId }, { $inc: { balance: preorder.heldAmount } });
+  const admin = (await getSessionUser(req))!;
+  await logAdminAction(admin, 'preorder.cancel', `Hủy đơn đặt trước "${preorder.productName}" của ${preorder.username}, hoàn $${preorder.heldAmount}`, preorder.id);
+  res.json({ success: true, refundedAmount: preorder.heldAmount });
+});
+
 // Real admin notifications (currently: a user placing/adding to a
 // pre-order). The header bell polls this instead of showing a fixed,
 // hardcoded badge.
@@ -2078,6 +2208,7 @@ app.post('/api/orders/:orderCode/refund', requireRole('admin', 'ctv'), async (re
     throw err;
   }
 
+  await logAdminAction(actor, 'order.refund', `Hoàn tiền đơn hàng #${order.orderCode} ($${order.totalPrice}) cho ${order.username}`, order.orderCode);
   const updated = await orderCol.findOne({ orderCode: order.orderCode });
   res.json({ success: true, order: updated });
 });
@@ -2160,11 +2291,220 @@ async function findDepositTransactions(
   return null;
 }
 
+// Shared by both the user-triggered check (POST /api/deposit/check-rpc) and
+// the background poller (pollAllDepositsBatch) below — the only difference
+// between them is WHERE onChainBalance/chainHead come from (a single live
+// RPC call vs. a batched multicall result). Credit = how much the wallet's
+// on-chain balance has GROWN since the last time it was observed (see the
+// deposit_checkpoints reasoning at the call sites) — comparing against a
+// per-user+network checkpoint, never lifetime totals, so a sweep never
+// blocks a later deposit from being credited.
+async function creditDepositFromOnChainBalance(
+  user: User,
+  network: CryptoNetwork,
+  cryptoConfig: CryptoOption,
+  userAddress: string,
+  onChainBalance: number,
+  chainHead: number | null
+): Promise<{ creditedNow: number; newBalance: number }> {
+  const userCol = db.collection<User>('users');
+  const depCol = db.collection<DepositTransaction>('deposits');
+  const cpCol = db.collection<any>('deposit_checkpoints');
+
+  const checkpoint = await cpCol.findOne({ userId: user.id, network });
+  const priorDeposits = await depCol.find({ userId: user.id, network });
+  const alreadyCredited = Number(
+    priorDeposits.filter((d) => !String(d.id).startsWith('tx_sim_')).reduce((sum, d) => sum + d.amount, 0).toFixed(3)
+  );
+  const baseline: number = checkpoint ? Number(checkpoint.lastBalance) : alreadyCredited;
+  const newDepositDelta = onChainBalance - baseline;
+
+  let creditedNow = 0;
+  let newBalance = user.balance;
+
+  const previousBlock = checkpoint && typeof checkpoint.lastBlock === 'number' ? checkpoint.lastBlock : null;
+  const checkpointFields: Record<string, any> = { lastBalance: onChainBalance, updatedAt: new Date().toISOString() };
+  if (chainHead !== null) checkpointFields.lastBlock = chainHead;
+  if (checkpoint) {
+    await cpCol.updateOne({ userId: user.id, network }, { $set: checkpointFields });
+  } else {
+    await cpCol.insertOne({ id: `cp_${user.id}_${network}`, userId: user.id, network, ...checkpointFields });
+  }
+
+  // A >=0.001 floor (rather than >0) avoids sub-thousandth floating-point
+  // dust re-triggering a $0.000 "deposit" row on every poll.
+  if (newDepositDelta >= 0.001) {
+    creditedNow = Number(newDepositDelta.toFixed(3));
+    try {
+      await userCol.updateOne({ id: user.id }, { $inc: { balance: creditedNow } });
+      const updatedUser = await userCol.findOne({ id: user.id });
+      newBalance = updatedUser ? updatedUser.balance : Number((user.balance + creditedNow).toFixed(3));
+
+      const rowBase = {
+        userId: user.id,
+        username: user.username,
+        network,
+        tokenSymbol: cryptoConfig.token,
+        walletAddress: userAddress,
+        status: 'confirmed' as const,
+        detectedVia: cryptoConfig.rpcUrl,
+      };
+      const stamp = Date.now();
+      const provisional: DepositTransaction = {
+        id: 'tx_' + stamp,
+        ...rowBase,
+        amount: creditedNow,
+        txHash: '',
+        blockNumber: chainHead ?? 0,
+        timestamp: new Date().toISOString(),
+      };
+      await depCol.insertOne(provisional);
+
+      if (chainHead !== null) {
+        const head = chainHead;
+        const resolveHashes = async () => {
+          try {
+            const attributed = await findDepositTransactions(cryptoConfig, userAddress, creditedNow, head, previousBlock);
+            if (!attributed) return;
+            await depCol.updateOne(
+              { id: provisional.id },
+              { $set: { amount: attributed[0].amount, txHash: attributed[0].txHash, blockNumber: attributed[0].blockNumber } }
+            );
+            for (let i = 1; i < attributed.length; i++) {
+              await depCol.insertOne({
+                id: `tx_${stamp}_${i}`,
+                ...rowBase,
+                amount: attributed[i].amount,
+                txHash: attributed[i].txHash,
+                blockNumber: attributed[i].blockNumber,
+                timestamp: provisional.timestamp,
+              });
+            }
+          } catch (lookupErr) {
+            console.warn(`[Deposit] Could not resolve tx hash for ${creditedNow} ${network} deposit of user ${user.id}:`, lookupErr);
+          }
+        };
+        // Wait for the lookup only briefly so a live caller (the HTTP route)
+        // stays responsive; if it's slow it keeps running in the background
+        // and fills the hash in on the row when it finishes. The background
+        // poller doesn't need this cap for responsiveness but shares it for
+        // simplicity — it already runs detached from any request.
+        await Promise.race([resolveHashes(), new Promise((resolve) => setTimeout(resolve, 8000))]);
+      }
+    } catch (err) {
+      console.error(`[Deposit] Failed to credit ${creditedNow} for user ${user.id} on ${network} after moving checkpoint — needs manual review.`, err);
+      throw err;
+    }
+  }
+
+  return { creditedNow, newBalance };
+}
+
+// Background deposit poller — closes the gap where a user's balance was
+// only ever checked when THEY had the deposit modal open (manual click or
+// its 15s auto-poll while open). Someone who sends funds and never reopens
+// that modal would otherwise sit uncredited indefinitely. Batched via
+// Multicall3 (same contract/pattern already proven in sweep_wallets.py — an
+// ~11-14x speedup there) so checking every user's wallet on a network costs
+// one RPC round trip per chunk of DEPOSIT_POLL_CHUNK addresses, not one call
+// per user — the whole reason this can run as a scheduled job at all without
+// getting the public RPC endpoints (bsc-dataseed, polygon publicnode, base
+// mainnet) rate-limiting or blocking this server.
+const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
+const MULTICALL3_ABI = [
+  'function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) payable returns (tuple(bool success, bytes returnData)[] returnData)',
+];
+const DEPOSIT_POLL_CHUNK = 400;
+// TRC (Tron) is deliberately excluded — its deposit-crediting path was
+// reverted earlier this project and stays out of scope here; only the
+// already-working EVM networks are polled in the background.
+const DEPOSIT_POLL_EVM_NETWORKS: CryptoNetwork[] = ['bsc', 'polygon', 'base'];
+
+async function multicallBalances(cryptoConfig: CryptoOption, addresses: string[]): Promise<Map<string, number>> {
+  const result = new Map<string, number>();
+  if (addresses.length === 0) return result;
+
+  const provider = new ethers.JsonRpcProvider(cryptoConfig.rpcUrl, cryptoConfig.chainId, { staticNetwork: true });
+  const multicall = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL3_ABI, provider);
+  const erc20Interface = new ethers.Interface(['function balanceOf(address) view returns (uint256)']);
+
+  for (let i = 0; i < addresses.length; i += DEPOSIT_POLL_CHUNK) {
+    const chunk = addresses.slice(i, i + DEPOSIT_POLL_CHUNK);
+    const calls = chunk.map((addr) => ({
+      target: cryptoConfig.contractAddress,
+      allowFailure: true,
+      callData: erc20Interface.encodeFunctionData('balanceOf', [addr]),
+    }));
+    try {
+      const raw = (await Promise.race([
+        multicall.aggregate3.staticCall(calls),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Multicall timeout')), 20000)),
+      ])) as { success: boolean; returnData: string }[];
+      chunk.forEach((addr, idx) => {
+        const entry = raw[idx];
+        if (entry?.success && entry.returnData && entry.returnData !== '0x') {
+          const [value] = erc20Interface.decodeFunctionResult('balanceOf', entry.returnData) as unknown as [bigint];
+          result.set(addr.toLowerCase(), Number(ethers.formatUnits(value, cryptoConfig.decimals)));
+        }
+      });
+    } catch (err) {
+      // Leave this chunk's addresses unresolved for this tick — the next
+      // scheduled run retries them. Deliberately no fallback to sequential
+      // per-address calls here: that's exactly the RPC load this batching
+      // exists to avoid, and a 3-minute-later retry costs nothing real.
+      console.warn(`[Deposit Poll] Multicall batch failed for ${cryptoConfig.id} (addresses ${i}-${i + chunk.length}):`, err);
+    }
+  }
+  return result;
+}
+
+async function pollAllDepositsBatch(): Promise<void> {
+  const userCol = db.collection<User>('users');
+  const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
+
+  for (const network of DEPOSIT_POLL_EVM_NETWORKS) {
+    const cryptoConfig = await cryptoOptCol.findOne({ id: network });
+    if (!cryptoConfig || cryptoConfig.isHidden) continue;
+
+    // Only users who already have a deposit wallet for this network (i.e.
+    // have opened the deposit modal at least once) — this job never
+    // force-generates one, same scoping as the user-triggered check.
+    const users = await userCol.find(
+      { [`depositWallets.${network}`]: { $exists: true, $ne: '' } },
+      { projection: { id: 1, username: 1, balance: 1, role: 1, depositWallets: 1 } }
+    );
+    if (users.length === 0) continue;
+
+    let chainHead: number | null = null;
+    try {
+      chainHead = await getChainHead(cryptoConfig, QUICK_RETRY_DELAYS_MS);
+    } catch {
+      // Left null — creditDepositFromOnChainBalance treats that as "chain
+      // head unknown" (checkpoint still updates, just without a block
+      // number to resolve the real tx hash from).
+    }
+
+    const addresses = users.map((u) => u.depositWallets[network]);
+    const balances = await multicallBalances(cryptoConfig, addresses);
+    if (balances.size === 0) continue; // whole batch failed this tick — retried next tick
+
+    for (const user of users) {
+      const addr = user.depositWallets[network];
+      const onChainBalance = balances.get(addr.toLowerCase());
+      if (onChainBalance === undefined) continue; // this address's call failed — retried next tick
+      try {
+        await creditDepositFromOnChainBalance(user, network, cryptoConfig, addr, onChainBalance, chainHead);
+      } catch (err) {
+        console.error(`[Deposit Poll] Failed crediting user ${user.id} on ${network}:`, err);
+      }
+    }
+  }
+}
+
 // 9. Real RPC Check / Poll endpoint
 app.post('/api/deposit/check-rpc', async (req, res) => {
   const { network = 'bsc' } = req.body as { network: CryptoNetwork };
   if (typeof network !== 'string') return res.status(400).json({ error: 'Invalid network' });
-  const userCol = db.collection<User>('users');
   const depCol = db.collection<DepositTransaction>('deposits');
   const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
   const user = await getSessionUser(req);
@@ -2226,115 +2566,20 @@ app.post('/api/deposit/check-rpc', async (req, res) => {
       rpcStatus = 'active';
     }
 
-    // Credit = how much the wallet's on-chain balance has GROWN since the last
-    // time it was observed. The last observed balance is stored per
-    // user+network (deposit_checkpoints), not derived from lifetime credited
-    // totals: comparing against lifetime totals meant that once funds were
-    // swept out of a user's deposit wallet, the on-chain balance sat below the
-    // "already credited" total and every later deposit went uncredited until
-    // it climbed back past it. A drop (sweep/withdrawal) now just moves the
-    // checkpoint down without crediting anything.
-    // Persisted in the DB (never in memory), so a restart can't re-credit an
-    // existing balance. With no checkpoint yet (first check, or accounts that
-    // predate this), fall back to the sum of deposits already recorded — the
-    // old behavior — so nothing already credited is credited twice.
-    const cpCol = db.collection<any>('deposit_checkpoints');
-    const checkpoint = await cpCol.findOne({ userId: user.id, network });
+    // alreadyCredited is only for the response payload below (nothing in
+    // this route relies on it for crediting logic anymore — see
+    // creditDepositFromOnChainBalance, which recomputes its own baseline the
+    // same way so it stays correct independent of whatever this route does).
     const priorDeposits = await depCol.find({ userId: user.id, network });
-    // Rows from the removed "simulated test deposit" tool (id tx_sim_...) were
-    // never real on-chain funds — counting them would inflate the baseline and
-    // swallow that account's first genuine deposit until it exceeded them.
     const alreadyCredited = Number(
       priorDeposits.filter((d) => !String(d.id).startsWith('tx_sim_')).reduce((sum, d) => sum + d.amount, 0).toFixed(3)
     );
-    const baseline: number = checkpoint ? Number(checkpoint.lastBalance) : alreadyCredited;
-    const newDepositDelta = onChainBalance - baseline;
 
     let creditedNow = 0;
     let newBalance = user.balance;
 
     if (rpcOk) {
-      // Move the checkpoint BEFORE crediting: if the process dies between the
-      // two steps the worst case is one under-credited deposit that shows up in
-      // the logs, never the same on-chain funds credited twice.
-      const previousBlock = checkpoint && typeof checkpoint.lastBlock === 'number' ? checkpoint.lastBlock : null;
-      const checkpointFields: Record<string, any> = { lastBalance: onChainBalance, updatedAt: new Date().toISOString() };
-      if (chainHead !== null) checkpointFields.lastBlock = chainHead;
-      if (checkpoint) {
-        await cpCol.updateOne({ userId: user.id, network }, { $set: checkpointFields });
-      } else {
-        await cpCol.insertOne({ id: `cp_${user.id}_${network}`, userId: user.id, network, ...checkpointFields });
-      }
-
-      // A >=0.001 floor (rather than >0) avoids sub-thousandth floating-point
-      // dust re-triggering a $0.000 "deposit" row on every 15-second poll.
-      if (newDepositDelta >= 0.001) {
-        creditedNow = Number(newDepositDelta.toFixed(3));
-        try {
-          await userCol.updateOne({ id: user.id }, { $inc: { balance: creditedNow } });
-          const updatedUser = await userCol.findOne({ id: user.id });
-          newBalance = updatedUser ? updatedUser.balance : Number((user.balance + creditedNow).toFixed(3));
-
-          // The balance credit above is the source of truth for the amount. The
-          // row is written straight away with no hash, so a slow chain lookup
-          // can never delay or lose the credit; the real transaction hash(es)
-          // are then filled in from the token's Transfer events below.
-          const rowBase = {
-            userId: user.id,
-            username: user.username,
-            network,
-            tokenSymbol: cryptoConfig.token,
-            walletAddress: userAddress,
-            status: 'confirmed' as const,
-            detectedVia: cryptoConfig.rpcUrl,
-          };
-          const stamp = Date.now();
-          const provisional: DepositTransaction = {
-            id: 'tx_' + stamp,
-            ...rowBase,
-            amount: creditedNow,
-            txHash: '',
-            blockNumber: chainHead ?? 0,
-            timestamp: new Date().toISOString(),
-          };
-          await depCol.insertOne(provisional);
-
-          if (chainHead !== null) {
-            const head = chainHead;
-            const resolveHashes = async () => {
-              try {
-                const attributed = await findDepositTransactions(cryptoConfig, userAddress, creditedNow, head, previousBlock);
-                if (!attributed) return;
-                await depCol.updateOne(
-                  { id: provisional.id },
-                  { $set: { amount: attributed[0].amount, txHash: attributed[0].txHash, blockNumber: attributed[0].blockNumber } }
-                );
-                for (let i = 1; i < attributed.length; i++) {
-                  await depCol.insertOne({
-                    id: `tx_${stamp}_${i}`,
-                    ...rowBase,
-                    amount: attributed[i].amount,
-                    txHash: attributed[i].txHash,
-                    blockNumber: attributed[i].blockNumber,
-                    timestamp: provisional.timestamp,
-                  });
-                }
-              } catch (lookupErr) {
-                // Best effort: the deposit is already credited and recorded — a
-                // failed hash lookup just leaves its hash empty.
-                console.warn(`[Deposit] Could not resolve tx hash for ${creditedNow} ${network} deposit of user ${user.id}:`, lookupErr);
-              }
-            };
-            // Wait for the lookup only briefly so the deposit check stays
-            // responsive; if it's slow it keeps running in the background and
-            // fills the hash in on the row when it finishes.
-            await Promise.race([resolveHashes(), new Promise((resolve) => setTimeout(resolve, 8000))]);
-          }
-        } catch (err) {
-          console.error(`[Deposit] Failed to credit ${creditedNow} for user ${user.id} on ${network} after moving checkpoint — needs manual review.`, err);
-          throw err;
-        }
-      }
+      ({ creditedNow, newBalance } = await creditDepositFromOnChainBalance(user, network, cryptoConfig, userAddress, onChainBalance, chainHead));
     }
 
     res.json({
@@ -2421,7 +2666,12 @@ app.put('/api/admin/crypto-options/:id', requireRole('admin'), async (req, res) 
 
   // id itself is never editable — it's the join key to CryptoNetwork
   // everywhere else (user.depositWallets, DepositTransaction.network...).
-  const { id: _ignoredId, ...updateFields } = req.body;
+  // _id is Mongo's own immutable document id — GET /api/admin/crypto-options
+  // returns it as part of each option (findOne/find never strip it), and the
+  // admin UI's edit form round-trips the whole fetched object back on save,
+  // so without stripping it here too, $set: { _id: ... } gets rejected by
+  // MongoDB ("would modify the immutable field '_id'") on every real save.
+  const { id: _ignoredId, _id: _ignoredMongoId, ...updateFields } = req.body;
   await cryptoOptCol.updateOne({ id: req.params.id }, { $set: updateFields });
   const updated = await cryptoOptCol.findOne({ id: req.params.id });
   res.json({ success: true, option: updated });
@@ -2429,7 +2679,10 @@ app.put('/api/admin/crypto-options/:id', requireRole('admin'), async (req, res) 
 
 app.delete('/api/admin/crypto-options/:id', requireRole('admin'), async (req, res) => {
   const cryptoOptCol = db.collection<CryptoOption>('crypto_options');
+  const option = await cryptoOptCol.findOne({ id: req.params.id });
   await cryptoOptCol.deleteOne({ id: req.params.id });
+  const admin = (await getSessionUser(req))!;
+  await logAdminAction(admin, 'crypto_option.delete', `Xóa phương thức nạp tiền "${option?.name || req.params.id}" (${option?.networkLabel || ''})`, req.params.id);
   res.json({ success: true });
 });
 
@@ -2491,6 +2744,8 @@ app.delete('/api/admin/inventory/:id', requireRole('admin'), async (req, res) =>
   if (!item) return res.status(404).json({ error: 'Không tìm thấy tài khoản trong kho' });
   if (item.isSold) return res.status(400).json({ error: 'Không thể xóa tài khoản đã bán' });
   await invCol.deleteOne({ id: req.params.id });
+  const admin = (await getSessionUser(req))!;
+  await logAdminAction(admin, 'inventory.delete', `Xóa tài khoản kho hàng khỏi sản phẩm/biến thể "${item.productId}/${item.variantId}"`, req.params.id);
   res.json({ success: true });
 });
 
@@ -2552,6 +2807,8 @@ app.post('/api/admin/users/create', requireRole('admin'), async (req, res) => {
   };
 
   await userCol.insertOne(newUser);
+  const admin = (await getSessionUser(req))!;
+  await logAdminAction(admin, 'user.create', `Tạo tài khoản mới "${cleanUsername}" (${role}), số dư ban đầu $${newUser.balance}`, newId);
   res.json({ success: true, user: toPublicUser(newUser), tempPassword });
 });
 
@@ -2602,6 +2859,15 @@ app.post('/api/admin/users/update', requireRole('admin'), async (req, res) => {
     });
   }
 
+  const admin = (await getSessionUser(req))!;
+  const changeParts: string[] = [];
+  if (newRole) changeParts.push(`đổi quyền thành "${newRole}"`);
+  if (typeof balanceAdjust === 'number' && balanceAdjust !== 0) {
+    changeParts.push(balanceAdjust > 0 ? `cộng $${balanceAdjust}` : `trừ $${Math.abs(balanceAdjust)}`);
+  }
+  if (changeParts.length > 0) {
+    await logAdminAction(admin, 'user.update', `Cập nhật tài khoản "${target.username}": ${changeParts.join(', ')}`, targetUserId);
+  }
   const updated = await userCol.findOne({ id: targetUserId });
   res.json({ success: true, user: updated ? toPublicUser(updated) : null });
 });
@@ -2616,8 +2882,13 @@ app.put('/api/admin/users/:id', requireRole('admin'), async (req, res) => {
   if (typeof balance === 'number') updateFields.balance = Number(balance);
   if (typeof discountPercent === 'number') updateFields.discountPercent = Number(discountPercent);
 
+  const beforeUser = await userCol.findOne({ id });
   await userCol.updateOne({ id }, { $set: updateFields });
   const updatedUser = await userCol.findOne({ id });
+  if (Object.keys(updateFields).length > 0) {
+    const admin = (await getSessionUser(req))!;
+    await logAdminAction(admin, 'user.update', `Cập nhật tài khoản "${beforeUser?.username || id}": ${JSON.stringify(updateFields)}`, id);
+  }
   res.json({ success: true, user: updatedUser ? toPublicUser(updatedUser) : null });
 });
 
@@ -2628,7 +2899,11 @@ app.delete('/api/admin/users/:id', requireRole('admin'), async (req, res) => {
   if (id === sessionUser?.id) {
     return res.status(400).json({ error: 'Không thể xóa tài khoản đang đăng nhập' });
   }
+  const target = await userCol.findOne({ id });
   await userCol.deleteOne({ id });
+  if (sessionUser) {
+    await logAdminAction(sessionUser, 'user.delete', `Xóa tài khoản "${target?.username || id}"`, id);
+  }
   res.json({ success: true });
 });
 
@@ -2730,6 +3005,8 @@ app.delete('/api/admin/categories/:id', requireRole('admin'), async (req, res) =
     });
   }
   await catCol.deleteOne({ id });
+  const admin = (await getSessionUser(req))!;
+  await logAdminAction(admin, 'category.delete', `Xóa danh mục "${existing.name}"`, id);
   res.json({ success: true });
 });
 
@@ -2841,9 +3118,12 @@ app.delete('/api/admin/products/:id', requireRole('admin'), async (req, res) => 
   const prodCol = db.collection<Product>('products');
   const invCol = db.collection<any>('inventory');
 
+  const product = await prodCol.findOne({ id });
   await prodCol.deleteOne({ id });
   await invCol.deleteMany({ productId: id });
   await cancelOpenPreorders({ productId: id });
+  const admin = (await getSessionUser(req))!;
+  await logAdminAction(admin, 'product.delete', `Xóa sản phẩm "${product?.name || id}"`, id);
   res.json({ success: true });
 });
 
@@ -2967,6 +3247,8 @@ app.put('/api/admin/products/:id/variants/:variantId', requireRole('admin'), asy
 
   const badge = computeBestBadge({ price: product.price, originalPrice: product.originalPrice, variants });
   await prodCol.updateOne({ id: product.id }, { $set: { variants, badge } });
+  const admin = (await getSessionUser(req))!;
+  await logAdminAction(admin, 'variant.update', `Sửa biến thể "${variants[idx].name}" của sản phẩm "${product.name}" → giá $${variants[idx].price}`, req.params.variantId);
   res.json({ success: true, variant: variants[idx] });
 });
 
@@ -2992,6 +3274,9 @@ app.delete('/api/admin/products/:id/variants/:variantId', requireRole('admin'), 
   await invCol.deleteMany({ variantId: req.params.variantId, isSold: false });
   await cancelOpenPreorders({ variantId: req.params.variantId });
 
+  const admin = (await getSessionUser(req))!;
+  const deletedVariant = variants.find((v) => v.id === req.params.variantId);
+  await logAdminAction(admin, 'variant.delete', `Xóa biến thể "${deletedVariant?.name || req.params.variantId}" khỏi sản phẩm "${product.name}"`, req.params.variantId);
   res.json({ success: true });
 });
 
@@ -3235,6 +3520,8 @@ app.post('/api/admin/config/fee', requireRole('admin'), async (req, res) => {
   const newFee = Number(parsed.toFixed(1));
   await configCol.updateOne({ key: 'platform' }, { $set: { platformFeePercent: newFee } });
 
+  const admin = (await getSessionUser(req))!;
+  await logAdminAction(admin, 'config.fee', `Đổi phí sàn thành ${newFee}%`);
   res.json({ success: true, platformFeePercent: newFee });
 });
 
@@ -3584,6 +3871,7 @@ app.post('/api/admin/ctv-deductions', requireRole('admin'), async (req, res) => 
     adminUsername: admin.username,
   };
   await dedCol.insertOne(newDeduction);
+  await logAdminAction(admin, 'ctv_deduction.create', `Trừ $${newDeduction.amount} của CTV "${ctv.username}" — lý do: ${cleanReason}`, ctv.id);
   res.json({ success: true, deduction: newDeduction });
 });
 
@@ -3592,6 +3880,32 @@ app.get('/api/admin/ctv-deductions', requireRole('admin'), async (req, res) => {
   const deductions = await dedCol.find();
   deductions.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   res.json({ deductions });
+});
+
+// Admin-only view of every logged admin/CTV action (see logAdminAction) —
+// not exposed to CTV accounts even though some entries are their own
+// actions (refunds), since this also carries every other admin's activity
+// platform-wide. Supports an optional actor/action filter and pagination so
+// the log stays usable once it's months old, without changing the
+// unfiltered/page-1 shape the admin UI's default view relies on.
+app.get('/api/admin/audit-log', requireRole('admin'), async (req, res) => {
+  const logCol = db.collection<AdminAuditLogEntry>('admin_audit_log');
+  let all = await logCol.find();
+  all.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+  const actorFilter = typeof req.query.actor === 'string' ? req.query.actor.trim().toLowerCase() : '';
+  if (actorFilter) {
+    all = all.filter((e) => e.actorUsername.toLowerCase().includes(actorFilter));
+  }
+  const actionFilter = typeof req.query.action === 'string' ? req.query.action.trim() : '';
+  if (actionFilter) {
+    all = all.filter((e) => e.action === actionFilter);
+  }
+
+  const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
+  const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit || '50'), 10) || 50));
+  const start = (page - 1) * limit;
+  res.json({ entries: all.slice(start, start + limit), total: all.length, page, limit });
 });
 
 // 21. Admin: Get all withdrawal requests (MongoDB: find) — admin only
@@ -3612,6 +3926,7 @@ async function transitionWithdrawal(
   id: string,
   next: 'completed' | 'rejected',
   txHash: unknown,
+  admin: User,
   res: express.Response
 ) {
   const wdrCol = db.collection<WithdrawalRequest>('withdrawals');
@@ -3626,17 +3941,24 @@ async function transitionWithdrawal(
   if (result.matchedCount === 0) {
     return res.status(400).json({ error: 'Lệnh rút tiền này đã được xử lý trước đó, không thể đổi trạng thái nữa' });
   }
+  const action = next === 'completed' ? 'withdrawal.complete' : 'withdrawal.reject';
+  const summary = next === 'completed'
+    ? `Xác nhận đã thanh toán lệnh rút $${existing.amount} cho "${existing.username}"`
+    : `Từ chối lệnh rút $${existing.amount} của "${existing.username}"`;
+  await logAdminAction(admin, action, summary, id);
   const updated = await wdrCol.findOne({ id });
   res.json({ success: true, withdrawal: updated });
 }
 
 app.post('/api/admin/withdrawals/:id/complete', requireRole('admin'), async (req, res) => {
-  await transitionWithdrawal(req.params.id, 'completed', req.body?.txHash, res);
+  const admin = (await getSessionUser(req))!;
+  await transitionWithdrawal(req.params.id, 'completed', req.body?.txHash, admin, res);
 });
 
 // Admin: Reject a withdrawal request
 app.post('/api/admin/withdrawals/:id/reject', requireRole('admin'), async (req, res) => {
-  await transitionWithdrawal(req.params.id, 'rejected', undefined, res);
+  const admin = (await getSessionUser(req))!;
+  await transitionWithdrawal(req.params.id, 'rejected', undefined, admin, res);
 });
 
 // The CTV product form only lets a CTV pick a category by its display
@@ -3917,6 +4239,40 @@ function recordCouponFailure(userId: string): void {
 
 const COUPON_LOCKED_MESSAGE = 'Bạn đã thử mã giảm giá sai quá nhiều lần. Vui lòng thử lại sau 15 phút.';
 
+// Same lockout pattern as the coupon guard above, scoped to admin/CTV PIN
+// attempts (POST /api/auth/verify-admin-pin) — a short numeric PIN is much
+// easier to brute-force than a real password, so this is tighter: fewer
+// tries, longer cooldown.
+const PIN_FAIL_LIMIT = 5;
+const PIN_FAIL_WINDOW_MS = 15 * 60 * 1000;
+const pinFailures = new Map<string, { count: number; resetAt: number }>();
+
+function isPinLocked(userId: string): boolean {
+  const entry = pinFailures.get(userId);
+  if (!entry) return false;
+  if (entry.resetAt <= Date.now()) {
+    pinFailures.delete(userId);
+    return false;
+  }
+  return entry.count >= PIN_FAIL_LIMIT;
+}
+
+function recordPinFailure(userId: string): void {
+  const now = Date.now();
+  if (pinFailures.size > 5000) {
+    for (const [key, entry] of pinFailures) if (entry.resetAt <= now) pinFailures.delete(key);
+  }
+  const entry = pinFailures.get(userId);
+  if (!entry || entry.resetAt <= now) pinFailures.set(userId, { count: 1, resetAt: now + PIN_FAIL_WINDOW_MS });
+  else entry.count += 1;
+}
+
+function clearPinFailures(userId: string): void {
+  pinFailures.delete(userId);
+}
+
+const PIN_LOCKED_MESSAGE = 'Bạn đã nhập sai mã PIN quá nhiều lần. Vui lòng thử lại sau 15 phút.';
+
 // 22b. Vouchers CRUD — admin only. CTV no longer create or manage discount
 // codes (they can still redeem one at checkout like any other buyer).
 app.get('/api/vouchers', requireRole('admin'), async (req, res) => {
@@ -3989,6 +4345,8 @@ app.delete('/api/vouchers/:id', requireRole('admin'), async (req, res) => {
   const voucher = await voucherCol.findOne({ id: req.params.id });
   if (!voucher) return res.status(404).json({ error: 'Không tìm thấy voucher' });
   await voucherCol.deleteOne({ id: req.params.id });
+  const admin = (await getSessionUser(req))!;
+  await logAdminAction(admin, 'voucher.delete', `Xóa voucher "${voucher.code}"`, req.params.id);
   res.json({ success: true });
 });
 

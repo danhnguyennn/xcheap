@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Product, ProductVariant, User, Language, UserRole, CryptoNetwork, CryptoOption, Voucher, Review, ReviewSuggestion, Order, CtvDeduction } from '../types';
+import { Product, ProductVariant, User, Language, UserRole, CryptoNetwork, CryptoOption, Voucher, Review, ReviewSuggestion, Order, CtvDeduction, PreOrder, AdminAuditLogEntry } from '../types';
 import { translations } from '../locales/translations';
 import { formatMoney } from '../utils/pricing';
 import { SimpleBarChart, BarChartDatum } from '../components/charts/SimpleBarChart';
@@ -38,7 +38,10 @@ import {
   EyeOff,
   Flame,
   UserCheck,
-  Copy
+  Copy,
+  Clock,
+  KeyRound,
+  History
 } from 'lucide-react';
 
 interface AdminPageProps {
@@ -62,8 +65,16 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   onRefreshUser,
 }) => {
   const t = translations[language];
-  const [activeTab, setActiveTab] = useState<'overview' | 'categories' | 'products' | 'users' | 'inventory' | 'orders' | 'rpc' | 'ctv-fee' | 'vouchers' | 'reviews'>('overview');
-  
+  const [activeTab, setActiveTab] = useState<'overview' | 'categories' | 'products' | 'users' | 'inventory' | 'orders' | 'preorders' | 'rpc' | 'ctv-fee' | 'vouchers' | 'reviews' | 'audit-log'>('overview');
+
+  // Secondary admin PIN gate (opt-in, see server/auth.ts requireRole) — set
+  // the moment the first admin API call comes back 403 with
+  // requiresAdminPin, cleared once the PIN is verified for this session.
+  const [needsAdminPin, setNeedsAdminPin] = useState(false);
+  const [adminPinInput, setAdminPinInput] = useState('');
+  const [verifyingPin, setVerifyingPin] = useState(false);
+  const [adminPinError, setAdminPinError] = useState('');
+
   // Data states
   const [stats, setStats] = useState<any>(null);
   const [allUsers, setAllUsers] = useState<User[]>([]);
@@ -108,9 +119,22 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [expandedHistoryId, setExpandedHistoryId] = useState<string | null>(null);
   const [historyDetail, setHistoryDetail] = useState<Record<string, { importedUsernames: string[]; duplicateUsernames: string[] }>>({});
   const [loadingHistoryDetailId, setLoadingHistoryDetailId] = useState<string | null>(null);
+
+  // Audit log of admin/CTV actions (balance adjust, refund, delete, price
+  // edit, ...) — see GET /api/admin/audit-log. Loaded lazily, only once the
+  // "Nhật Ký" tab is actually opened.
+  const [auditLog, setAuditLog] = useState<AdminAuditLogEntry[]>([]);
+  const [auditLogTotal, setAuditLogTotal] = useState(0);
+  const [auditLogPage, setAuditLogPage] = useState(1);
+  const [auditLogActorFilter, setAuditLogActorFilter] = useState('');
+  const [isLoadingAuditLog, setIsLoadingAuditLog] = useState(false);
+  const AUDIT_LOG_PAGE_SIZE = 50;
   const [historyDetailTab, setHistoryDetailTab] = useState<'imported' | 'duplicate'>('imported');
   const [vouchers, setVouchers] = useState<Voucher[]>([]);
   const [productReviews, setProductReviews] = useState<(Review & { productName: string })[]>([]);
+  const [preorders, setPreorders] = useState<PreOrder[]>([]);
+  const [cancellingPreorderId, setCancellingPreorderId] = useState<string | null>(null);
+  const [preorderStatusFilter, setPreorderStatusFilter] = useState<'all' | PreOrder['status']>('all');
   const [reviewEditableMaxRating, setReviewEditableMaxRating] = useState(3);
   const [reviewSuggestions, setReviewSuggestions] = useState<ReviewSuggestion[]>([]);
   const [newSuggestionText, setNewSuggestionText] = useState<Record<Language, string>>(EMPTY_SUGGESTION_TEXT);
@@ -161,6 +185,37 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [customFeeInput, setCustomFeeInput] = useState<number>(5);
   const [loading, setLoading] = useState(false);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
+  // Replaces window.confirm() for every destructive/irreversible admin
+  // action — the browser-native dialog looks and behaves nothing like the
+  // rest of the app. One shared dialog + helper instead of a one-off modal
+  // per call site.
+  const [confirmDialog, setConfirmDialog] = useState<{ message: React.ReactNode; onConfirm: () => void } | null>(null);
+  const askConfirm = (message: React.ReactNode, onConfirm: () => void) => setConfirmDialog({ message, onConfirm });
+
+  const handleVerifyAdminPin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAdminPinError('');
+    setVerifyingPin(true);
+    try {
+      const res = await fetch('/api/auth/verify-admin-pin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin: adminPinInput }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setNeedsAdminPin(false);
+        setAdminPinInput('');
+        fetchAdminData();
+      } else {
+        setAdminPinError(data.error || 'Mã PIN không đúng');
+      }
+    } catch (err) {
+      setAdminPinError('Lỗi kết nối tới máy chủ');
+    } finally {
+      setVerifyingPin(false);
+    }
+  };
   const [actionError, setActionError] = useState<string | null>(null);
   // Per-row custom top-up amount for the users table — accounts cost $0.4
   // each and buyers purchase in the hundreds/thousands, so a fixed +$10
@@ -172,12 +227,6 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [importVariantId, setImportVariantId] = useState<string>(products[0]?.variants[0]?.id || '');
   const [rawAccountsInput, setRawAccountsInput] = useState('');
   const [isImporting, setIsImporting] = useState(false);
-  // Detail of the most recent bulk import — which usernames actually went
-  // in vs. which were skipped as duplicates — so admin can review a batch
-  // instead of only seeing a total count in the toast. Cleared on the next
-  // import attempt (not kept around once stale).
-  const [lastImportDetail, setLastImportDetail] = useState<{ importedUsernames: string[]; duplicateUsernames: string[] } | null>(null);
-  const [importDetailTab, setImportDetailTab] = useState<'imported' | 'duplicate'>('imported');
 
   // User edit / create state
   const [adjustUserId, setAdjustUserId] = useState('');
@@ -268,6 +317,18 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     setOrdersPage(1);
   }, [orderSearch, orderStatusFilter]);
 
+  // Escape closes the confirm dialog — a document listener, not an onKeyDown
+  // on the backdrop div, since a plain non-focusable div never actually
+  // receives keyboard events (same reasoning as the pre-order modal).
+  useEffect(() => {
+    if (!confirmDialog) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setConfirmDialog(null);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [confirmDialog]);
+
   const showNotification = (successMsg: string | null, errorMsg: string | null = null) => {
     setActionSuccess(successMsg);
     setActionError(errorMsg);
@@ -300,7 +361,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const fetchAdminData = async () => {
     setLoading(true);
     try {
-      const [statsRes, usersRes, catsRes, invRes, feeRes, withRes, voucherRes, reviewsRes, suggestionsRes, cryptoOptsRes, ordersRes, ctvBreakdownRes, ctvDeductionsRes] = await Promise.all([
+      const [statsRes, usersRes, catsRes, invRes, feeRes, withRes, voucherRes, reviewsRes, suggestionsRes, cryptoOptsRes, ordersRes, ctvBreakdownRes, ctvDeductionsRes, preordersRes] = await Promise.all([
         fetch('/api/admin/stats'),
         fetch('/api/admin/users'),
         fetch('/api/categories'),
@@ -314,7 +375,21 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         fetch('/api/admin/orders'),
         fetch('/api/admin/ctv-breakdown'),
         fetch('/api/admin/ctv-deductions'),
+        fetch('/api/admin/preorders'),
       ]);
+
+      // Any of these can come back 403-with-requiresAdminPin at once (they
+      // all go through the same requireRole gate) — checking just the first
+      // one is enough to know the whole batch was blocked the same way.
+      if (statsRes.status === 403) {
+        const body = await statsRes.json().catch(() => ({}));
+        if (body.requiresAdminPin) {
+          setNeedsAdminPin(true);
+          setLoading(false);
+          return;
+        }
+      }
+      setNeedsAdminPin(false);
       fetchChartData(chartPeriod);
 
       if (statsRes.ok) {
@@ -376,6 +451,10 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       if (ctvDeductionsRes.ok) {
         const ctvDeductionsData = await ctvDeductionsRes.json();
         setCtvDeductions(ctvDeductionsData.deductions || []);
+      }
+      if (preordersRes.ok) {
+        const preordersData = await preordersRes.json();
+        setPreorders(preordersData.preorders || []);
       }
     } catch (err) {
       console.error('Failed to load admin data', err);
@@ -476,27 +555,69 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   // the server itself refuses this once the item is sold (it's the buyer's
   // delivered credential at that point), so the button is also hidden for
   // sold rows here to match.
-  const handleDeleteInventoryItem = async (item: any) => {
-    if (!window.confirm(`Xóa tài khoản "${item.username}" khỏi kho? Hành động này không thể hoàn tác.`)) return;
-    try {
-      const res = await fetch(`/api/admin/inventory/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
-      const data = await res.json();
-      if (!res.ok) {
-        showCopyToast(data.error || 'Không thể xóa tài khoản');
-        return;
+  const handleDeleteInventoryItem = (item: any) => {
+    askConfirm(
+      <>
+        Xóa tài khoản <strong className="text-slate-900 dark:text-slate-100">{item.username}</strong> khỏi kho?
+        <div className="text-[11px] text-slate-500 dark:text-slate-500 mt-1">Hành động này không thể hoàn tác.</div>
+      </>,
+      async () => {
+      try {
+        const res = await fetch(`/api/admin/inventory/${encodeURIComponent(item.id)}`, { method: 'DELETE' });
+        const data = await res.json();
+        if (!res.ok) {
+          showCopyToast(data.error || 'Không thể xóa tài khoản');
+          return;
+        }
+        showCopyToast(`Đã xóa tài khoản "${item.username}" khỏi kho`);
+        // Refresh whichever view(s) could be showing this row.
+        if (inventorySearchResults) {
+          setInventorySearchResults((prev) => (prev ? prev.filter((i) => i.id !== item.id) : prev));
+        }
+        if (productInventoryItems[item.productId]) {
+          await loadProductInventoryItems(item.productId);
+        }
+        await refreshInventorySummary();
+      } catch (e) {
+        showCopyToast('Lỗi kết nối, không thể xóa tài khoản');
       }
-      showCopyToast(`Đã xóa tài khoản "${item.username}" khỏi kho`);
-      // Refresh whichever view(s) could be showing this row.
-      if (inventorySearchResults) {
-        setInventorySearchResults((prev) => (prev ? prev.filter((i) => i.id !== item.id) : prev));
+    });
+  };
+
+  // Force-cancels any user's still-pending pre-order and refunds the
+  // heldAmount — for when the buyer can't be reached, or a product is being
+  // discontinued and its pre-orders need clearing manually.
+  const handleAdminCancelPreorder = (preorder: PreOrder) => {
+    askConfirm(
+      <>
+        Hủy đơn đặt trước của <strong className="text-slate-900 dark:text-slate-100">{preorder.username}</strong>?
+        <div className="text-[11px] text-slate-500 dark:text-slate-500 mt-1 truncate">
+          {preorder.productName} / {preorder.variantName}
+        </div>
+        <div className="mt-2 text-amber-600 dark:text-amber-400 font-bold">
+          Hoàn ${formatMoney(preorder.heldAmount || 0)} về số dư user
+        </div>
+      </>,
+      async () => {
+        setCancellingPreorderId(preorder.id);
+        try {
+          const res = await fetch(`/api/admin/preorders/${encodeURIComponent(preorder.id)}`, { method: 'DELETE' });
+          const data = await res.json();
+          if (!res.ok) {
+            showCopyToast(data.error || 'Không thể hủy đơn đặt trước');
+            return;
+          }
+          showCopyToast(`Đã hủy và hoàn $${formatMoney(data.refundedAmount)} cho "${preorder.username}"`);
+          setPreorders((prev) =>
+            prev.map((p) => (p.id === preorder.id ? { ...p, status: 'cancelled', refundedAt: new Date().toISOString() } : p))
+          );
+        } catch (e) {
+          showCopyToast('Lỗi kết nối, không thể hủy đơn đặt trước');
+        } finally {
+          setCancellingPreorderId(null);
+        }
       }
-      if (productInventoryItems[item.productId]) {
-        await loadProductInventoryItems(item.productId);
-      }
-      await refreshInventorySummary();
-    } catch (e) {
-      showCopyToast('Lỗi kết nối, không thể xóa tài khoản');
-    }
+    );
   };
 
   const loadUploadHistory = async () => {
@@ -519,6 +640,31 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     setShowUploadHistory(next);
     if (next) loadUploadHistory();
   };
+
+  const loadAuditLog = async (page: number, actor: string) => {
+    setIsLoadingAuditLog(true);
+    try {
+      const params = new URLSearchParams({ page: String(page), limit: String(AUDIT_LOG_PAGE_SIZE) });
+      if (actor.trim()) params.set('actor', actor.trim());
+      const res = await fetch(`/api/admin/audit-log?${params.toString()}`);
+      if (res.ok) {
+        const data = await res.json();
+        setAuditLog(data.entries || []);
+        setAuditLogTotal(data.total || 0);
+        setAuditLogPage(data.page || page);
+      }
+    } catch (e) {
+      // Silent — the tab just stays empty/stale, admin can retry via the search/refresh button.
+    } finally {
+      setIsLoadingAuditLog(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === 'audit-log') {
+      loadAuditLog(1, auditLogActorFilter);
+    }
+  }, [activeTab]);
 
   const toggleHistoryDetail = async (entryId: string) => {
     if (expandedHistoryId === entryId) {
@@ -575,19 +721,27 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     }
   };
 
-  const handleDeleteCryptoOpt = async (opt: CryptoOption) => {
-    if (!confirm(`Xóa hẳn cổng nạp "${opt.networkLabel}"? Ví đã tạo cho người dùng trên mạng này sẽ không còn hiển thị/kiểm tra được nữa cho tới khi thêm lại.`)) return;
-    try {
-      const res = await fetch(`/api/admin/crypto-options/${opt.id}`, { method: 'DELETE' });
-      if (res.ok) {
-        showNotification(`✅ Đã xóa cổng nạp "${opt.networkLabel}"`);
-        fetchAdminData();
-      } else {
+  const handleDeleteCryptoOpt = (opt: CryptoOption) => {
+    askConfirm(
+      <>
+        Xóa hẳn cổng nạp <strong className="text-slate-900 dark:text-slate-100">{opt.networkLabel}</strong>?
+        <div className="text-[11px] text-slate-500 dark:text-slate-500 mt-1">
+          Ví đã tạo cho người dùng trên mạng này sẽ không còn hiển thị/kiểm tra được nữa cho tới khi thêm lại.
+        </div>
+      </>,
+      async () => {
+      try {
+        const res = await fetch(`/api/admin/crypto-options/${opt.id}`, { method: 'DELETE' });
+        if (res.ok) {
+          showNotification(`✅ Đã xóa cổng nạp "${opt.networkLabel}"`);
+          fetchAdminData();
+        } else {
+          showNotification(null, 'Lỗi xóa cổng nạp');
+        }
+      } catch (e) {
         showNotification(null, 'Lỗi xóa cổng nạp');
       }
-    } catch (e) {
-      showNotification(null, 'Lỗi xóa cổng nạp');
-    }
+    });
   };
 
   const openEditCryptoOpt = (opt: CryptoOption) => {
@@ -690,20 +844,21 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     }
   };
 
-  const handleDeleteVoucher = async (id: string, code: string) => {
-    if (!confirm(`Bạn có chắc muốn xóa mã "${code}"?`)) return;
-    try {
-      const res = await fetch(`/api/vouchers/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        showNotification(`✅ Đã xóa mã "${code}"`);
-        fetchAdminData();
-      } else {
-        const data = await res.json().catch(() => ({}));
-        showNotification(null, data.error || 'Lỗi xóa voucher');
+  const handleDeleteVoucher = (id: string, code: string) => {
+    askConfirm(<>Xóa mã giảm giá <strong className="text-slate-900 dark:text-slate-100">{code}</strong>?</>, async () => {
+      try {
+        const res = await fetch(`/api/vouchers/${id}`, { method: 'DELETE' });
+        if (res.ok) {
+          showNotification(`✅ Đã xóa mã "${code}"`);
+          fetchAdminData();
+        } else {
+          const data = await res.json().catch(() => ({}));
+          showNotification(null, data.error || 'Lỗi xóa voucher');
+        }
+      } catch (err) {
+        showNotification(null, 'Lỗi kết nối máy chủ');
       }
-    } catch (err) {
-      showNotification(null, 'Lỗi kết nối máy chủ');
-    }
+    });
   };
 
   const handleAddSuggestion = async () => {
@@ -757,19 +912,20 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     }
   };
 
-  const handleDeleteSuggestion = async (id: string) => {
-    if (!confirm('Bạn có chắc muốn xóa câu gợi ý này?')) return;
-    try {
-      const res = await fetch(`/api/admin/review-comment-suggestions/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        setReviewSuggestions((prev) => prev.filter((s) => s.id !== id));
-        showNotification('✅ Đã xóa câu gợi ý');
-      } else {
-        showNotification(null, 'Lỗi xóa câu gợi ý');
+  const handleDeleteSuggestion = (id: string) => {
+    askConfirm('Bạn có chắc muốn xóa câu gợi ý này?', async () => {
+      try {
+        const res = await fetch(`/api/admin/review-comment-suggestions/${id}`, { method: 'DELETE' });
+        if (res.ok) {
+          setReviewSuggestions((prev) => prev.filter((s) => s.id !== id));
+          showNotification('✅ Đã xóa câu gợi ý');
+        } else {
+          showNotification(null, 'Lỗi xóa câu gợi ý');
+        }
+      } catch (err) {
+        showNotification(null, 'Lỗi kết nối máy chủ');
       }
-    } catch (err) {
-      showNotification(null, 'Lỗi kết nối máy chủ');
-    }
+    });
   };
 
   const handleUpdateFee = async (newFee: number) => {
@@ -842,7 +998,6 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     }
 
     setIsImporting(true);
-    setLastImportDetail(null);
     try {
       const res = await fetch('/api/admin/stock/bulk-import', {
         method: 'POST',
@@ -857,8 +1012,6 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       if (res.ok) {
         const dupText = data.duplicateCount > 0 ? `, bỏ qua ${data.duplicateCount} tài khoản trùng username đã có trong kho` : '';
         showNotification(`✅ Đã nhập thành công ${data.importedCount} tài khoản vào kho${dupText}!`);
-        setLastImportDetail({ importedUsernames: data.importedUsernames || [], duplicateUsernames: data.duplicateUsernames || [] });
-        setImportDetailTab('imported');
         setRawAccountsInput('');
         onRefreshProducts();
         fetchAdminData();
@@ -1012,20 +1165,21 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   };
 
   // Delete Category
-  const handleDeleteCategory = async (id: string, name: string) => {
-    if (!confirm(`Bạn có chắc muốn xóa danh mục "${name}"?`)) return;
-    try {
-      const res = await fetch(`/api/admin/categories/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        showNotification(`✅ Đã xóa danh mục "${name}"`);
-        fetchAdminData();
-      } else {
-        const data = await res.json().catch(() => ({}));
-        showNotification(null, data.error || 'Lỗi xóa danh mục');
+  const handleDeleteCategory = (id: string, name: string) => {
+    askConfirm(<>Xóa danh mục <strong className="text-slate-900 dark:text-slate-100">{name}</strong>?</>, async () => {
+      try {
+        const res = await fetch(`/api/admin/categories/${id}`, { method: 'DELETE' });
+        if (res.ok) {
+          showNotification(`✅ Đã xóa danh mục "${name}"`);
+          fetchAdminData();
+        } else {
+          const data = await res.json().catch(() => ({}));
+          showNotification(null, data.error || 'Lỗi xóa danh mục');
+        }
+      } catch (e) {
+        showNotification(null, 'Lỗi xóa danh mục');
       }
-    } catch (e) {
-      showNotification(null, 'Lỗi xóa danh mục');
-    }
+    });
   };
 
   const resetProductForm = () => {
@@ -1101,18 +1255,19 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   };
 
   // Delete Product
-  const handleDeleteProduct = async (id: string, name: string) => {
-    if (!confirm(`Bạn có chắc muốn xóa sản phẩm "${name}"?`)) return;
-    try {
-      const res = await fetch(`/api/admin/products/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        showNotification(`✅ Đã xóa sản phẩm "${name}"`);
-        onRefreshProducts();
-        fetchAdminData();
+  const handleDeleteProduct = (id: string, name: string) => {
+    askConfirm(<>Xóa sản phẩm <strong className="text-slate-900 dark:text-slate-100">{name}</strong>?</>, async () => {
+      try {
+        const res = await fetch(`/api/admin/products/${id}`, { method: 'DELETE' });
+        if (res.ok) {
+          showNotification(`✅ Đã xóa sản phẩm "${name}"`);
+          onRefreshProducts();
+          fetchAdminData();
+        }
+      } catch (e) {
+        showNotification(null, 'Lỗi xóa sản phẩm');
       }
-    } catch (e) {
-      showNotification(null, 'Lỗi xóa sản phẩm');
-    }
+    });
   };
 
   // Toggle a product on/off the storefront without deleting it — reuses the
@@ -1238,26 +1393,32 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
   // Refunds an order's totalPrice straight back into the buyer's wallet and
   // marks it refunded — money-affecting and not reversible from this UI, so
-  // it's gated behind a plain confirm() rather than firing on one click.
-  const handleRefundOrder = async (order: Order) => {
-    if (!window.confirm(`Hoàn ${formatMoney(order.totalPrice)}$ vào ví "${order.username}" cho đơn #${order.orderCode}?\n\nHành động này không thể hoàn tác.`)) {
-      return;
-    }
-    setRefundingOrderCode(order.orderCode);
-    try {
-      const res = await fetch(`/api/orders/${order.orderCode}/refund`, { method: 'POST' });
-      const data = await res.json();
-      if (res.ok) {
-        showNotification(`✅ Đã hoàn $${formatMoney(order.totalPrice)} cho đơn #${order.orderCode}`);
-        fetchAdminData();
-      } else {
-        showNotification(null, data.error || 'Lỗi hoàn tiền đơn hàng');
+  // it's gated behind a confirm dialog rather than firing on one click.
+  const handleRefundOrder = (order: Order) => {
+    askConfirm(
+      <>
+        Hoàn tiền đơn <strong className="text-slate-900 dark:text-slate-100">#{order.orderCode}</strong> vào ví{' '}
+        <strong className="text-slate-900 dark:text-slate-100">{order.username}</strong>?
+        <div className="mt-2 text-base text-amber-600 dark:text-amber-400 font-bold">${formatMoney(order.totalPrice)}</div>
+        <div className="text-[11px] text-slate-500 dark:text-slate-500 mt-1">Hành động này không thể hoàn tác.</div>
+      </>,
+      async () => {
+      setRefundingOrderCode(order.orderCode);
+      try {
+        const res = await fetch(`/api/orders/${order.orderCode}/refund`, { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+          showNotification(`✅ Đã hoàn $${formatMoney(order.totalPrice)} cho đơn #${order.orderCode}`);
+          fetchAdminData();
+        } else {
+          showNotification(null, data.error || 'Lỗi hoàn tiền đơn hàng');
+        }
+      } catch (e) {
+        showNotification(null, 'Lỗi hoàn tiền đơn hàng');
+      } finally {
+        setRefundingOrderCode(null);
       }
-    } catch (e) {
-      showNotification(null, 'Lỗi hoàn tiền đơn hàng');
-    } finally {
-      setRefundingOrderCode(null);
-    }
+    });
   };
 
   // Toggle a single variant on/off the storefront (same idea, scoped to one
@@ -1362,25 +1523,76 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     }
   };
 
-  const handleDeleteVariant = async (variantId: string, name: string) => {
+  const handleDeleteVariant = (variantId: string, name: string) => {
     if (!variantsProduct) return;
-    if (!confirm(`Bạn có chắc muốn xóa biến thể "${name}"? Tồn kho chưa bán của biến thể này sẽ bị xóa theo.`)) return;
-    try {
-      const res = await fetch(`/api/admin/products/${variantsProduct.id}/variants/${variantId}`, { method: 'DELETE' });
-      const data = await res.json();
-      if (res.ok) {
-        showNotification(`✅ Đã xóa biến thể "${name}"`);
-        refreshAfterVariantChange(variantsProduct.id);
-      } else {
-        showNotification(null, data.error || 'Lỗi xóa biến thể');
+    const productId = variantsProduct.id;
+    askConfirm(
+      <>
+        Xóa biến thể <strong className="text-slate-900 dark:text-slate-100">{name}</strong>?
+        <div className="text-[11px] text-slate-500 dark:text-slate-500 mt-1">Tồn kho chưa bán của biến thể này sẽ bị xóa theo.</div>
+      </>,
+      async () => {
+      try {
+        const res = await fetch(`/api/admin/products/${productId}/variants/${variantId}`, { method: 'DELETE' });
+        const data = await res.json();
+        if (res.ok) {
+          showNotification(`✅ Đã xóa biến thể "${name}"`);
+          refreshAfterVariantChange(productId);
+        } else {
+          showNotification(null, data.error || 'Lỗi xóa biến thể');
+        }
+      } catch (e) {
+        showNotification(null, 'Lỗi kết nối máy chủ');
       }
-    } catch (e) {
-      showNotification(null, 'Lỗi kết nối máy chủ');
-    }
+    });
   };
 
   // Selected product for stock import
   const currentImportProd = products.find((p) => p.id === importProductId) || products[0];
+
+  if (needsAdminPin) {
+    return (
+      <div className="min-h-screen bg-[#f4f6f5] dark:bg-[#17181c] text-slate-900 dark:text-slate-100 flex items-center justify-center p-4">
+        <div className="bg-[#eef0ef] dark:bg-[#202227] border border-[#e1e4e3] dark:border-[#32363e] rounded-2xl max-w-sm w-full shadow-2xl p-6 space-y-4">
+          <div className="flex flex-col items-center text-center gap-2">
+            <div className="w-12 h-12 rounded-full bg-amber-50 dark:bg-amber-950/70 text-amber-600 dark:text-amber-400 flex items-center justify-center">
+              <KeyRound className="w-6 h-6" />
+            </div>
+            <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">{t.acctAdminPinTitle}</h2>
+            <p className="text-xs text-slate-600 dark:text-slate-400">{t.acctAdminPinDescActive}</p>
+          </div>
+          <form onSubmit={handleVerifyAdminPin} className="space-y-3">
+            <input
+              type="password"
+              inputMode="numeric"
+              autoFocus
+              value={adminPinInput}
+              onChange={(e) => setAdminPinInput(e.target.value.replace(/\D/g, '').slice(0, 10))}
+              placeholder="••••••"
+              className="w-full text-center text-2xl font-mono tracking-[0.3em] bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e1e4e3] dark:border-[#32363e] focus:border-amber-500 rounded-xl px-3 py-3 text-slate-800 dark:text-slate-200 focus:outline-none transition"
+            />
+            {adminPinError && (
+              <p className="text-xs text-red-600 dark:text-red-400 text-center">{adminPinError}</p>
+            )}
+            <button
+              type="submit"
+              disabled={verifyingPin || adminPinInput.length < 4}
+              className="w-full bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold text-sm py-2.5 rounded-xl transition"
+            >
+              {verifyingPin ? t.acctSaving : t.acctConfirmBtn}
+            </button>
+            <button
+              type="button"
+              onClick={onBackToStore}
+              className="w-full text-xs text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100 text-center"
+            >
+              {t.authBackToStore}
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#f4f6f5] dark:bg-[#17181c] text-slate-900 dark:text-slate-100 pb-16">
@@ -1453,7 +1665,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
       <div className="max-w-7xl mx-auto px-4 sm:px-8 mt-6">
         {/* Navigation Tabs — wraps into a compact grid instead of a long
             horizontally-scrolling row, so every section stays one click away. */}
-        <div className="grid grid-cols-4 sm:grid-cols-5 lg:grid-cols-10 gap-1.5 border-b border-[#e0e4e2] dark:border-[#33363e] pb-3 mb-6">
+        <div className="grid grid-cols-4 sm:grid-cols-5 lg:grid-cols-11 gap-1.5 border-b border-[#e0e4e2] dark:border-[#33363e] pb-3 mb-6">
           <button
             onClick={() => setActiveTab('overview')}
             title="Tổng Quan & Thống Kê"
@@ -1582,6 +1794,32 @@ export const AdminPage: React.FC<AdminPageProps> = ({
           >
             <Star className="w-4 h-4" />
             <span className="truncate w-full">Đánh Giá ({productReviews.length})</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('preorders')}
+            title="Đặt Trước"
+            className={`px-2 py-2 text-[11px] font-bold rounded-lg transition flex flex-col items-center gap-1 text-center ${
+              activeTab === 'preorders'
+                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-amber-700 dark:text-amber-300 ring-1 ring-amber-500'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200 hover:bg-[#ecefee] hover:dark:bg-[#222429]'
+            }`}
+          >
+            <Clock className="w-4 h-4" />
+            <span className="truncate w-full">Đặt Trước ({preorders.filter((p) => p.status === 'pending').length})</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('audit-log')}
+            title="Nhật Ký Hoạt Động Admin/CTV"
+            className={`px-2 py-2 text-[11px] font-bold rounded-lg transition flex flex-col items-center gap-1 text-center ${
+              activeTab === 'audit-log'
+                ? 'bg-[#e8ebea] dark:bg-[#282a30] text-purple-700 dark:text-purple-300 ring-1 ring-purple-500'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-800 hover:dark:text-slate-200 hover:bg-[#ecefee] hover:dark:bg-[#222429]'
+            }`}
+          >
+            <History className="w-4 h-4" />
+            <span className="truncate w-full">Nhật Ký</span>
           </button>
         </div>
 
@@ -2821,61 +3059,6 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 </button>
               </div>
 
-              {/* Detail of the batch that was just imported — which usernames
-                  actually went in vs. which were skipped as duplicates,
-                  instead of only a total count in the toast above. */}
-              {lastImportDetail && (
-                <div className="border-t border-[#e0e4e2] dark:border-[#33363e] pt-3 space-y-2">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => setImportDetailTab('imported')}
-                        className={`text-xs font-bold px-2.5 py-1 rounded-lg transition ${
-                          importDetailTab === 'imported'
-                            ? 'bg-emerald-600 text-white'
-                            : 'bg-[#e7ebe9] dark:bg-[#282a30] text-slate-600 dark:text-slate-400'
-                        }`}
-                      >
-                        Đã nhập ({lastImportDetail.importedUsernames.length})
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setImportDetailTab('duplicate')}
-                        className={`text-xs font-bold px-2.5 py-1 rounded-lg transition ${
-                          importDetailTab === 'duplicate'
-                            ? 'bg-amber-600 text-white'
-                            : 'bg-[#e7ebe9] dark:bg-[#282a30] text-slate-600 dark:text-slate-400'
-                        }`}
-                      >
-                        Trùng lặp ({lastImportDetail.duplicateUsernames.length})
-                      </button>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setLastImportDetail(null)}
-                      className="text-xs font-semibold text-slate-500 dark:text-slate-500 hover:text-slate-800 hover:dark:text-slate-200"
-                    >
-                      Đóng
-                    </button>
-                  </div>
-
-                  {(() => {
-                    const list = importDetailTab === 'imported' ? lastImportDetail.importedUsernames : lastImportDetail.duplicateUsernames;
-                    return list.length === 0 ? (
-                      <div className="text-center text-xs text-slate-500 dark:text-slate-500 py-4 border border-[#dde2e0] dark:border-[#373b43] rounded-lg">
-                        {importDetailTab === 'imported' ? 'Không có tài khoản nào được nhập' : 'Không có tài khoản nào trùng lặp'}
-                      </div>
-                    ) : (
-                      <div className="max-h-48 overflow-y-auto border border-[#dde2e0] dark:border-[#373b43] rounded-lg p-2 font-mono text-[11px] text-slate-700 dark:text-slate-300 space-y-0.5">
-                        {list.map((u, idx) => (
-                          <div key={idx}>{u}</div>
-                        ))}
-                      </div>
-                    );
-                  })()}
-                </div>
-              )}
             </div>
 
             {/* Inventory Inspection — grouped by product then variant instead of
@@ -2945,7 +3128,10 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                           {inventorySearchResults.map((item) => (
                             <tr key={item.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34]">
                               <td className="px-[5px] py-[2.5px] text-slate-700 dark:text-slate-300">{item.accountMasked}</td>
-                              <td className="px-[5px] py-[2.5px] text-slate-600 dark:text-slate-400 whitespace-nowrap">
+                              <td
+                                className="px-[5px] py-[2.5px] text-slate-600 dark:text-slate-400 max-w-[220px] truncate"
+                                title={`${item.productName} / ${item.variantName}`}
+                              >
                                 {item.productName} / {item.variantName}
                               </td>
                               <td className="px-[5px] py-[2.5px] w-10">
@@ -3027,11 +3213,11 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                           onClick={() => toggleInventoryProduct(productId)}
                           className="w-full bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-[#dde1e0] hover:dark:bg-[#363941] px-3 py-2 text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center justify-between transition"
                         >
-                          <span className="flex items-center gap-1.5">
-                            <ChevronRight className={`w-3.5 h-3.5 text-slate-500 dark:text-slate-500 transition-transform ${isExpanded ? 'rotate-90' : ''}`} />
-                            {product?.name || productId}
+                          <span className="flex items-center gap-1.5 min-w-0">
+                            <ChevronRight className={`w-3.5 h-3.5 text-slate-500 dark:text-slate-500 transition-transform flex-shrink-0 ${isExpanded ? 'rotate-90' : ''}`} />
+                            <span className="truncate" title={product?.name || productId}>{product?.name || productId}</span>
                           </span>
-                          <span className="text-slate-600 dark:text-slate-400 font-normal">{total.toLocaleString()} tài khoản</span>
+                          <span className="text-slate-600 dark:text-slate-400 font-normal flex-shrink-0 ml-2">{total.toLocaleString()} tài khoản</span>
                         </button>
                         {isExpanded && isLoadingItems && (
                           <div className="px-3 py-3 text-[11px] text-slate-500 dark:text-slate-500 flex items-center gap-1.5">
@@ -3210,7 +3396,10 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                               {new Date(entry.createdAt).toLocaleString('vi-VN')}
                             </td>
                             <td className="p-2.5 text-slate-700 dark:text-slate-300">{entry.uploadedByUsername}</td>
-                            <td className="p-2.5 text-slate-700 dark:text-slate-300 whitespace-nowrap">
+                            <td
+                              className="p-2.5 text-slate-700 dark:text-slate-300 max-w-[220px] truncate"
+                              title={`${entry.productName} / ${entry.variantName}`}
+                            >
                               {entry.productName} / {entry.variantName}
                             </td>
                             <td className="p-2.5 text-right text-emerald-600 dark:text-emerald-400 font-bold">{entry.importedCount}</td>
@@ -3929,6 +4118,232 @@ export const AdminPage: React.FC<AdminPageProps> = ({
           </div>
         )}
 
+        {/* TAB: PRE-ORDERS — every pre-order across every user. Needed now
+            that placing one holds real money (heldAmount) immediately (see
+            server.ts) — admin otherwise has no visibility into how much is
+            currently held in escrow or any way to force-cancel one. */}
+        {activeTab === 'preorders' && (() => {
+          const pending = preorders.filter((p) => p.status === 'pending');
+          const totalHeld = pending.reduce((sum, p) => sum + (p.heldAmount || 0), 0);
+          const filteredPreorders = preorderStatusFilter === 'all' ? preorders : preorders.filter((p) => p.status === preorderStatusFilter);
+          const statusBadge = (status: PreOrder['status']) => {
+            const map: Record<PreOrder['status'], string> = {
+              pending: 'bg-amber-50 dark:bg-amber-950/70 text-amber-600 dark:text-amber-400',
+              fulfilled: 'bg-emerald-50 dark:bg-emerald-950/70 text-emerald-600 dark:text-emerald-400',
+              cancelled: 'bg-slate-100 dark:bg-slate-800/70 text-slate-600 dark:text-slate-400',
+              expired: 'bg-red-50 dark:bg-red-950/70 text-red-600 dark:text-red-400',
+            };
+            const label: Record<PreOrder['status'], string> = {
+              pending: 'Đang chờ',
+              fulfilled: 'Đã giao',
+              cancelled: 'Đã hủy',
+              expired: 'Hết hạn',
+            };
+            return <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${map[status]}`}>{label[status]}</span>;
+          };
+
+          return (
+            <div className="space-y-4">
+              <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">Quản Lý Đặt Trước</h3>
+
+              {/* Summary — the headline number is totalHeld: real money
+                  currently deducted from buyers and sitting in escrow until
+                  fulfilled, cancelled, or auto-expired. */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl p-4">
+                  <div className="text-[11px] text-slate-600 dark:text-slate-400 mb-1">Đang chờ</div>
+                  <div className="text-xl font-bold text-amber-600 dark:text-amber-400">{pending.length}</div>
+                </div>
+                <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl p-4">
+                  <div className="text-[11px] text-slate-600 dark:text-slate-400 mb-1">Tổng tiền đang giữ</div>
+                  <div className="text-xl font-bold text-emerald-600 dark:text-emerald-400 font-mono">${formatMoney(totalHeld)}</div>
+                </div>
+                <div className="bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-xl p-4">
+                  <div className="text-[11px] text-slate-600 dark:text-slate-400 mb-1">Tổng số đơn</div>
+                  <div className="text-xl font-bold text-slate-800 dark:text-slate-200">{preorders.length}</div>
+                </div>
+              </div>
+
+              {/* Status filter */}
+              <div className="flex flex-wrap items-center gap-1.5">
+                {(['all', 'pending', 'fulfilled', 'cancelled', 'expired'] as const).map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    onClick={() => setPreorderStatusFilter(s)}
+                    className={`text-xs font-bold px-2.5 py-1 rounded-lg transition ${
+                      preorderStatusFilter === s
+                        ? 'bg-amber-600 text-white'
+                        : 'bg-[#e7ebe9] dark:bg-[#282a30] text-slate-600 dark:text-slate-400'
+                    }`}
+                  >
+                    {s === 'all' ? 'Tất cả' : s === 'pending' ? 'Đang chờ' : s === 'fulfilled' ? 'Đã giao' : s === 'cancelled' ? 'Đã hủy' : 'Hết hạn'}
+                  </button>
+                ))}
+              </div>
+
+              <div className="overflow-x-auto border border-[#dde2e0] dark:border-[#373b43] rounded-xl">
+                <table className="w-full text-left text-xs min-w-[720px]">
+                  <thead className="bg-[#e9ece9] dark:bg-[#17191d] text-slate-600 dark:text-slate-400 border-b border-[#dee2e0] dark:border-[#363a43]">
+                    <tr>
+                      <th className="p-2.5">Khách hàng</th>
+                      <th className="p-2.5">Sản phẩm / Biến thể</th>
+                      <th className="p-2.5 text-right">SL</th>
+                      <th className="p-2.5 text-right">Đã giữ</th>
+                      <th className="p-2.5">Trạng thái</th>
+                      <th className="p-2.5">Hết hạn / Cập nhật</th>
+                      <th className="p-2.5 text-right">Thao tác</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#e4e8e7] dark:divide-[#2d3036]">
+                    {filteredPreorders.length === 0 ? (
+                      <tr>
+                        <td colSpan={7} className="text-center text-slate-500 dark:text-slate-500 py-6">
+                          Không có đơn đặt trước nào
+                        </td>
+                      </tr>
+                    ) : (
+                      filteredPreorders.map((p) => {
+                        const daysLeft = Math.max(0, Math.ceil((new Date(p.expiresAt).getTime() - Date.now()) / 86400000));
+                        return (
+                          <tr key={p.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34]">
+                            <td className="p-2.5 text-slate-700 dark:text-slate-300 font-semibold">{p.username}</td>
+                            <td className="p-2.5 text-slate-600 dark:text-slate-400 max-w-[220px] truncate" title={`${p.productName} / ${p.variantName}`}>
+                              {p.productName} / {p.variantName}
+                            </td>
+                            <td className="p-2.5 text-right font-mono text-slate-700 dark:text-slate-300">{p.quantity}</td>
+                            <td className="p-2.5 text-right font-mono font-bold text-amber-600 dark:text-amber-400">${formatMoney(p.heldAmount || 0)}</td>
+                            <td className="p-2.5">{statusBadge(p.status)}</td>
+                            <td className="p-2.5 text-slate-600 dark:text-slate-400 whitespace-nowrap">
+                              {p.status === 'pending'
+                                ? `còn ${daysLeft} ngày`
+                                : p.status === 'fulfilled' && p.fulfilledAt
+                                ? new Date(p.fulfilledAt).toLocaleString('vi-VN')
+                                : p.refundedAt
+                                ? new Date(p.refundedAt).toLocaleString('vi-VN')
+                                : '—'}
+                            </td>
+                            <td className="p-2.5 text-right">
+                              {p.status === 'pending' && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleAdminCancelPreorder(p)}
+                                  disabled={cancellingPreorderId === p.id}
+                                  className="text-[11px] font-bold text-red-600 dark:text-red-400 hover:underline disabled:opacity-50"
+                                >
+                                  Hủy
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* TAB: AUDIT LOG — every logged admin/CTV action (see
+            logAdminAction in server.ts): who did what, to what, and when.
+            Lazily loaded only once this tab is opened. */}
+        {activeTab === 'audit-log' && (
+          <div className="space-y-4">
+            <div>
+              <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">Nhật Ký Hoạt Động</h3>
+              <p className="text-xs text-slate-600 dark:text-slate-400">Lịch sử các thao tác nhạy cảm của admin/CTV (cộng/trừ tiền, hoàn đơn, xóa, đổi giá...) — phục vụ tra cứu khi có tranh chấp nội bộ.</p>
+            </div>
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                loadAuditLog(1, auditLogActorFilter);
+              }}
+              className="flex items-center gap-2"
+            >
+              <input
+                type="text"
+                value={auditLogActorFilter}
+                onChange={(e) => setAuditLogActorFilter(e.target.value)}
+                placeholder="Lọc theo tên người thực hiện..."
+                className="flex-1 max-w-xs bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-xs text-slate-800 dark:text-slate-200 focus:border-purple-500 focus:outline-none"
+              />
+              <button
+                type="submit"
+                className="bg-[#e7ebe9] dark:bg-[#282a30] hover:bg-[#dde1df] hover:dark:bg-[#32353c] text-slate-700 dark:text-slate-300 text-xs font-semibold px-3 py-2 rounded-lg transition inline-flex items-center gap-1.5"
+              >
+                <Search className="w-3.5 h-3.5" />
+                Tìm
+              </button>
+              {isLoadingAuditLog && <RefreshCw className="w-3.5 h-3.5 animate-spin text-slate-500 dark:text-slate-500" />}
+            </form>
+
+            <div className="overflow-x-auto border border-[#dde2e0] dark:border-[#373b43] rounded-lg">
+              <table className="w-full text-left text-xs min-w-[640px]">
+                <thead className="bg-[#e9ece9] dark:bg-[#17191d] text-slate-600 dark:text-slate-400 border-b border-[#dee2e0] dark:border-[#363a43]">
+                  <tr>
+                    <th className="p-2.5">Thời gian</th>
+                    <th className="p-2.5">Người thực hiện</th>
+                    <th className="p-2.5">Nội dung</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#e4e8e7] dark:divide-[#2d3036]">
+                  {auditLog.length === 0 ? (
+                    <tr>
+                      <td colSpan={3} className="p-6 text-center text-slate-500 dark:text-slate-500">
+                        {isLoadingAuditLog ? 'Đang tải...' : 'Chưa có hoạt động nào được ghi nhận.'}
+                      </td>
+                    </tr>
+                  ) : (
+                    auditLog.map((entry) => (
+                      <tr key={entry.id} className="hover:bg-[#e6eae9] hover:dark:bg-[#2a2d34]">
+                        <td className="p-2.5 text-slate-600 dark:text-slate-400 whitespace-nowrap font-mono text-[11px]">
+                          {new Date(entry.createdAt).toLocaleString('vi-VN')}
+                        </td>
+                        <td className="p-2.5 whitespace-nowrap">
+                          <span className="text-slate-800 dark:text-slate-200 font-semibold">{entry.actorUsername}</span>
+                          <span className="ml-1.5 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-purple-50 dark:bg-purple-950/70 text-purple-600 dark:text-purple-400 uppercase">
+                            {entry.actorRole}
+                          </span>
+                        </td>
+                        <td className="p-2.5 text-slate-700 dark:text-slate-300">{entry.summary}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {auditLogTotal > AUDIT_LOG_PAGE_SIZE && (
+              <div className="flex items-center justify-between text-xs text-slate-600 dark:text-slate-400">
+                <span>
+                  Trang {auditLogPage}/{Math.max(1, Math.ceil(auditLogTotal / AUDIT_LOG_PAGE_SIZE))} — {auditLogTotal} hoạt động
+                </span>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={auditLogPage <= 1 || isLoadingAuditLog}
+                    onClick={() => loadAuditLog(auditLogPage - 1, auditLogActorFilter)}
+                    className="px-3 py-1.5 rounded-lg bg-[#e7ebe9] dark:bg-[#282a30] text-slate-700 dark:text-slate-300 font-semibold disabled:opacity-40 transition"
+                  >
+                    Trước
+                  </button>
+                  <button
+                    type="button"
+                    disabled={auditLogPage >= Math.ceil(auditLogTotal / AUDIT_LOG_PAGE_SIZE) || isLoadingAuditLog}
+                    onClick={() => loadAuditLog(auditLogPage + 1, auditLogActorFilter)}
+                    className="px-3 py-1.5 rounded-lg bg-[#e7ebe9] dark:bg-[#282a30] text-slate-700 dark:text-slate-300 font-semibold disabled:opacity-40 transition"
+                  >
+                    Sau
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* TAB: VOUCHERS — admin sees and manages every code, CTV-created included */}
         {activeTab === 'vouchers' && (
           <div className="space-y-4">
@@ -4398,6 +4813,50 @@ export const AdminPage: React.FC<AdminPageProps> = ({
               <div className="flex justify-end gap-2 pt-1">
                 <button onClick={() => setShowAddCryptoOptModal(false)} className="px-4 py-2 bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-[#dde1e0] hover:dark:bg-[#373b44] text-slate-700 dark:text-slate-300 rounded-lg text-xs font-semibold">Hủy</button>
                 <button onClick={handleCreateCryptoOpt} className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-lg text-xs transition">Thêm Cổng Nạp</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Shared confirm dialog — replaces window.confirm() for every
+            destructive/irreversible action (see askConfirm above). */}
+        {confirmDialog && (
+          <div
+            className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+            onClick={() => setConfirmDialog(null)}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="confirm-dialog-message"
+              onClick={(e) => e.stopPropagation()}
+              className="animate-modal-pop bg-[#eef0ef] dark:bg-[#202227] border border-[#e1e4e3] dark:border-[#32363e] rounded-2xl max-w-sm w-full shadow-2xl p-5 space-y-4"
+            >
+              <div className="flex items-start gap-3">
+                <div className="w-9 h-9 flex-shrink-0 rounded-full bg-red-50 dark:bg-red-950/70 text-red-600 dark:text-red-400 flex items-center justify-center">
+                  <AlertCircle className="w-5 h-5" />
+                </div>
+                <div id="confirm-dialog-message" className="text-sm text-slate-800 dark:text-slate-200 pt-1.5 min-w-0 flex-1">
+                  {confirmDialog.message}
+                </div>
+              </div>
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  onClick={() => setConfirmDialog(null)}
+                  className="px-4 py-2 bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-[#dde2e0] dark:border-[#373b43] text-slate-700 dark:text-slate-300 font-semibold rounded-lg text-xs transition focus:outline-none focus:ring-2 focus:ring-red-500"
+                >
+                  Hủy
+                </button>
+                <button
+                  onClick={() => {
+                    const { onConfirm } = confirmDialog;
+                    setConfirmDialog(null);
+                    onConfirm();
+                  }}
+                  className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-bold rounded-lg text-xs transition focus:outline-none focus:ring-2 focus:ring-red-600"
+                >
+                  Xác nhận
+                </button>
               </div>
             </div>
           </div>

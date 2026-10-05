@@ -19,6 +19,11 @@ declare module 'express-session' {
     userId?: string;
     // The account's authVersion at the moment this session was created.
     authVersion?: number;
+    // Set once this session has passed the admin/CTV secondary PIN check
+    // (see requireRole below and POST /api/auth/verify-admin-pin in
+    // server.ts) — only meaningful for an account that has opted into a
+    // PIN; absent/false otherwise never blocks anything.
+    adminPinVerified?: boolean;
   }
 }
 
@@ -43,8 +48,8 @@ export function generateApiKey(): string {
 // only ever re-attached on a user's own /api/user/me response (see
 // server.ts) — every other route that lists or returns other accounts
 // (e.g. the admin user list) must never leak it.
-export function toPublicUser(user: User): Omit<User, 'passwordHash' | 'apiKey' | 'authVersion'> {
-  const { passwordHash, apiKey, authVersion, ...publicUser } = user;
+export function toPublicUser(user: User): Omit<User, 'passwordHash' | 'apiKey' | 'authVersion' | 'adminPinHash'> {
+  const { passwordHash, apiKey, authVersion, adminPinHash, ...publicUser } = user;
   return publicUser;
 }
 
@@ -166,6 +171,18 @@ export function requireRole(...roles: UserRole[]) {
     if (!user) return res.status(401).json({ error: 'Vui lòng đăng nhập' });
     if (!roles.includes(user.role)) {
       return res.status(403).json({ error: 'Bạn không có quyền truy cập chức năng này' });
+    }
+    // Secondary admin PIN (opt-in — see POST /api/auth/set-admin-pin in
+    // server.ts) only ever gates an interactive BROWSER session: it's a
+    // second thing you type into the login UI, so it only makes sense to
+    // check when the request actually came in on that cookie session.
+    // An API-key caller already proved possession of a separate, long,
+    // per-account secret and has no UI to be prompted through — gating it
+    // here too would just break every legitimate script/integration the
+    // moment that account sets a PIN.
+    const isCookieSession = req.session.userId === user.id;
+    if (isCookieSession && (user.role === 'admin' || user.role === 'ctv') && user.adminPinHash && !req.session.adminPinVerified) {
+      return res.status(403).json({ error: 'Vui lòng nhập mã PIN quản trị', requiresAdminPin: true });
     }
     next();
   };

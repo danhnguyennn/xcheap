@@ -47,6 +47,13 @@ export interface User {
   // not a stored field. Only meaningful for role === 'user' accounts.
   vipDiscountPercent?: number;
   vipTierKey?: string;
+  // Optional secondary PIN gating the admin/CTV dashboard, opt-in per
+  // account (see POST /api/auth/set-admin-pin) — server-side only, like
+  // passwordHash, and stripped the same way by toPublicUser.
+  adminPinHash?: string;
+  // Computed on each /api/user/me response from adminPinHash — never the
+  // hash itself. Only meaningful for role 'admin'/'ctv'.
+  hasAdminPin?: boolean;
 }
 
 export interface AccountSummary {
@@ -193,6 +200,26 @@ export interface CtvDeduction {
   createdAt: string;
   adminId: string;
   adminUsername: string;
+}
+
+// One privileged admin/CTV action — who did what, to what, and when. Written
+// by logAdminAction() for every balance change, refund, delete, price edit,
+// etc. on the admin side, so an internal dispute ("who refunded this order?")
+// has a real record instead of relying on memory or chat logs. Entries are
+// never edited or deleted by the app itself (see GET /api/admin/audit-log),
+// so the log stays trustworthy.
+export interface AdminAuditLogEntry {
+  id: string;
+  actorId: string;
+  actorUsername: string;
+  actorRole: UserRole;
+  // Short stable key for filtering, e.g. 'user.balance_adjust', 'order.refund'.
+  action: string;
+  // Human-readable Vietnamese description shown in the admin UI.
+  summary: string;
+  // id of the affected user/order/product/etc., when there is one.
+  targetId?: string;
+  createdAt: string;
 }
 
 // A "đặt trước" (pre-order) placed against a variant that's currently out of

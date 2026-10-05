@@ -27,6 +27,7 @@ import {
   Trash2,
   Star,
   Search,
+  KeyRound,
 } from 'lucide-react';
 
 // Must match the server's minimum withdrawal amount (server.ts /api/ctv/withdraw)
@@ -62,6 +63,13 @@ export const CtvPage: React.FC<CtvPageProps> = ({
   const [withdrawals, setWithdrawals] = useState<WithdrawalRequest[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [notification, setNotification] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  // Secondary admin/CTV PIN gate (opt-in, see server/auth.ts requireRole) —
+  // same mechanism and UI as AdminPage.tsx.
+  const [needsAdminPin, setNeedsAdminPin] = useState(false);
+  const [adminPinInput, setAdminPinInput] = useState('');
+  const [verifyingPin, setVerifyingPin] = useState(false);
+  const [adminPinError, setAdminPinError] = useState('');
   const [chartDaily, setChartDaily] = useState<{ date: string; revenue: number; orders: number }[]>([]);
   const [chartTopProducts, setChartTopProducts] = useState<{ name: string; revenue: number; orders: number }[]>([]);
   const [chartPeriod, setChartPeriod] = useState<'week' | 'month' | 'all'>('week');
@@ -97,6 +105,31 @@ export const CtvPage: React.FC<CtvPageProps> = ({
   const showToast = (type: 'success' | 'error', message: string) => {
     setNotification({ type, message });
     setTimeout(() => setNotification(null), 4000);
+  };
+
+  const handleVerifyAdminPin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAdminPinError('');
+    setVerifyingPin(true);
+    try {
+      const res = await fetch('/api/auth/verify-admin-pin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pin: adminPinInput }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setNeedsAdminPin(false);
+        setAdminPinInput('');
+        loadCtvData();
+      } else {
+        setAdminPinError(data.error || 'Mã PIN không đúng');
+      }
+    } catch (err) {
+      setAdminPinError('Lỗi kết nối tới máy chủ');
+    } finally {
+      setVerifyingPin(false);
+    }
   };
 
   // Refunds an order's totalPrice straight back into the buyer's wallet.
@@ -149,6 +182,17 @@ export const CtvPage: React.FC<CtvPageProps> = ({
         fetch('/api/ctv/stats'),
         fetch('/api/platform/config'),
       ]);
+
+      if (statsRes.status === 403) {
+        const body = await statsRes.json().catch(() => ({}));
+        if (body.requiresAdminPin) {
+          setNeedsAdminPin(true);
+          setLoading(false);
+          return;
+        }
+      }
+      setNeedsAdminPin(false);
+
       fetchChartData(chartPeriod);
 
       if (statsRes.ok) {
@@ -335,6 +379,50 @@ export const CtvPage: React.FC<CtvPageProps> = ({
   };
 
   const currentRefillProduct = myProducts.find((p) => p.id === refillProductId) || myProducts[0];
+
+  if (needsAdminPin) {
+    return (
+      <div className="min-h-screen bg-[#f4f6f5] dark:bg-[#17181c] text-slate-900 dark:text-slate-100 flex items-center justify-center p-4">
+        <div className="bg-[#eef0ef] dark:bg-[#202227] border border-[#e1e4e3] dark:border-[#32363e] rounded-2xl max-w-sm w-full shadow-2xl p-6 space-y-4">
+          <div className="flex flex-col items-center text-center gap-2">
+            <div className="w-12 h-12 rounded-full bg-amber-50 dark:bg-amber-950/70 text-amber-600 dark:text-amber-400 flex items-center justify-center">
+              <KeyRound className="w-6 h-6" />
+            </div>
+            <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">{t.acctAdminPinTitle}</h2>
+            <p className="text-xs text-slate-600 dark:text-slate-400">{t.acctAdminPinDescActive}</p>
+          </div>
+          <form onSubmit={handleVerifyAdminPin} className="space-y-3">
+            <input
+              type="password"
+              inputMode="numeric"
+              autoFocus
+              value={adminPinInput}
+              onChange={(e) => setAdminPinInput(e.target.value.replace(/\D/g, '').slice(0, 10))}
+              placeholder="••••••"
+              className="w-full text-center text-2xl font-mono tracking-[0.3em] bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e1e4e3] dark:border-[#32363e] focus:border-amber-500 rounded-xl px-3 py-3 text-slate-800 dark:text-slate-200 focus:outline-none transition"
+            />
+            {adminPinError && (
+              <p className="text-xs text-red-600 dark:text-red-400 text-center">{adminPinError}</p>
+            )}
+            <button
+              type="submit"
+              disabled={verifyingPin || adminPinInput.length < 4}
+              className="w-full bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold text-sm py-2.5 rounded-xl transition"
+            >
+              {verifyingPin ? t.acctSaving : t.acctConfirmBtn}
+            </button>
+            <button
+              type="button"
+              onClick={onBackToStore}
+              className="w-full text-xs text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100 text-center"
+            >
+              {t.authBackToStore}
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-[#f4f6f5] dark:bg-[#17181c] text-slate-900 dark:text-slate-100 pb-16 font-sans">

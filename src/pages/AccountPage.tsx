@@ -20,6 +20,7 @@ import {
   ShieldAlert,
   CheckCircle2,
   Check,
+  KeyRound,
 } from 'lucide-react';
 
 interface AccountPageProps {
@@ -53,6 +54,18 @@ export const AccountPage: React.FC<AccountPageProps> = ({ user, language, onBack
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [savingPassword, setSavingPassword] = useState(false);
+
+  // Admin/CTV-only secondary PIN (see requireRole in server/auth.ts) — set,
+  // change, and remove all share the same set-admin-pin/clear-admin-pin
+  // endpoints the dashboard's own PIN gate verifies against.
+  const [isSettingPin, setIsSettingPin] = useState(false);
+  const [pinCurrentPassword, setPinCurrentPassword] = useState('');
+  const [newPin, setNewPin] = useState('');
+  const [confirmPin, setConfirmPin] = useState('');
+  const [savingPin, setSavingPin] = useState(false);
+  const [isRemovingPin, setIsRemovingPin] = useState(false);
+  const [removePinPassword, setRemovePinPassword] = useState('');
+  const [removingPin, setRemovingPin] = useState(false);
 
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
@@ -148,6 +161,66 @@ export const AccountPage: React.FC<AccountPageProps> = ({ user, language, onBack
       showNotice('error', t.acctServerError);
     } finally {
       setSavingPassword(false);
+    }
+  };
+
+  const handleSetAdminPin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!/^\d{4,10}$/.test(newPin)) {
+      showNotice('error', t.acctAdminPinInvalidFormat);
+      return;
+    }
+    if (newPin !== confirmPin) {
+      showNotice('error', t.acctAdminPinMismatch);
+      return;
+    }
+    setSavingPin(true);
+    try {
+      const res = await fetch('/api/auth/set-admin-pin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword: pinCurrentPassword, newPin }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showNotice('success', t.acctAdminPinSetSuccess);
+        setIsSettingPin(false);
+        setPinCurrentPassword('');
+        setNewPin('');
+        setConfirmPin('');
+        onRefreshUser();
+      } else {
+        showNotice('error', data.error || t.acctServerError);
+      }
+    } catch (err) {
+      showNotice('error', t.acctServerError);
+    } finally {
+      setSavingPin(false);
+    }
+  };
+
+  const handleRemoveAdminPin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setRemovingPin(true);
+    try {
+      const res = await fetch('/api/auth/clear-admin-pin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword: removePinPassword }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showNotice('success', t.acctAdminPinRemoveSuccess);
+        setIsRemovingPin(false);
+        setRemovePinPassword('');
+        onRefreshUser();
+      } else {
+        showNotice('error', data.error || t.acctServerError);
+      }
+    } catch (err) {
+      showNotice('error', t.acctServerError);
+    } finally {
+      setRemovingPin(false);
     }
   };
 
@@ -461,6 +534,122 @@ export const AccountPage: React.FC<AccountPageProps> = ({ user, language, onBack
           </form>
         )}
       </div>
+
+      {/* Admin/CTV-only secondary PIN for the dashboard (see requireRole in
+          server/auth.ts) — opt-in, never shown to a regular user. */}
+      {(user.role === 'admin' || user.role === 'ctv') && (
+        <div className="bg-[#eef0ef] dark:bg-[#202227] border border-[#e1e4e3] dark:border-[#32363e] rounded-2xl p-4 mb-4">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <div className="flex items-center gap-2">
+              <KeyRound className="w-4 h-4 text-amber-600 dark:text-amber-400" />
+              <div>
+                <div className="font-bold text-slate-900 dark:text-slate-100 text-sm">{t.acctAdminPinTitle}</div>
+                <div className="text-[10px] text-slate-600 dark:text-slate-400">
+                  {user.hasAdminPin ? t.acctAdminPinDescActive : t.acctAdminPinDescSet}
+                </div>
+              </div>
+            </div>
+            {!isSettingPin && !isRemovingPin && (
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <button
+                  onClick={() => setIsSettingPin(true)}
+                  className="bg-[#e7ebe9] dark:bg-[#292b31] hover:bg-[#dee3e1] hover:dark:bg-[#363941] border border-[#dfe3e1] dark:border-[#353840] text-slate-800 dark:text-slate-200 text-xs font-semibold px-3 py-1.5 rounded-lg transition"
+                >
+                  {user.hasAdminPin ? t.acctAdminPinChangeBtn : t.acctAdminPinSetBtn}
+                </button>
+                {user.hasAdminPin && (
+                  <button
+                    onClick={() => setIsRemovingPin(true)}
+                    className="text-red-600 dark:text-red-400 hover:underline text-xs font-semibold px-1"
+                  >
+                    {t.acctAdminPinRemoveBtn}
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+
+          {isSettingPin && (
+            <form onSubmit={handleSetAdminPin} className="mt-3 space-y-2.5">
+              <input
+                type="password"
+                value={pinCurrentPassword}
+                onChange={(e) => setPinCurrentPassword(e.target.value)}
+                placeholder={t.acctCurrentPasswordPlaceholder}
+                className="w-full bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e1e4e3] dark:border-[#32363e] focus:border-emerald-500 rounded-lg px-3 py-2 text-sm text-slate-800 dark:text-slate-200 focus:outline-none transition"
+              />
+              <input
+                type="password"
+                inputMode="numeric"
+                value={newPin}
+                onChange={(e) => setNewPin(e.target.value.replace(/\D/g, '').slice(0, 10))}
+                placeholder={t.acctAdminPinNewPlaceholder}
+                className="w-full bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e1e4e3] dark:border-[#32363e] focus:border-emerald-500 rounded-lg px-3 py-2 text-sm text-slate-800 dark:text-slate-200 focus:outline-none transition font-mono tracking-widest"
+              />
+              <input
+                type="password"
+                inputMode="numeric"
+                value={confirmPin}
+                onChange={(e) => setConfirmPin(e.target.value.replace(/\D/g, '').slice(0, 10))}
+                placeholder={t.acctAdminPinConfirmPlaceholder}
+                className="w-full bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e1e4e3] dark:border-[#32363e] focus:border-emerald-500 rounded-lg px-3 py-2 text-sm text-slate-800 dark:text-slate-200 focus:outline-none transition font-mono tracking-widest"
+              />
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  type="submit"
+                  disabled={savingPin}
+                  className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs px-3.5 py-2 rounded-lg transition"
+                >
+                  {savingPin ? t.acctSaving : t.acctConfirmBtn}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsSettingPin(false);
+                    setPinCurrentPassword('');
+                    setNewPin('');
+                    setConfirmPin('');
+                  }}
+                  className="text-xs text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100 px-3 py-2"
+                >
+                  {t.acctCancel}
+                </button>
+              </div>
+            </form>
+          )}
+
+          {isRemovingPin && (
+            <form onSubmit={handleRemoveAdminPin} className="mt-3 space-y-2.5">
+              <input
+                type="password"
+                value={removePinPassword}
+                onChange={(e) => setRemovePinPassword(e.target.value)}
+                placeholder={t.acctCurrentPasswordPlaceholder}
+                className="w-full bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e1e4e3] dark:border-[#32363e] focus:border-red-500 rounded-lg px-3 py-2 text-sm text-slate-800 dark:text-slate-200 focus:outline-none transition"
+              />
+              <div className="flex items-center gap-2 pt-1">
+                <button
+                  type="submit"
+                  disabled={removingPin}
+                  className="bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white font-bold text-xs px-3.5 py-2 rounded-lg transition"
+                >
+                  {removingPin ? t.acctSaving : t.acctAdminPinRemoveBtn}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setIsRemovingPin(false);
+                    setRemovePinPassword('');
+                  }}
+                  className="text-xs text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100 px-3 py-2"
+                >
+                  {t.acctCancel}
+                </button>
+              </div>
+            </form>
+          )}
+        </div>
+      )}
 
       {/* Telegram notifications — not yet wired to a live bot */}
       <div className="bg-[#eef0ef] dark:bg-[#202227] border border-[#e1e4e3] dark:border-[#32363e] rounded-2xl p-4 mb-4">

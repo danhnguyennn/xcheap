@@ -216,13 +216,14 @@ export class MongoCollection<T extends MongoDoc> {
   // MongoDB: updateOne()
   public async updateOne(
     query: Record<string, any>,
-    update: { $set?: Partial<T>; $inc?: Record<string, number> }
+    update: { $set?: Partial<T>; $inc?: Record<string, number>; $unset?: Partial<Record<keyof T, ''>> }
   ): Promise<{ matchedCount: number; modifiedCount: number }> {
     if (this.col) {
       try {
         const mongoUpdate: Record<string, any> = {};
         if (update.$set) mongoUpdate.$set = { ...update.$set, updatedAt: new Date().toISOString() };
         if (update.$inc) mongoUpdate.$inc = update.$inc;
+        if (update.$unset) mongoUpdate.$unset = update.$unset;
         const result = await this.col.updateOne(query as Filter<Document>, mongoUpdate);
         return { matchedCount: result.matchedCount, modifiedCount: result.modifiedCount };
       } catch (err) {
@@ -242,6 +243,9 @@ export class MongoCollection<T extends MongoDoc> {
       for (const [key, amount] of Object.entries(update.$inc)) {
         target[key] = (Number(target[key]) || 0) + Number(amount);
       }
+    }
+    if (update.$unset) {
+      for (const key of Object.keys(update.$unset)) delete target[key];
     }
     return { matchedCount: 1, modifiedCount: 1 };
   }
