@@ -352,7 +352,13 @@ async function checkExpiredPreorders(): Promise<void> {
       { $set: { status: 'expired', refundedAt: nowIso } }
     );
     if (ownership.matchedCount === 0) continue; // fulfilled/cancelled just before we got to it
-    await userCol.updateOne({ id: p.userId }, { $inc: { balance: p.heldAmount } });
+    // heldAmount is missing (undefined) on pre-orders placed before the
+    // "hold funds up front" feature existed — $inc with an undefined
+    // operand gets serialized to BSON null and MongoDB rejects it
+    // ("Cannot increment with non-numeric argument"). Those old pre-orders
+    // never held any money, so refunding $0 for them is correct, not a
+    // fallback — this isn't just a crash-guard.
+    await userCol.updateOne({ id: p.userId }, { $inc: { balance: Number(p.heldAmount) || 0 } });
     refundedCount++;
   }
   if (refundedCount > 0) {
@@ -2019,8 +2025,12 @@ app.delete('/api/user/preorders/:id', async (req, res) => {
   if (ownership.matchedCount === 0) {
     return res.status(400).json({ error: 'Đơn đặt trước này không còn ở trạng thái chờ để hủy' });
   }
-  await userCol.updateOne({ id: user.id }, { $inc: { balance: preorder.heldAmount } });
-  res.json({ success: true, refundedAmount: preorder.heldAmount });
+  // heldAmount is missing (undefined) on pre-orders placed before the "hold
+  // funds up front" feature existed — see checkExpiredPreorders for why
+  // Number(...) || 0 here is the correct refund, not just a crash-guard.
+  const refundAmount = Number(preorder.heldAmount) || 0;
+  await userCol.updateOne({ id: user.id }, { $inc: { balance: refundAmount } });
+  res.json({ success: true, refundedAmount: refundAmount });
 });
 
 // Admin visibility over every pre-order in the system, across all users.
@@ -2053,10 +2063,14 @@ app.delete('/api/admin/preorders/:id', requireRole('admin'), async (req, res) =>
   if (ownership.matchedCount === 0) {
     return res.status(400).json({ error: 'Đơn đặt trước này không còn ở trạng thái chờ để hủy' });
   }
-  await userCol.updateOne({ id: preorder.userId }, { $inc: { balance: preorder.heldAmount } });
+  // heldAmount is missing (undefined) on pre-orders placed before the "hold
+  // funds up front" feature existed — see checkExpiredPreorders for why
+  // Number(...) || 0 here is the correct refund, not just a crash-guard.
+  const refundAmount = Number(preorder.heldAmount) || 0;
+  await userCol.updateOne({ id: preorder.userId }, { $inc: { balance: refundAmount } });
   const admin = (await getSessionUser(req))!;
-  await logAdminAction(admin, 'preorder.cancel', `Hủy đơn đặt trước "${preorder.productName}" của ${preorder.username}, hoàn $${preorder.heldAmount}`, preorder.id);
-  res.json({ success: true, refundedAmount: preorder.heldAmount });
+  await logAdminAction(admin, 'preorder.cancel', `Hủy đơn đặt trước "${preorder.productName}" của ${preorder.username}, hoàn $${refundAmount}`, preorder.id);
+  res.json({ success: true, refundedAmount: refundAmount });
 });
 
 // Real admin notifications (currently: a user placing/adding to a
@@ -3176,7 +3190,11 @@ async function cancelOpenPreorders(filter: { productId?: string; variantId?: str
   // never be fulfilled now — each buyer's held money goes back to them, same
   // as a normal cancel.
   for (const p of open) {
-    await userCol.updateOne({ id: p.userId }, { $inc: { balance: p.heldAmount } });
+    // heldAmount is missing (undefined) on pre-orders placed before the
+    // "hold funds up front" feature existed — see checkExpiredPreorders for
+    // why Number(...) || 0 here is the correct refund, not just a
+    // crash-guard.
+    await userCol.updateOne({ id: p.userId }, { $inc: { balance: Number(p.heldAmount) || 0 } });
   }
   return open.length;
 }
