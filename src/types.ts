@@ -183,6 +183,12 @@ export interface Order {
   // existed, and an entry is skipped for any claimed row that (for the
   // same legacy reason) has no uploader recorded on it.
   uploaderBreakdown?: { userId: string; username: string; quantity: number }[];
+  // Warranty replacements on this order (see POST .../warranty/replace):
+  // how many delivered accounts were swapped out, and the replacement
+  // accounts themselves so the buyer can see exactly which ones are covered.
+  // Absent on orders that were never replaced.
+  warrantyReplacedCount?: number;
+  warrantyReplacedAccounts?: string[];
 }
 
 // A manual balance adjustment admin makes against a CTV's earned income —
@@ -197,6 +203,23 @@ export interface CtvDeduction {
   ctvUsername: string;
   amount: number;
   reason: string;
+  createdAt: string;
+  adminId: string;
+  adminUsername: string;
+}
+
+// A warranty action admin took on an order within the 72h window (see
+// POST /api/admin/orders/:orderCode/warranty/*). "replace" swaps broken
+// accounts for fresh ones from the same CTV's stock; "refund" refunds the
+// whole order. Every claim is kept as a permanent record.
+export interface WarrantyClaim {
+  id: string;
+  orderCode: string;
+  userId: string;
+  username: string;
+  action: 'replace' | 'refund';
+  // replace only: each broken account paired with the account that replaced it.
+  replacements?: { broken: string; replacement: string; ctvUserId: string }[];
   createdAt: string;
   adminId: string;
   adminUsername: string;

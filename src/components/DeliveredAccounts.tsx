@@ -7,12 +7,15 @@ interface DeliveredAccountsProps {
   copyLabel: string;
   copiedLabel: string;
   copiedToastMessage: string;
+  // Accounts that came in through a warranty replacement — shown with a badge.
+  replacedAccounts?: string[];
+  warrantyBadgeLabel?: string;
 }
 
 // One account = one row, exactly as delivered (full raw "|"-separated
 // string) — no attempt to split it into labeled fields, so the row a user
 // copies is always identical to what they see.
-export const DeliveredAccounts: React.FC<DeliveredAccountsProps> = ({ accounts, copyLabel, copiedLabel, copiedToastMessage }) => {
+export const DeliveredAccounts: React.FC<DeliveredAccountsProps> = ({ accounts, copyLabel, copiedLabel, copiedToastMessage, replacedAccounts, warrantyBadgeLabel }) => {
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
 
   const copyOne = (line: string, idx: number) => {
@@ -36,6 +39,9 @@ export const DeliveredAccounts: React.FC<DeliveredAccountsProps> = ({ accounts, 
               xuống dòng hiển thị hết toàn bộ chuỗi thông tin — nút Copy vẫn
               luôn sao chép đúng nguyên văn dòng đầy đủ, chỉ phần hiển thị bị
               rút gọn. Hover vào (desktop) vẫn xem được toàn bộ qua title. */}
+          {warrantyBadgeLabel && replacedAccounts?.includes(line) && (
+            <span className="flex-shrink-0 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-600 dark:text-purple-400 border border-purple-500/30">{warrantyBadgeLabel}</span>
+          )}
           <span
             title={line}
             className="flex-1 min-w-0 font-mono text-[11px] text-emerald-700 dark:text-emerald-300 truncate select-all"

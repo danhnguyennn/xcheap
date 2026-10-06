@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Product, ProductVariant, User, Language, UserRole, CryptoNetwork, CryptoOption, Voucher, Review, ReviewSuggestion, Order, CtvDeduction, PreOrder, AdminAuditLogEntry } from '../types';
+import { Product, ProductVariant, User, Language, UserRole, CryptoNetwork, CryptoOption, Voucher, Review, ReviewSuggestion, Order, CtvDeduction, PreOrder, AdminAuditLogEntry, WarrantyClaim } from '../types';
 import { translations } from '../locales/translations';
 import { formatMoney } from '../utils/pricing';
 import { SimpleBarChart, BarChartDatum } from '../components/charts/SimpleBarChart';
@@ -55,6 +55,10 @@ interface AdminPageProps {
 
 const EMPTY_SUGGESTION_TEXT: Record<Language, string> = { vn: '', en: '', zh: '', th: '', ja: '' };
 const SUGGESTION_LANGUAGE_LABELS: Record<Language, string> = { vn: 'VN', en: 'EN', zh: 'ZH', th: 'TH', ja: 'JA' };
+// Username is the first pipe-separated field of an account line (same rule as
+// the server's inventoryUsernameKey) — used to show a short label for a
+// replaced account without printing its password/token.
+const splitAccountUser = (line: string): string => line.split('|')[0].trim();
 
 export const AdminPage: React.FC<AdminPageProps> = ({
   user,
@@ -289,7 +293,17 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   const [allOrders, setAllOrders] = useState<Order[]>([]);
   const [orderSearch, setOrderSearch] = useState('');
   const [orderStatusFilter, setOrderStatusFilter] = useState<'all' | 'completed' | 'refunded'>('all');
-  const [refundingOrderCode, setRefundingOrderCode] = useState<string | null>(null);
+  // Order detail modal — fetched on demand (the list omits delivered accounts).
+  const [detailOrder, setDetailOrder] = useState<Order | null>(null);
+  const [loadingDetailOrderCode, setLoadingDetailOrderCode] = useState<string | null>(null);
+  // Which account rows have their extra fields expanded in the modal.
+  const [openAccountRows, setOpenAccountRows] = useState<Record<number, boolean>>({});
+  // Warranty state for the open order: its claim history, remaining window /
+  // replacement quota, and which delivered accounts admin ticked as broken.
+  const [detailClaims, setDetailClaims] = useState<WarrantyClaim[]>([]);
+  const [detailWarranty, setDetailWarranty] = useState<{ windowEndsAt: string; withinWindow: boolean; replacedCount: number; replaceRemaining: number } | null>(null);
+  const [brokenSelection, setBrokenSelection] = useState<Record<number, boolean>>({});
+  const [submittingWarranty, setSubmittingWarranty] = useState(false);
 
   // "Đang online" stat — polled independently of fetchAdminData (which only
   // runs on mount/after an action) so the number actually stays live while
@@ -1392,9 +1406,68 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   };
 
   // Refunds an order's totalPrice straight back into the buyer's wallet and
-  // marks it refunded — money-affecting and not reversible from this UI, so
-  // it's gated behind a confirm dialog rather than firing on one click.
-  const handleRefundOrder = (order: Order) => {
+  // Opens the order detail modal, fetching the full order (incl. delivered
+  // accounts) from the server — the list endpoint deliberately omits them.
+  const openOrderDetail = async (orderCode: string) => {
+    setOpenAccountRows({});
+    setBrokenSelection({});
+    setLoadingDetailOrderCode(orderCode);
+    try {
+      const res = await fetch(`/api/admin/orders/${orderCode}`);
+      const data = await res.json();
+      if (res.ok) {
+        setDetailOrder(data.order);
+        setDetailClaims(data.claims || []);
+        setDetailWarranty(data.warranty || null);
+      } else {
+        showNotification(null, data.error || 'Lỗi tải chi tiết đơn hàng');
+      }
+    } catch (e) {
+      showNotification(null, 'Lỗi kết nối máy chủ');
+    } finally {
+      setLoadingDetailOrderCode(null);
+    }
+  };
+
+  // Warranty actions — both are admin-only, both server-validated against the
+  // 72h window and the purchased quantity. Refreshes the open order and the
+  // orders list afterwards so the new state (replaced accounts / refunded
+  // status) shows up straight away.
+  const submitWarrantyReplace = (order: Order) => {
+    const chosen = order.accounts.filter((_, idx) => brokenSelection[idx]);
+    askConfirm(
+      <>
+        Bù <strong className="text-slate-900 dark:text-slate-100">{chosen.length} tài khoản lỗi</strong> cho đơn{' '}
+        <strong className="text-slate-900 dark:text-slate-100">#{order.orderCode}</strong> của{' '}
+        <strong className="text-slate-900 dark:text-slate-100">{order.username}</strong>?
+        <div className="text-[11px] text-slate-500 dark:text-slate-500 mt-1">Tài khoản thay thế lấy từ kho của CTV đã đăng tải. Hành động này không thể hoàn tác.</div>
+      </>,
+      async () => {
+        setSubmittingWarranty(true);
+        try {
+          const res = await fetch(`/api/admin/orders/${order.orderCode}/warranty/replace`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ brokenAccounts: chosen }),
+          });
+          const data = await res.json();
+          if (res.ok) {
+            showNotification(`✅ Đã bù ${chosen.length} tài khoản cho đơn #${order.orderCode.toUpperCase()}`);
+            await openOrderDetail(order.orderCode);
+            fetchAdminData();
+          } else {
+            showNotification(null, data.error || 'Lỗi bù tài khoản');
+          }
+        } catch (e) {
+          showNotification(null, 'Lỗi kết nối máy chủ');
+        } finally {
+          setSubmittingWarranty(false);
+        }
+      }
+    );
+  };
+
+  const submitWarrantyRefund = (order: Order) => {
     askConfirm(
       <>
         Hoàn tiền đơn <strong className="text-slate-900 dark:text-slate-100">#{order.orderCode}</strong> vào ví{' '}
@@ -1403,22 +1476,24 @@ export const AdminPage: React.FC<AdminPageProps> = ({
         <div className="text-[11px] text-slate-500 dark:text-slate-500 mt-1">Hành động này không thể hoàn tác.</div>
       </>,
       async () => {
-      setRefundingOrderCode(order.orderCode);
-      try {
-        const res = await fetch(`/api/orders/${order.orderCode}/refund`, { method: 'POST' });
-        const data = await res.json();
-        if (res.ok) {
-          showNotification(`✅ Đã hoàn $${formatMoney(order.totalPrice)} cho đơn #${order.orderCode}`);
-          fetchAdminData();
-        } else {
-          showNotification(null, data.error || 'Lỗi hoàn tiền đơn hàng');
+        setSubmittingWarranty(true);
+        try {
+          const res = await fetch(`/api/admin/orders/${order.orderCode}/warranty/refund`, { method: 'POST' });
+          const data = await res.json();
+          if (res.ok) {
+            showNotification(`✅ Đã hoàn $${formatMoney(order.totalPrice)} cho đơn #${order.orderCode}`);
+            await openOrderDetail(order.orderCode);
+            fetchAdminData();
+          } else {
+            showNotification(null, data.error || 'Lỗi hoàn tiền bảo hành');
+          }
+        } catch (e) {
+          showNotification(null, 'Lỗi kết nối máy chủ');
+        } finally {
+          setSubmittingWarranty(false);
         }
-      } catch (e) {
-        showNotification(null, 'Lỗi hoàn tiền đơn hàng');
-      } finally {
-        setRefundingOrderCode(null);
       }
-    });
+    );
   };
 
   // Toggle a single variant on/off the storefront (same idea, scoped to one
@@ -3585,24 +3660,23 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                                     Hoàn thành
                                   </span>
                                 )}
+                                {!!o.warrantyReplacedCount && (
+                                  <div className="mt-1 text-[10px] font-semibold text-purple-600 dark:text-purple-400">
+                                    Bảo hành: bù {o.warrantyReplacedCount}/{o.quantity}
+                                  </div>
+                                )}
                               </td>
                               <td className="p-3 font-mono text-[10px] text-slate-600 dark:text-slate-400 whitespace-nowrap">
                                 {new Date(o.createdAt).toLocaleString('vi-VN')}
                               </td>
-                              <td className="p-3 text-right">
-                                {o.status === 'refunded' ? (
-                                  <span className="text-[10px] text-slate-500 dark:text-slate-500">
-                                    {o.refundedAt ? new Date(o.refundedAt).toLocaleDateString('vi-VN') : ''}
-                                  </span>
-                                ) : (
-                                  <button
-                                    onClick={() => handleRefundOrder(o)}
-                                    disabled={refundingOrderCode === o.orderCode}
-                                    className="bg-red-50 dark:bg-red-950/70 hover:bg-red-100 hover:dark:bg-red-900/70 text-red-700 dark:text-red-300 border border-red-500/30 px-2.5 py-1 rounded text-[10px] font-bold disabled:opacity-40 disabled:cursor-not-allowed transition"
-                                  >
-                                    {refundingOrderCode === o.orderCode ? 'Đang hoàn...' : 'Hoàn tiền'}
-                                  </button>
-                                )}
+                              <td className="p-3 text-right whitespace-nowrap">
+                                <button
+                                  onClick={() => openOrderDetail(o.orderCode)}
+                                  disabled={loadingDetailOrderCode === o.orderCode}
+                                  className="bg-[#e7ebe9] dark:bg-[#282a30] hover:bg-[#dde1df] hover:dark:bg-[#32353c] text-slate-700 dark:text-slate-300 border border-[#dde2e0] dark:border-[#373b43] px-2.5 py-1 rounded text-[10px] font-bold disabled:opacity-40 disabled:cursor-not-allowed transition mr-1.5"
+                                >
+                                  {loadingDetailOrderCode === o.orderCode ? 'Đang tải...' : 'Chi tiết'}
+                                </button>
                               </td>
                             </tr>
                           ))}
@@ -3640,6 +3714,283 @@ export const AdminPage: React.FC<AdminPageProps> = ({
             })()}
           </div>
         )}
+
+        {/* Order detail modal — opened from the "Chi tiết" button above. */}
+        {detailOrder && (() => {
+          const accounts = detailOrder.accounts || [];
+          const canSelectBroken = detailOrder.status !== 'refunded' && !!detailWarranty?.withinWindow && (detailWarranty?.replaceRemaining ?? 0) > 0;
+          const selectedBrokenCount = Object.values(brokenSelection).filter(Boolean).length;
+          const replaceRemaining = detailWarranty?.replaceRemaining ?? 0;
+          // Username is the first pipe-separated field — same rule the server
+          // uses (inventoryUsernameKey). The rest of the line is kept intact
+          // so "copy line" and the expanded view never lose any data.
+          const splitAccount = (line: string) => {
+            const idx = line.indexOf('|');
+            return idx === -1 ? { user: line.trim(), rest: '' } : { user: line.slice(0, idx).trim(), rest: line.slice(idx + 1) };
+          };
+          const copyText = (text: string, message: string) => {
+            navigator.clipboard.writeText(text);
+            showCopyToast(message);
+          };
+          const cardCls = 'bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dde2e0] dark:border-[#373b43] rounded-xl px-3 py-2.5';
+          const labelCls = 'text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-500 mb-1';
+          return (
+            <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={() => setDetailOrder(null)}>
+              <div
+                className="bg-[#eceeed] dark:bg-[#23252a] border border-purple-500/50 rounded-2xl max-w-2xl w-full shadow-2xl max-h-[90vh] flex flex-col"
+                onClick={(e) => e.stopPropagation()}
+              >
+                {/* Header */}
+                <div className="flex items-center justify-between gap-3 px-5 py-4 border-b border-[#e0e4e2] dark:border-[#33363e]">
+                  <div>
+                    <div className="text-[11px] text-slate-500 dark:text-slate-500">Chi tiết đơn hàng</div>
+                    <h3 className="text-base font-bold font-mono text-slate-900 dark:text-slate-100">#{detailOrder.orderCode.toUpperCase()}</h3>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    {detailOrder.status === 'refunded' ? (
+                      <span className="px-2 py-1 rounded text-[10px] font-bold uppercase bg-red-500/20 text-red-600 dark:text-red-400 border border-red-500/30">Đã hoàn tiền</span>
+                    ) : (
+                      <span className="px-2 py-1 rounded text-[10px] font-bold uppercase bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30">Hoàn thành</span>
+                    )}
+                    <button onClick={() => setDetailOrder(null)} className="text-slate-600 dark:text-slate-400 hover:text-slate-900 hover:dark:text-slate-100 text-lg leading-none">✕</button>
+                  </div>
+                </div>
+
+                {/* Body */}
+                <div className="p-5 overflow-y-auto space-y-5 text-xs">
+                  {/* Summary */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    <div className={cardCls}>
+                      <div className={labelCls}>Khách hàng</div>
+                      <div className="font-semibold text-slate-900 dark:text-slate-100 break-all">{detailOrder.username}</div>
+                    </div>
+                    <div className={cardCls}>
+                      <div className={labelCls}>Số lượng</div>
+                      <div className="font-mono font-semibold text-slate-900 dark:text-slate-100">{detailOrder.quantity}</div>
+                    </div>
+                    <div className={cardCls}>
+                      <div className={labelCls}>Đơn giá</div>
+                      <div className="font-mono font-semibold text-slate-900 dark:text-slate-100">${formatMoney(detailOrder.unitPrice)}</div>
+                    </div>
+                    <div className={cardCls}>
+                      <div className={labelCls}>Tổng tiền</div>
+                      <div className="font-mono font-bold text-emerald-600 dark:text-emerald-400">${formatMoney(detailOrder.totalPrice)}</div>
+                    </div>
+                  </div>
+
+                  {/* Product & timing */}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className={cardCls}>
+                      <div className={labelCls}>Sản phẩm</div>
+                      <div className="font-semibold text-slate-900 dark:text-slate-100">{detailOrder.productName}</div>
+                      <div className="text-[11px] text-slate-600 dark:text-slate-400">{detailOrder.variantName}</div>
+                    </div>
+                    <div className={cardCls}>
+                      <div className={labelCls}>Thời gian đặt</div>
+                      <div className="font-mono text-slate-800 dark:text-slate-200">{new Date(detailOrder.createdAt).toLocaleString('vi-VN')}</div>
+                      {detailOrder.status === 'refunded' && detailOrder.refundedAt && (
+                        <>
+                          <div className={`${labelCls} mt-2`}>Hoàn tiền lúc</div>
+                          <div className="font-mono text-red-600 dark:text-red-400">{new Date(detailOrder.refundedAt).toLocaleString('vi-VN')}</div>
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* CTV sources */}
+                  {detailOrder.uploaderBreakdown && detailOrder.uploaderBreakdown.length > 0 && (
+                    <div>
+                      <div className={labelCls}>Nguồn hàng (CTV đăng tải)</div>
+                      <div className="divide-y divide-[#e4e8e7] dark:divide-[#2d3036] border border-[#dde2e0] dark:border-[#373b43] rounded-xl overflow-hidden">
+                        {detailOrder.uploaderBreakdown.map((u) => (
+                          <div key={u.userId} className="flex justify-between px-3 py-2 bg-[#eff2f1] dark:bg-[#1d1f24]">
+                            <span className="text-slate-800 dark:text-slate-200 font-semibold">{u.username}</span>
+                            <span className="font-mono text-slate-600 dark:text-slate-400">× {u.quantity}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Delivered accounts */}
+                  <div>
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                      <div className={labelCls.replace('mb-1', '')}>Tài khoản đã giao ({accounts.length})</div>
+                      {accounts.length > 0 && (
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => copyText(accounts.map((a) => splitAccount(a).user).join('\n'), `Đã sao chép ${accounts.length} username`)}
+                            className="text-[11px] font-semibold px-2.5 py-1 rounded-lg bg-[#e7ebe9] dark:bg-[#282a30] hover:bg-[#dde1df] hover:dark:bg-[#32353c] text-slate-700 dark:text-slate-300 inline-flex items-center gap-1 transition"
+                          >
+                            <Copy className="w-3 h-3" />
+                            Copy tất cả username
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => copyText(accounts.join('\n'), `Đã sao chép ${accounts.length} tài khoản`)}
+                            className="text-[11px] font-semibold px-2.5 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white inline-flex items-center gap-1 transition"
+                          >
+                            <Copy className="w-3 h-3" />
+                            Copy tất cả
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    {accounts.length === 0 ? (
+                      <div className="text-center text-[11px] text-slate-500 dark:text-slate-500 py-4 border border-dashed border-[#dde2e0] dark:border-[#373b43] rounded-xl">
+                        Không có tài khoản nào được ghi nhận cho đơn này.
+                      </div>
+                    ) : (
+                      <div className="max-h-[320px] overflow-y-auto border border-[#dde2e0] dark:border-[#373b43] rounded-xl divide-y divide-[#e4e8e7] dark:divide-[#2d3036] bg-[#f5f6f6] dark:bg-[#1a1b1f]">
+                        {accounts.map((acc, idx) => {
+                          const { user, rest } = splitAccount(acc);
+                          const isOpen = !!openAccountRows[idx];
+                          return (
+                            <div key={idx} className="px-3 py-2">
+                              <div className="flex items-center gap-2">
+                                {canSelectBroken && (
+                                  <input
+                                    type="checkbox"
+                                    checked={!!brokenSelection[idx]}
+                                    onChange={(e) => setBrokenSelection((prev) => ({ ...prev, [idx]: e.target.checked }))}
+                                    className="shrink-0 accent-purple-600"
+                                    title="Đánh dấu tài khoản lỗi để bù"
+                                  />
+                                )}
+                                <span className="text-[10px] font-mono text-slate-500 dark:text-slate-500 w-6 shrink-0">{idx + 1}.</span>
+                                {detailOrder.warrantyReplacedAccounts?.includes(acc) && (
+                                  <span className="shrink-0 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-600 dark:text-purple-400 border border-purple-500/30">Bảo hành</span>
+                                )}
+                                <span className="flex-1 min-w-0 font-mono font-semibold text-slate-900 dark:text-slate-100 truncate" title={user}>{user}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => copyText(user, `Đã sao chép username ${user}`)}
+                                  className="text-[10px] font-semibold px-2 py-1 rounded bg-[#e7ebe9] dark:bg-[#282a30] hover:bg-[#dde1df] hover:dark:bg-[#32353c] text-slate-700 dark:text-slate-300 transition shrink-0"
+                                >
+                                  Copy user
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => copyText(acc, 'Đã sao chép tài khoản')}
+                                  className="text-[10px] font-semibold px-2 py-1 rounded bg-[#e7ebe9] dark:bg-[#282a30] hover:bg-[#dde1df] hover:dark:bg-[#32353c] text-slate-700 dark:text-slate-300 transition shrink-0"
+                                >
+                                  Copy dòng
+                                </button>
+                                {rest && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setOpenAccountRows((prev) => ({ ...prev, [idx]: !prev[idx] }))}
+                                    className="text-[10px] font-semibold text-purple-600 dark:text-purple-400 hover:underline inline-flex items-center gap-0.5 shrink-0"
+                                  >
+                                    <ChevronRight className={`w-3 h-3 transition-transform ${isOpen ? 'rotate-90' : ''}`} />
+                                    Chi tiết
+                                  </button>
+                                )}
+                              </div>
+                              {rest && isOpen && (
+                                <div className="mt-1.5 ml-8 font-mono text-[11px] text-slate-600 dark:text-slate-400 break-all bg-[#eceeed] dark:bg-[#23252a] rounded px-2 py-1.5">
+                                  {rest}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Warranty — 72h window, replace broken accounts from the same CTV's stock (capped at the quantity bought) or refund the whole order */}
+                  <div className="border-t border-[#e0e4e2] dark:border-[#33363e] pt-4 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className={labelCls.replace('mb-1', '')}>Bảo hành</div>
+                      {detailWarranty && (
+                        <span className={`text-[10px] font-semibold px-2 py-0.5 rounded border ${detailWarranty.withinWindow ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/30' : 'bg-slate-500/15 text-slate-600 dark:text-slate-400 border-slate-500/30'}`}>
+                          {detailWarranty.withinWindow
+                            ? `Còn hạn đến ${new Date(detailWarranty.windowEndsAt).toLocaleString('vi-VN')}`
+                            : detailOrder.status === 'refunded' ? 'Đơn đã hoàn tiền' : 'Đã hết hạn bảo hành (72 giờ)'}
+                        </span>
+                      )}
+                    </div>
+
+                    {detailWarranty && (
+                      <div className="text-[11px] text-slate-600 dark:text-slate-400">
+                        Đã bù {detailWarranty.replacedCount}/{detailOrder.quantity} tài khoản — còn có thể bù tối đa {replaceRemaining}.
+                      </div>
+                    )}
+
+                    {(canSelectBroken || detailWarranty?.withinWindow) && (
+                      <div className="flex flex-wrap items-center gap-2">
+                        {canSelectBroken && (
+                          <button
+                            type="button"
+                            disabled={submittingWarranty || selectedBrokenCount === 0 || selectedBrokenCount > replaceRemaining}
+                            onClick={() => submitWarrantyReplace(detailOrder)}
+                            className="text-[11px] font-bold px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white disabled:opacity-40 disabled:cursor-not-allowed transition"
+                          >
+                            Bù {selectedBrokenCount} tài khoản lỗi
+                          </button>
+                        )}
+                        {detailWarranty?.withinWindow && (
+                          <button
+                            type="button"
+                            disabled={submittingWarranty}
+                            onClick={() => submitWarrantyRefund(detailOrder)}
+                            className="text-[11px] font-bold px-3 py-1.5 rounded-lg bg-red-50 dark:bg-red-950/70 hover:bg-red-100 hover:dark:bg-red-900/70 text-red-700 dark:text-red-300 border border-red-500/30 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                          >
+                            Hoàn tiền
+                          </button>
+                        )}
+                        {selectedBrokenCount > replaceRemaining && canSelectBroken && (
+                          <span className="text-[10px] text-red-600 dark:text-red-400">Đã chọn quá số lượng còn được bù</span>
+                        )}
+                      </div>
+                    )}
+
+                    {detailClaims.length > 0 && (
+                      <div className="space-y-1.5">
+                        <div className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-500">Lịch sử bảo hành</div>
+                        {detailClaims.map((c) => (
+                          <div key={c.id} className="text-[11px] bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dde2e0] dark:border-[#373b43] rounded-lg px-3 py-2">
+                            <div className="flex justify-between gap-2">
+                              <span className="font-semibold text-slate-800 dark:text-slate-200">
+                                {c.action === 'replace' ? `Bù ${c.replacements?.length || 0} tài khoản` : 'Hoàn tiền toàn đơn'}
+                              </span>
+                              <span className="font-mono text-slate-500 dark:text-slate-500">{new Date(c.createdAt).toLocaleString('vi-VN')}</span>
+                            </div>
+                            <div className="text-slate-500 dark:text-slate-500">bởi {c.adminUsername}</div>
+                            {c.action === 'replace' && c.replacements && c.replacements.length > 0 && (
+                              <div className="mt-2 space-y-1 border-t border-[#dde2e0] dark:border-[#373b43] pt-2">
+                                {c.replacements.map((r, i) => (
+                                  <div key={i} className="flex items-center gap-2 font-mono">
+                                    <span className="text-red-600 dark:text-red-400 line-through truncate">{splitAccountUser(r.broken)}</span>
+                                    <span className="text-slate-400">→</span>
+                                    <span className="text-emerald-600 dark:text-emerald-400 font-semibold truncate flex-1">{splitAccountUser(r.replacement)}</span>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        navigator.clipboard.writeText(r.replacement);
+                                        showCopyToast('Đã sao chép tài khoản mới');
+                                      }}
+                                      className="text-[10px] font-semibold px-2 py-0.5 rounded bg-[#e7ebe9] dark:bg-[#282a30] hover:bg-[#dde1df] hover:dark:bg-[#32353c] text-slate-700 dark:text-slate-300 shrink-0"
+                                    >
+                                      Copy dòng
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* TAB 6: RPC GATEWAY MONITOR */}
         {activeTab === 'rpc' && (

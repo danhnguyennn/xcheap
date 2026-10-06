@@ -4,7 +4,7 @@ import express from 'express';
 import path from 'path';
 import { cryptoOptions } from './src/data/storeData';
 import { getVipTier } from './src/data/vipTiers';
-import { User, UserRole, Product, Order, PreOrder, AdminNotification, DepositTransaction, CryptoNetwork, CryptoOption, WithdrawalRequest, CtvStats, Category, Voucher, Review, ReviewSuggestion, Language, CtvDeduction, AdminAuditLogEntry } from './src/types';
+import { User, UserRole, Product, Order, PreOrder, AdminNotification, DepositTransaction, CryptoNetwork, CryptoOption, WithdrawalRequest, CtvStats, Category, Voucher, Review, ReviewSuggestion, Language, CtvDeduction, AdminAuditLogEntry, WarrantyClaim } from './src/types';
 import { db, generateObjectId, MongoCollection, inventoryUsernameKey } from './server/mongodb';
 import { getOrCreateUserWallet, ensureUserDepositWallets } from './server/walletVault';
 import { sessionMiddleware, getSessionUser, requireAuth, requireRole, hashPassword, verifyPassword, toPublicUser, generateApiKey } from './server/auth';
@@ -2153,6 +2153,189 @@ app.get('/api/admin/orders', requireRole('admin'), async (req, res) => {
   const orders = await orderCol.find({}, ORDERS_WITHOUT_ACCOUNTS);
   orders.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   res.json({ orders });
+});
+
+// Full detail for one order, including the delivered account credentials —
+// the list endpoint above strips `accounts` to keep the table light, so the
+// admin UI fetches this only when someone opens a specific order (e.g. to
+// answer "I didn't receive my account" disputes).
+app.get('/api/admin/orders/:orderCode', requireRole('admin'), async (req, res) => {
+  const orderCol = db.collection<Order>('orders');
+  const order = await orderCol.findOne({ orderCode: req.params.orderCode });
+  if (!order) return res.status(404).json({ error: 'Không tìm thấy đơn hàng' });
+  const claims = await db.collection<WarrantyClaim>('warranty_claims').find({ orderCode: order.orderCode });
+  claims.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  res.json({ order, claims, warranty: warrantyStatus(order, claims) });
+});
+
+// Warranty: a claim is only valid within WARRANTY_WINDOW_MS of the purchase
+// and only on an order that hasn't been refunded. Replacements can never
+// exceed the quantity the buyer actually bought, counted across every claim
+// on that order together.
+const WARRANTY_WINDOW_MS = 72 * 60 * 60 * 1000;
+
+function warrantyStatus(order: Order, claims: WarrantyClaim[]) {
+  const windowEndsAt = new Date(new Date(order.createdAt).getTime() + WARRANTY_WINDOW_MS).toISOString();
+  const replacedCount = claims.reduce((sum, c) => sum + (c.replacements?.length || 0), 0);
+  return {
+    windowEndsAt,
+    withinWindow: order.status !== 'refunded' && Date.now() <= new Date(windowEndsAt).getTime(),
+    replacedCount,
+    replaceRemaining: Math.max(0, order.quantity - replacedCount),
+  };
+}
+
+app.post('/api/admin/orders/:orderCode/warranty/replace', requireRole('admin'), async (req, res) => {
+  const orderCol = db.collection<Order>('orders');
+  const invCol = db.collection<any>('inventory');
+  const claimCol = db.collection<WarrantyClaim>('warranty_claims');
+
+  const order = await orderCol.findOne({ orderCode: req.params.orderCode });
+  if (!order) return res.status(404).json({ error: 'Không tìm thấy đơn hàng' });
+  const claims = await claimCol.find({ orderCode: order.orderCode });
+  const status = warrantyStatus(order, claims);
+  if (!status.withinWindow) {
+    return res.status(400).json({ error: 'Đơn này không còn trong thời hạn bảo hành (72 giờ) hoặc đã hoàn tiền' });
+  }
+
+  const input = req.body?.brokenAccounts;
+  if (!Array.isArray(input) || input.length === 0 || !input.every((s) => typeof s === 'string')) {
+    return res.status(400).json({ error: 'Vui lòng chọn ít nhất một tài khoản lỗi' });
+  }
+  const broken = Array.from(new Set(input as string[]));
+  if (broken.length > status.replaceRemaining) {
+    return res.status(400).json({ error: `Chỉ còn có thể bù tối đa ${status.replaceRemaining} tài khoản cho đơn này` });
+  }
+  if (broken.some((b) => !order.accounts.includes(b))) {
+    return res.status(400).json({ error: 'Có tài khoản không thuộc đơn này' });
+  }
+
+  // The CTV who supplied each broken account is recorded on the sold
+  // inventory row (still kept for 1 month — see cleanupOldSoldInventory).
+  const soldRows = await invCol.find({
+    variantId: order.variantId,
+    isSold: true,
+    soldToUserId: order.userId,
+    accountData: { $in: broken },
+  });
+  const supplierOf = new Map<string, { id: string; username: string }>();
+  for (const row of soldRows) {
+    if (row.uploadedByUserId) supplierOf.set(row.accountData, { id: row.uploadedByUserId, username: row.uploadedByUsername || '' });
+  }
+  const unresolved = broken.filter((b) => !supplierOf.has(b));
+  if (unresolved.length > 0) {
+    return res.status(400).json({ error: 'Không xác định được CTV cung cấp một số tài khoản lỗi — chỉ có thể hoàn tiền cho đơn này' });
+  }
+
+  // Claim one unsold account per broken one, from that same CTV's stock.
+  // Each claim is guarded on isSold:false so a concurrent buyer can't take it.
+  const claimedIds: string[] = [];
+  const replacementFor = new Map<string, string>();
+  const releaseClaimed = async () => {
+    for (const id of claimedIds) {
+      await invCol.updateOne({ id }, { $set: { isSold: false } });
+    }
+  };
+  for (const b of broken) {
+    const supplier = supplierOf.get(b)!;
+    const candidates = await invCol.find(
+      { variantId: order.variantId, isSold: false, uploadedByUserId: supplier.id },
+      { limit: 20 }
+    );
+    let picked: any = null;
+    for (const cand of candidates) {
+      const claim = await invCol.updateOne(
+        { id: cand.id, isSold: false },
+        { $set: { isSold: true, soldToUserId: order.userId, soldAt: new Date().toISOString() } }
+      );
+      if (claim.matchedCount === 1) {
+        picked = cand;
+        break;
+      }
+    }
+    if (!picked) {
+      await releaseClaimed();
+      return res.status(400).json({
+        error: `Kho của CTV "${supplier.username}" không còn tài khoản để bù — chỉ có thể hoàn tiền cho đơn này`,
+      });
+    }
+    claimedIds.push(picked.id);
+    replacementFor.set(b, picked.accountData);
+  }
+
+  const newAccounts = order.accounts.map((a) => replacementFor.get(a) ?? a);
+  const replacementList = broken.map((b) => replacementFor.get(b)!);
+  await orderCol.updateOne(
+    { orderCode: order.orderCode },
+    {
+      $set: {
+        accounts: newAccounts,
+        warrantyReplacedCount: (order.warrantyReplacedCount || 0) + broken.length,
+        warrantyReplacedAccounts: [...(order.warrantyReplacedAccounts || []), ...replacementList],
+      },
+    }
+  );
+
+  const admin = (await getSessionUser(req))!;
+  const claim: WarrantyClaim = {
+    id: 'war_' + generateObjectId(),
+    orderCode: order.orderCode,
+    userId: order.userId,
+    username: order.username,
+    action: 'replace',
+    replacements: broken.map((b) => ({ broken: b, replacement: replacementFor.get(b)!, ctvUserId: supplierOf.get(b)!.id })),
+    createdAt: new Date().toISOString(),
+    adminId: admin.id,
+    adminUsername: admin.username,
+  };
+  await claimCol.insertOne(claim);
+  await logAdminAction(admin, 'warranty.replace', `Bù ${broken.length} tài khoản lỗi cho đơn #${order.orderCode} của ${order.username}`, order.orderCode);
+  res.json({ success: true, claim, accounts: newAccounts });
+});
+
+app.post('/api/admin/orders/:orderCode/warranty/refund', requireRole('admin'), async (req, res) => {
+  const orderCol = db.collection<Order>('orders');
+  const userCol = db.collection<User>('users');
+  const claimCol = db.collection<WarrantyClaim>('warranty_claims');
+
+  const order = await orderCol.findOne({ orderCode: req.params.orderCode });
+  if (!order) return res.status(404).json({ error: 'Không tìm thấy đơn hàng' });
+  const claims = await claimCol.find({ orderCode: order.orderCode });
+  if (!warrantyStatus(order, claims).withinWindow) {
+    return res.status(400).json({ error: 'Đơn này không còn trong thời hạn bảo hành (72 giờ) hoặc đã hoàn tiền' });
+  }
+
+  // Same guarded status flip as the regular order refund: only credit the
+  // wallet if this update actually claimed the order.
+  const refundedAt = new Date().toISOString();
+  const flip = await orderCol.updateOne(
+    { orderCode: order.orderCode, status: { $ne: 'refunded' } },
+    { $set: { status: 'refunded', refundedAt } }
+  );
+  if (flip.matchedCount === 0) {
+    return res.status(400).json({ error: 'Đơn hàng này đã được hoàn tiền trước đó' });
+  }
+  try {
+    await userCol.updateOne({ id: order.userId }, { $inc: { balance: order.totalPrice } });
+  } catch (err) {
+    await orderCol.updateOne({ orderCode: order.orderCode }, { $set: { status: 'completed', refundedAt: '' } });
+    throw err;
+  }
+
+  const admin = (await getSessionUser(req))!;
+  const claim: WarrantyClaim = {
+    id: 'war_' + generateObjectId(),
+    orderCode: order.orderCode,
+    userId: order.userId,
+    username: order.username,
+    action: 'refund',
+    createdAt: refundedAt,
+    adminId: admin.id,
+    adminUsername: admin.username,
+  };
+  await claimCol.insertOne(claim);
+  await logAdminAction(admin, 'warranty.refund', `Hoàn tiền bảo hành đơn #${order.orderCode} ($${order.totalPrice}) cho ${order.username}`, order.orderCode);
+  res.json({ success: true, claim });
 });
 
 // CTV order management — only orders this CTV actually contributed stock to

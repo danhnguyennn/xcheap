@@ -217,6 +217,13 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ language, onBackToStore,
                           {t.ordersCompleted}
                         </span>
                       )}
+                      {!!order.warrantyReplacedCount && (
+                        <span className="bg-purple-50 dark:bg-purple-950/70 text-purple-700 dark:text-purple-300 text-[10px] font-bold px-2 py-0.5 rounded border border-purple-500/30">
+                          {t.warrantyReplacedNote
+                            .replace('{n}', String(order.warrantyReplacedCount))
+                            .replace('{total}', String(order.quantity))}
+                        </span>
+                      )}
                     </div>
                     <div className="text-slate-600 dark:text-slate-400 text-[11px] font-medium mt-0.5 truncate">
                       {order.productName} - {order.variantName}
@@ -282,6 +289,8 @@ export const OrdersPage: React.FC<OrdersPageProps> = ({ language, onBackToStore,
                       copyLabel={t.copyOne}
                       copiedLabel={t.copied}
                       copiedToastMessage={t.copiedAccountToast}
+                      replacedAccounts={order.warrantyReplacedAccounts}
+                      warrantyBadgeLabel={t.warrantyReplacedBadge}
                     />
                   </div>
                 )}
