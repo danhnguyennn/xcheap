@@ -2946,6 +2946,23 @@ app.delete('/api/admin/inventory/:id', requireRole('admin'), async (req, res) =>
   res.json({ success: true });
 });
 
+// Bulk delete — used after a "Check Live" pass over unsold inventory to
+// clear out the ones that came back dead/suspended in one request instead of
+// one DELETE per row. Scoped to isSold:false in the filter itself (not just
+// checked beforehand) so a row that sold in the gap between the check and
+// this call can never be deleted out from under its buyer.
+app.post('/api/admin/inventory/bulk-delete', requireRole('admin'), async (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0 || !ids.every((i) => typeof i === 'string')) {
+    return res.status(400).json({ error: 'Thiếu danh sách id tài khoản cần xóa' });
+  }
+  const invCol = db.collection<any>('inventory');
+  const result = await invCol.deleteMany({ id: { $in: ids }, isSold: false });
+  const admin = (await getSessionUser(req))!;
+  await logAdminAction(admin, 'inventory.bulk_delete', `Xóa ${result.deletedCount} tài khoản kho hàng (sau khi Check Live)`);
+  res.json({ success: true, deletedCount: result.deletedCount });
+});
+
 // 13. Admin: Users CRUD (MongoDB: find, insertOne, updateOne, deleteOne) — admin only
 app.get('/api/admin/users', requireRole('admin'), async (req, res) => {
   const userCol = db.collection<User>('users');
@@ -3087,6 +3104,37 @@ app.put('/api/admin/users/:id', requireRole('admin'), async (req, res) => {
     await logAdminAction(admin, 'user.update', `Cập nhật tài khoản "${beforeUser?.username || id}": ${JSON.stringify(updateFields)}`, id);
   }
   res.json({ success: true, user: updatedUser ? toPublicUser(updatedUser) : null });
+});
+
+// Admin resets a user's password when they've lost access (forgot password,
+// locked out of their email, etc.) — either to a specific password admin
+// chose (newPassword), or, if left blank, a fresh random one. Either way the
+// resulting password is returned once in the response so admin can hand it
+// over, same pattern as account creation's tempPassword. Bumps authVersion
+// to invalidate every existing session on the account, exactly like a
+// self-service password change, so a session an attacker already had open is
+// kicked out too. If the admin is resetting their own password, their own
+// current session is re-stamped so they don't get logged out by their own action.
+app.post('/api/admin/users/:id/reset-password', requireRole('admin'), async (req, res) => {
+  const { id } = req.params;
+  const { newPassword } = req.body;
+  if (newPassword !== undefined && (typeof newPassword !== 'string' || newPassword.length < 6)) {
+    return res.status(400).json({ error: 'Mật khẩu mới phải có ít nhất 6 ký tự' });
+  }
+  const userCol = db.collection<User>('users');
+  const target = await userCol.findOne({ id });
+  if (!target) return res.status(404).json({ error: 'Không tìm thấy người dùng' });
+
+  const tempPassword = newPassword || crypto.randomBytes(6).toString('base64url');
+  await userCol.updateOne({ id }, { $set: { passwordHash: await hashPassword(tempPassword) }, $inc: { authVersion: 1 } });
+
+  const admin = (await getSessionUser(req))!;
+  if (req.session.userId === id) {
+    const refreshed = await userCol.findOne({ id });
+    req.session.authVersion = refreshed?.authVersion ?? 0;
+  }
+  await logAdminAction(admin, 'user.reset_password', `Đặt lại mật khẩu cho tài khoản "${target.username}"`, id);
+  res.json({ success: true, username: target.username, tempPassword });
 });
 
 app.delete('/api/admin/users/:id', requireRole('admin'), async (req, res) => {

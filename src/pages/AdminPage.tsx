@@ -4,6 +4,7 @@ import { translations } from '../locales/translations';
 import { formatMoney } from '../utils/pricing';
 import { SimpleBarChart, BarChartDatum } from '../components/charts/SimpleBarChart';
 import { showCopyToast } from '../components/Toast';
+import { AccountCheckStatus } from '../components/tools/CheckLiveXTab';
 import {
   ShieldCheck,
   Users,
@@ -59,6 +60,73 @@ const SUGGESTION_LANGUAGE_LABELS: Record<Language, string> = { vn: 'VN', en: 'EN
 // the server's inventoryUsernameKey) — used to show a short label for a
 // replaced account without printing its password/token.
 const splitAccountUser = (line: string): string => line.split('|')[0].trim();
+// Ordering for the Users table's "sort by role" mode — highest privilege first.
+const USER_ROLE_SORT_ORDER: Record<UserRole, number> = { admin: 0, ctv: 1, user: 2 };
+
+// Same color scheme as the Tools page's Check Live X tab (CheckLiveXTab),
+// reused here so a status reads the same way in both places.
+const CHECK_LIVE_BADGE: Record<AccountCheckStatus, { label: string; cls: string }> = {
+  LIVE: { label: 'LIVE', cls: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30' },
+  TEMPORARILY: { label: 'TEMPORARILY', cls: 'bg-amber-500/15 text-amber-700 dark:text-amber-400 border border-amber-500/30' },
+  WRONG: { label: 'WRONG', cls: 'bg-purple-500/15 text-purple-700 dark:text-purple-400 border border-purple-500/30' },
+  SUPPEND: { label: 'SUSPEND', cls: 'bg-rose-500/15 text-rose-700 dark:text-rose-400 border border-rose-500/30' },
+  DIE: { label: 'DIE', cls: 'bg-rose-500/15 text-rose-700 dark:text-rose-400 border border-rose-500/30' },
+  CHECKING: { label: 'CHECK', cls: 'bg-blue-500/15 text-blue-700 dark:text-blue-400 border border-blue-500/30' },
+};
+
+// A <select> whose <option> text is a long product/variant description
+// can't wrap or truncate — the browser just renders the dropdown as wide as
+// the longest option, overflowing the page. This draws the same "pick one
+// from a list" control ourselves so long labels wrap inside a fixed-width
+// panel instead. Used only where that's actually a problem (the bulk-import
+// product/variant pickers) — plain <select> is left alone everywhere else.
+const SimpleDropdown: React.FC<{
+  value: string;
+  options: { value: string; label: string }[];
+  onChange: (value: string) => void;
+  placeholder?: string;
+}> = ({ value, options, onChange, placeholder }) => {
+  const [open, setOpen] = useState(false);
+  const selected = options.find((o) => o.value === value);
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-left text-slate-800 dark:text-slate-200 flex items-center justify-between gap-2"
+      >
+        <span className="truncate" title={selected?.label}>{selected?.label || placeholder || 'Chọn...'}</span>
+        <ChevronRight className={`w-3.5 h-3.5 flex-shrink-0 text-slate-500 dark:text-slate-500 transition-transform ${open ? 'rotate-90' : ''}`} />
+      </button>
+      {open && (
+        <>
+          {/* Transparent backdrop closes the panel on outside click — same
+              convention already used for every modal in this file. */}
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div className="absolute z-50 mt-1 w-full max-h-64 overflow-y-auto bg-[#eceeed] dark:bg-[#23252a] border border-[#dde2e0] dark:border-[#373b43] rounded-lg shadow-xl py-1">
+            {options.map((o) => (
+              <button
+                key={o.value}
+                type="button"
+                onClick={() => {
+                  onChange(o.value);
+                  setOpen(false);
+                }}
+                className={`w-full text-left px-3 py-2 text-xs whitespace-normal break-words leading-snug transition ${
+                  o.value === value
+                    ? 'bg-purple-500/10 text-purple-700 dark:text-purple-300 font-semibold'
+                    : 'text-slate-700 dark:text-slate-300 hover:bg-[#e0e4e2] hover:dark:bg-[#2a2d34]'
+                }`}
+              >
+                {o.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
 
 export const AdminPage: React.FC<AdminPageProps> = ({
   user,
@@ -99,6 +167,13 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   // when that product is expanded — scoped to that product alone, so its
   // preview can never be crowded out by any other product's inventory.
   const [productInventoryItems, setProductInventoryItems] = useState<Record<string, any[]>>({});
+  // Check Live X results for unsold inventory rows, keyed by item id — lets
+  // admin check whether stock is still usable before anyone buys it, instead
+  // of copy-pasting usernames over to the separate Tools page. Reset per
+  // variant group each time its check is (re-)run.
+  const [checkLiveResults, setCheckLiveResults] = useState<Record<string, { status: AccountCheckStatus; reason?: string }>>({});
+  const [checkingLiveVariantId, setCheckingLiveVariantId] = useState<string | null>(null);
+  const [checkLiveProgress, setCheckLiveProgress] = useState<{ done: number; total: number } | null>(null);
   const [loadingInventoryProductIds, setLoadingInventoryProductIds] = useState<Set<string>>(new Set());
   // Which product groups in the inventory list are expanded — starts empty
   // (everything collapsed) so the tab doesn't render dozens of full account
@@ -225,6 +300,14 @@ export const AdminPage: React.FC<AdminPageProps> = ({
   // each and buyers purchase in the hundreds/thousands, so a fixed +$10
   // isn't a workable increment for crediting a real top-up.
   const [balanceInputs, setBalanceInputs] = useState<Record<string, string>>({});
+  // Shown once right after a password reset — the plaintext temp password
+  // never comes back from the server again after this response.
+  const [resetPasswordResult, setResetPasswordResult] = useState<{ username: string; tempPassword: string } | null>(null);
+  // Which user admin is currently choosing a new password for (opens the
+  // input modal below) and what they've typed so far.
+  const [resetPasswordTarget, setResetPasswordTarget] = useState<User | null>(null);
+  const [resetPasswordInput, setResetPasswordInput] = useState('');
+  const [resettingPasswordId, setResettingPasswordId] = useState<string | null>(null);
 
   // Bulk Import state
   const [importProductId, setImportProductId] = useState<string>(products[0]?.id || '');
@@ -276,6 +359,10 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
   // Search queries
   const [userSearch, setUserSearch] = useState('');
+  // Default is newest-first (same convention as orders/audit-log elsewhere
+  // in this page); "role" groups admin → CTV → user, and within the 'user'
+  // group sorts by VIP tier high → low.
+  const [userSortMode, setUserSortMode] = useState<'time' | 'role'>('time');
   const [productSearch, setProductSearch] = useState('');
 
   // Pagination — Users and Inventory tabs used to just dump everything into
@@ -325,7 +412,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
   useEffect(() => {
     setUsersPage(1);
-  }, [userSearch]);
+  }, [userSearch, userSortMode]);
 
   useEffect(() => {
     setOrdersPage(1);
@@ -524,6 +611,103 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     }
     navigator.clipboard.writeText(items.map((i) => i.username).join('\n'));
     showCopyToast(`Đã sao chép ${items.length} username ${label}`);
+  };
+
+  // Checks only UNSOLD rows of one variant against the same Check Live X
+  // engine the Tools page uses (POST /api/tools/x-check-live) — 10 requests
+  // in flight at once, same concurrency as CheckLiveXTab, so a large batch
+  // doesn't take minutes. Results are stored per item id and shown inline in
+  // the table instead of needing a copy-paste round trip to the Tools page.
+  const CHECK_LIVE_CONCURRENCY = 10;
+  const handleCheckLiveVariant = async (variantId: string, unsoldItems: any[]) => {
+    if (unsoldItems.length === 0 || checkingLiveVariantId) return;
+    setCheckingLiveVariantId(variantId);
+    setCheckLiveProgress({ done: 0, total: unsoldItems.length });
+    setCheckLiveResults((prev) => {
+      const next = { ...prev };
+      unsoldItems.forEach((item) => { next[item.id] = { status: 'CHECKING' }; });
+      return next;
+    });
+
+    let nextIndex = 0;
+    let doneCount = 0;
+    const worker = async () => {
+      while (nextIndex < unsoldItems.length) {
+        const item = unsoldItems[nextIndex++];
+        try {
+          const res = await fetch('/api/tools/x-check-live', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: item.username }),
+          });
+          const data = await res.json();
+          const status: AccountCheckStatus =
+            data.isLive === true || data.status === 'LIVE'
+              ? 'LIVE'
+              : data.status === 'TEMPORARILY'
+              ? 'TEMPORARILY'
+              : data.status === 'WRONG'
+              ? 'WRONG'
+              : data.status === 'SUPPEND'
+              ? 'SUPPEND'
+              : 'DIE';
+          setCheckLiveResults((prev) => ({ ...prev, [item.id]: { status, reason: data.reason } }));
+        } catch (e) {
+          setCheckLiveResults((prev) => ({ ...prev, [item.id]: { status: 'DIE', reason: 'Lỗi kết nối' } }));
+        } finally {
+          doneCount++;
+          setCheckLiveProgress({ done: doneCount, total: unsoldItems.length });
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(CHECK_LIVE_CONCURRENCY, unsoldItems.length) }, worker));
+    setCheckingLiveVariantId(null);
+  };
+
+  // Deletes every unsold item in this variant whose last Check Live result
+  // wasn't LIVE, in one request (see POST /api/admin/inventory/bulk-delete) —
+  // the server re-checks isSold itself, so a row that sold in the meantime
+  // is never touched even though it was dead a moment ago.
+  const handleBulkDeleteDead = (productId: string, unsoldItems: any[]) => {
+    const deadItems = unsoldItems.filter((item) => {
+      const r = checkLiveResults[item.id];
+      return r && r.status !== 'LIVE' && r.status !== 'CHECKING';
+    });
+    if (deadItems.length === 0) return;
+    askConfirm(
+      <>
+        Xóa <strong className="text-slate-900 dark:text-slate-100">{deadItems.length} tài khoản</strong> không còn live khỏi kho?
+        <div className="text-[11px] text-slate-500 dark:text-slate-500 mt-1">Hành động này không thể hoàn tác.</div>
+      </>,
+      async () => {
+        try {
+          const res = await fetch('/api/admin/inventory/bulk-delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ids: deadItems.map((i) => i.id) }),
+          });
+          // A stale server process without this route (or any other
+          // non-JSON failure, e.g. a 404 HTML page) must not be mistaken for
+          // a network error — res.json() alone would throw and land in the
+          // catch below with a misleading "connection error" message.
+          const data = await res.json().catch(() => ({}));
+          if (res.ok) {
+            showCopyToast(`Đã xóa ${data.deletedCount} tài khoản`);
+            setCheckLiveResults((prev) => {
+              const next = { ...prev };
+              deadItems.forEach((i) => delete next[i.id]);
+              return next;
+            });
+            await loadProductInventoryItems(productId);
+            await refreshInventorySummary();
+          } else {
+            showCopyToast(data.error || `Lỗi xóa tài khoản (HTTP ${res.status})`);
+          }
+        } catch (e) {
+          showCopyToast('Lỗi kết nối, không thể xóa tài khoản');
+        }
+      }
+    );
   };
 
   const toggleInventoryProduct = (productId: string) => {
@@ -1081,6 +1265,63 @@ export const AdminPage: React.FC<AdminPageProps> = ({
     } catch (e) {
       showNotification(null, 'Lỗi kết nối');
     }
+  };
+
+  // Opens the password-choice modal — admin can either type a specific
+  // password or leave it blank and let the server generate a random one.
+  const handleResetPassword = (usr: User) => {
+    setResetPasswordInput('');
+    setResetPasswordTarget(usr);
+  };
+
+  // Client-side random suggestion for the "Ngẫu nhiên" button — same shape
+  // as the server's own fallback (6 random bytes, base64url), just generated
+  // here so admin can see/edit it before submitting instead of only finding
+  // out what it was after the fact.
+  const generateRandomPassword = (): string => {
+    const bytes = new Uint8Array(6);
+    crypto.getRandomValues(bytes);
+    return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  };
+
+  // Submits the chosen (or left-blank) password — logs the account out
+  // everywhere, so it's gated behind a confirm dialog like every other
+  // access-affecting action. The resulting password is shown once more
+  // afterward so admin can copy it even if they didn't type it themselves.
+  const submitResetPassword = () => {
+    const usr = resetPasswordTarget;
+    if (!usr) return;
+    if (resetPasswordInput && resetPasswordInput.length < 6) {
+      showNotification(null, 'Mật khẩu mới phải có ít nhất 6 ký tự');
+      return;
+    }
+    askConfirm(
+      <>
+        Đặt lại mật khẩu cho tài khoản <strong className="text-slate-900 dark:text-slate-100">{usr.username}</strong>?
+        <div className="text-[11px] text-slate-500 dark:text-slate-500 mt-1">Mật khẩu cũ sẽ ngừng dùng được ngay và mọi phiên đăng nhập hiện tại của tài khoản này sẽ bị đăng xuất.</div>
+      </>,
+      async () => {
+        setResettingPasswordId(usr.id);
+        try {
+          const res = await fetch(`/api/admin/users/${usr.id}/reset-password`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ newPassword: resetPasswordInput || undefined }),
+          });
+          const data = await res.json();
+          if (res.ok) {
+            setResetPasswordTarget(null);
+            setResetPasswordResult({ username: data.username, tempPassword: data.tempPassword });
+          } else {
+            showNotification(null, data.error || 'Lỗi đặt lại mật khẩu');
+          }
+        } catch (e) {
+          showNotification(null, 'Lỗi kết nối máy chủ');
+        } finally {
+          setResettingPasswordId(null);
+        }
+      }
+    );
   };
 
   // Create new user
@@ -2805,6 +3046,15 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                     className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:outline-none focus:border-purple-500"
                   />
                 </div>
+                <select
+                  value={userSortMode}
+                  onChange={(e) => setUserSortMode(e.target.value as 'time' | 'role')}
+                  title="Sắp xếp danh sách"
+                  className="bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-2.5 py-1.5 text-xs text-slate-800 dark:text-slate-200"
+                >
+                  <option value="time">Sắp xếp: Thời gian (mới nhất)</option>
+                  <option value="role">Sắp xếp: Phân quyền → VIP cao đến thấp</option>
+                </select>
                 <button
                   onClick={() => setShowAddUserModal(true)}
                   className="bg-purple-600 hover:bg-purple-500 text-slate-900 dark:text-slate-100 font-bold text-xs px-3.5 py-2 rounded-lg flex items-center gap-1.5 transition shadow"
@@ -2816,9 +3066,19 @@ export const AdminPage: React.FC<AdminPageProps> = ({
             </div>
 
             {(() => {
-              const filteredUsers = allUsers.filter(
-                (u) => !userSearch || u.username.toLowerCase().includes(userSearch.toLowerCase()) || u.email.toLowerCase().includes(userSearch.toLowerCase())
-              );
+              const filteredUsers = allUsers
+                .filter(
+                  (u) => !userSearch || u.username.toLowerCase().includes(userSearch.toLowerCase()) || u.email.toLowerCase().includes(userSearch.toLowerCase())
+                )
+                .sort((a, b) => {
+                  if (userSortMode === 'role') {
+                    const roleDiff = USER_ROLE_SORT_ORDER[a.role] - USER_ROLE_SORT_ORDER[b.role];
+                    if (roleDiff !== 0) return roleDiff;
+                    // Same role — 'user' accounts sort by VIP tier high → low (no-op for admin/ctv, which have no VIP tier).
+                    return (b.vipDiscountPercent ?? 0) - (a.vipDiscountPercent ?? 0);
+                  }
+                  return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+                });
               const usersTotalPages = Math.max(1, Math.ceil(filteredUsers.length / USERS_PER_PAGE));
               const pagedUsers = filteredUsers.slice((usersPage - 1) * USERS_PER_PAGE, usersPage * USERS_PER_PAGE);
               return (
@@ -2928,6 +3188,17 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                             title="Trừ tiền khỏi ví"
                           >
                             -$
+                          </button>
+
+                          {/* Reset password */}
+                          <button
+                            onClick={() => handleResetPassword(usr)}
+                            disabled={resettingPasswordId === usr.id}
+                            className="bg-[#e7ebe9] dark:bg-[#282a30] hover:bg-[#dde1df] hover:dark:bg-[#32353c] text-slate-700 dark:text-slate-300 border border-[#dde2e0] dark:border-[#373b43] px-2 py-1 rounded text-[10px] font-bold disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1"
+                            title="Đặt lại mật khẩu cho tài khoản này"
+                          >
+                            <KeyRound className="w-3 h-3" />
+                            {resettingPasswordId === usr.id ? '...' : 'Mật khẩu'}
                           </button>
                         </td>
                       </tr>
@@ -3068,34 +3339,27 @@ export const AdminPage: React.FC<AdminPageProps> = ({
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
                 <div>
                   <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Chọn sản phẩm:</label>
-                  <select
+                  <SimpleDropdown
                     value={importProductId}
-                    onChange={(e) => {
-                      setImportProductId(e.target.value);
-                      const p = products.find((prod) => prod.id === e.target.value);
+                    options={products.map((p) => ({ value: p.id, label: p.name }))}
+                    onChange={(id) => {
+                      setImportProductId(id);
+                      const p = products.find((prod) => prod.id === id);
                       if (p && p.variants[0]) setImportVariantId(p.variants[0].id);
                     }}
-                    className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200"
-                  >
-                    {products.map((p) => (
-                      <option key={p.id} value={p.id}>{p.name}</option>
-                    ))}
-                  </select>
+                  />
                 </div>
 
                 <div>
                   <label className="block text-slate-700 dark:text-slate-300 font-semibold mb-1">Chọn phân loại (Biến thể):</label>
-                  <select
+                  <SimpleDropdown
                     value={importVariantId}
-                    onChange={(e) => setImportVariantId(e.target.value)}
-                    className="w-full bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2 text-slate-800 dark:text-slate-200"
-                  >
-                    {currentImportProd?.variants.map((v) => (
-                      <option key={v.id} value={v.id}>
-                        {v.name} (${formatMoney(v.price)} - Hiện có: {v.stockCount})
-                      </option>
-                    ))}
-                  </select>
+                    options={(currentImportProd?.variants || []).map((v) => ({
+                      value: v.id,
+                      label: `${v.name} ($${formatMoney(v.price)} - Hiện có: ${v.stockCount})`,
+                    }))}
+                    onChange={setImportVariantId}
+                  />
                 </div>
               </div>
 
@@ -3146,6 +3410,32 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 </h3>
                 <span className="text-xs text-slate-600 dark:text-slate-400">Bấm vào tên sản phẩm để mở/đóng</span>
               </div>
+
+              {/* Kho tổng — tổng/chưa bán/đã bán trên toàn bộ sản phẩm, cộng
+                  dồn từ số liệu per-product server đã tính sẵn (không đếm lại
+                  ở client). */}
+              {inventoryByProduct.length > 0 && (() => {
+                const totals = inventoryByProduct.reduce(
+                  (acc, p) => ({ total: acc.total + p.total, available: acc.available + p.available, sold: acc.sold + p.sold }),
+                  { total: 0, available: 0, sold: 0 }
+                );
+                return (
+                  <div className="grid grid-cols-3 gap-2 text-xs">
+                    <div className="bg-[#eff2f1] dark:bg-[#1d1f24] border border-[#dee1e0] dark:border-[#373b43] rounded-lg px-3 py-2">
+                      <div className="text-slate-500 dark:text-slate-500 text-[10px] uppercase font-semibold">Tổng kho</div>
+                      <div className="font-mono font-bold text-slate-900 dark:text-slate-100">{totals.total.toLocaleString()}</div>
+                    </div>
+                    <div className="bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-500/30 rounded-lg px-3 py-2">
+                      <div className="text-emerald-700 dark:text-emerald-400 text-[10px] uppercase font-semibold">Chưa bán</div>
+                      <div className="font-mono font-bold text-emerald-600 dark:text-emerald-400">{totals.available.toLocaleString()}</div>
+                    </div>
+                    <div className="bg-red-50 dark:bg-red-950/40 border border-red-500/30 rounded-lg px-3 py-2">
+                      <div className="text-red-700 dark:text-red-400 text-[10px] uppercase font-semibold">Đã bán</div>
+                      <div className="font-mono font-bold text-red-600 dark:text-red-400">{totals.sold.toLocaleString()}</div>
+                    </div>
+                  </div>
+                );
+              })()}
 
               {/* Cross-warehouse username search — find a problem account to
                   pull out without having to know which product it's under. */}
@@ -3269,7 +3559,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
 
                   return (
                     <>
-                    {pagedEntries.map(({ productId, total }) => {
+                    {pagedEntries.map(({ productId, total, available, sold }) => {
                     const product = products.find((p) => p.id === productId);
                     const isExpanded = expandedInventoryProducts.has(productId);
                     const isLoadingItems = loadingInventoryProductIds.has(productId);
@@ -3292,7 +3582,11 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                             <ChevronRight className={`w-3.5 h-3.5 text-slate-500 dark:text-slate-500 transition-transform flex-shrink-0 ${isExpanded ? 'rotate-90' : ''}`} />
                             <span className="truncate" title={product?.name || productId}>{product?.name || productId}</span>
                           </span>
-                          <span className="text-slate-600 dark:text-slate-400 font-normal flex-shrink-0 ml-2">{total.toLocaleString()} tài khoản</span>
+                          <span className="flex items-center gap-2 flex-shrink-0 ml-2 font-normal">
+                            <span className="text-slate-600 dark:text-slate-400">{total.toLocaleString()} tài khoản</span>
+                            <span className="text-emerald-600 dark:text-emerald-400">{available.toLocaleString()} chưa bán</span>
+                            <span className="text-red-600 dark:text-red-400">{sold.toLocaleString()} đã bán</span>
+                          </span>
                         </button>
                         {isExpanded && isLoadingItems && (
                           <div className="px-3 py-3 text-[11px] text-slate-500 dark:text-slate-500 flex items-center gap-1.5">
@@ -3310,11 +3604,17 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                             if (a.isSold !== b.isSold) return a.isSold ? 1 : -1;
                             return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
                           });
+                          const unsoldItems = sortedItems.filter((i) => !i.isSold);
+                          const isCheckingThis = checkingLiveVariantId === variantId;
+                          const deadItems = unsoldItems.filter((i) => {
+                            const r = checkLiveResults[i.id];
+                            return r && r.status !== 'LIVE' && r.status !== 'CHECKING';
+                          });
                           return (
                             <div key={variantId}>
-                              <div className="bg-[#eff2f1] dark:bg-[#1d1f24] px-3 py-1.5 text-[11px] font-semibold text-slate-600 dark:text-slate-400 flex items-center justify-between gap-2">
+                              <div className="bg-[#eff2f1] dark:bg-[#1d1f24] px-3 py-1.5 text-[11px] font-semibold text-slate-600 dark:text-slate-400 flex items-center justify-between gap-2 flex-wrap">
                                 <span>{variant?.name || variantId}</span>
-                                <span className="flex items-center gap-2 font-normal text-[10px]">
+                                <span className="flex items-center gap-2 font-normal text-[10px] flex-wrap">
                                   <button
                                     type="button"
                                     onClick={() => copyUsernames(sortedItems, '(tất cả)')}
@@ -3324,7 +3624,7 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                                   </button>
                                   <button
                                     type="button"
-                                    onClick={() => copyUsernames(sortedItems.filter((i) => !i.isSold), 'chưa bán')}
+                                    onClick={() => copyUsernames(unsoldItems, 'chưa bán')}
                                     className="flex items-center gap-0.5 text-slate-500 dark:text-slate-500 hover:text-emerald-600 hover:dark:text-emerald-400 transition"
                                   >
                                     <Copy className="w-3 h-3" />Chưa bán
@@ -3336,6 +3636,29 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                                   >
                                     <Copy className="w-3 h-3" />Đã bán
                                   </button>
+                                  <span className="w-px h-3 bg-[#dde2e0] dark:bg-[#373b43]" />
+                                  <button
+                                    type="button"
+                                    onClick={() => handleCheckLiveVariant(variantId, unsoldItems)}
+                                    disabled={unsoldItems.length === 0 || checkingLiveVariantId !== null}
+                                    className="flex items-center gap-0.5 text-purple-600 dark:text-purple-400 hover:text-purple-800 hover:dark:text-purple-300 disabled:opacity-40 disabled:cursor-not-allowed transition font-bold"
+                                    title="Kiểm tra Live X cho các tài khoản chưa bán"
+                                  >
+                                    <ShieldCheck className="w-3 h-3" />
+                                    {isCheckingThis && checkLiveProgress
+                                      ? `Đang kiểm tra ${checkLiveProgress.done}/${checkLiveProgress.total}...`
+                                      : `Check Live (${unsoldItems.length})`}
+                                  </button>
+                                  {deadItems.length > 0 && !isCheckingThis && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleBulkDeleteDead(productId, unsoldItems)}
+                                      className="flex items-center gap-0.5 text-red-600 dark:text-red-400 hover:text-red-800 hover:dark:text-red-300 transition font-bold"
+                                      title="Xóa các tài khoản không còn live"
+                                    >
+                                      <Trash2 className="w-3 h-3" />Xóa die ({deadItems.length})
+                                    </button>
+                                  )}
                                 </span>
                               </div>
                               <div className="max-h-64 overflow-y-auto">
@@ -3361,6 +3684,13 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                                         <td className="px-[5px] py-[2.5px] text-right w-24">
                                           {item.isSold ? (
                                             <span className="bg-red-50 dark:bg-red-950/70 text-red-600 dark:text-red-400 px-1.5 py-0.5 rounded text-[10px]">Đã bán</span>
+                                          ) : checkLiveResults[item.id] ? (
+                                            <span
+                                              className={`px-1.5 py-0.5 rounded text-[10px] font-bold uppercase ${CHECK_LIVE_BADGE[checkLiveResults[item.id].status].cls}`}
+                                              title={checkLiveResults[item.id].reason || ''}
+                                            >
+                                              {CHECK_LIVE_BADGE[checkLiveResults[item.id].status].label}
+                                            </span>
                                           ) : (
                                             <span className="bg-emerald-50 dark:bg-emerald-950/70 text-emerald-600 dark:text-emerald-400 px-1.5 py-0.5 rounded text-[10px]">Sẵn sàng</span>
                                           )}
@@ -5165,6 +5495,104 @@ export const AdminPage: React.FC<AdminPageProps> = ({
                 <button onClick={() => setShowAddCryptoOptModal(false)} className="px-4 py-2 bg-[#e5e8e7] dark:bg-[#2d3036] hover:bg-[#dde1e0] hover:dark:bg-[#373b44] text-slate-700 dark:text-slate-300 rounded-lg text-xs font-semibold">Hủy</button>
                 <button onClick={handleCreateCryptoOpt} className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-lg text-xs transition">Thêm Cổng Nạp</button>
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* Password-choice modal — admin types a specific password, or
+            leaves it blank to let the server generate a random one. */}
+        {resetPasswordTarget && (
+          <div
+            className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+            onClick={() => setResetPasswordTarget(null)}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="animate-modal-pop bg-[#eef0ef] dark:bg-[#202227] border border-[#e1e4e3] dark:border-[#32363e] rounded-2xl max-w-sm w-full shadow-2xl p-5 space-y-4"
+            >
+              <div className="flex flex-col items-center text-center gap-2">
+                <div className="w-12 h-12 rounded-full bg-amber-50 dark:bg-amber-950/70 text-amber-600 dark:text-amber-400 flex items-center justify-center">
+                  <KeyRound className="w-6 h-6" />
+                </div>
+                <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">Đặt mật khẩu cho {resetPasswordTarget.username}</h3>
+                <p className="text-xs text-slate-600 dark:text-slate-400">Gõ mật khẩu bạn muốn đặt, hoặc để trống và bấm "Ngẫu nhiên".</p>
+              </div>
+              <div className="space-y-2">
+                <input
+                  type="text"
+                  autoFocus
+                  value={resetPasswordInput}
+                  onChange={(e) => setResetPasswordInput(e.target.value)}
+                  placeholder="Để trống = tự sinh ngẫu nhiên"
+                  className="w-full font-mono bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e1e4e3] dark:border-[#32363e] focus:border-amber-500 rounded-xl px-3 py-2.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none transition"
+                />
+                <button
+                  type="button"
+                  onClick={() => setResetPasswordInput(generateRandomPassword())}
+                  className="text-[11px] font-semibold text-amber-700 dark:text-amber-400 hover:underline"
+                >
+                  Ngẫu nhiên
+                </button>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setResetPasswordTarget(null)}
+                  className="flex-1 bg-[#e7ebe9] dark:bg-[#282a30] hover:bg-[#dde1df] hover:dark:bg-[#32353c] text-slate-700 dark:text-slate-300 font-bold text-sm py-2.5 rounded-xl transition"
+                >
+                  Hủy
+                </button>
+                <button
+                  onClick={submitResetPassword}
+                  disabled={resettingPasswordId === resetPasswordTarget.id}
+                  className="flex-1 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold text-sm py-2.5 rounded-xl transition"
+                >
+                  Đặt lại
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Shown once right after an admin password reset — the plaintext
+            temp password is never retrievable again after this. */}
+        {resetPasswordResult && (
+          <div
+            className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+            onClick={() => setResetPasswordResult(null)}
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="animate-modal-pop bg-[#eef0ef] dark:bg-[#202227] border border-emerald-500/50 rounded-2xl max-w-sm w-full shadow-2xl p-5 space-y-4"
+            >
+              <div className="flex flex-col items-center text-center gap-2">
+                <div className="w-12 h-12 rounded-full bg-emerald-50 dark:bg-emerald-950/70 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
+                  <KeyRound className="w-6 h-6" />
+                </div>
+                <h3 className="text-base font-bold text-slate-900 dark:text-slate-100">Đã đặt lại mật khẩu</h3>
+                <p className="text-xs text-slate-600 dark:text-slate-400">
+                  Gửi mật khẩu này cho <strong className="text-slate-800 dark:text-slate-200">{resetPasswordResult.username}</strong> — sẽ không hiển thị lại được nữa.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 bg-[#f2f4f3] dark:bg-[#1a1b1f] border border-[#e1e4e3] dark:border-[#32363e] rounded-xl px-3 py-3">
+                <span className="flex-1 min-w-0 font-mono text-sm text-slate-800 dark:text-slate-200 truncate select-all">{resetPasswordResult.tempPassword}</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(resetPasswordResult.tempPassword);
+                    showCopyToast('Đã sao chép mật khẩu');
+                  }}
+                  className="shrink-0 p-1.5 text-slate-500 dark:text-slate-500 hover:text-emerald-600 hover:dark:text-emerald-400 transition"
+                  title="Sao chép"
+                >
+                  <Copy className="w-4 h-4" />
+                </button>
+              </div>
+              <button
+                onClick={() => setResetPasswordResult(null)}
+                className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm py-2.5 rounded-xl transition"
+              >
+                Đóng
+              </button>
             </div>
           </div>
         )}
